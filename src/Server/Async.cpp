@@ -196,7 +196,7 @@ void spawn(Callback callback, llvm::StringRef path, llvm::ArrayRef<std::string> 
     stdio[2].data.stream = (uv_stream_t*)&err;
 
     options = {[](uv_process_t* req, int64_t exit_status, int term_signal) {
-        printf("Child process exited with status %ld, signal %d\n", exit_status, term_signal);
+        printf("Child process exited with status %lld, signal %d\n", exit_status, term_signal);
         uv_close((uv_handle_t*)req, NULL);
     }};
     options.stdio = stdio;

@@ -65,7 +65,7 @@ TEST(SourceConverter, UriAndFsPath) {
     using SC = SourceConverter;
 
     // It must be a existed file.
-#if defined(__unix__)
+#if defined(__unix__) || defined(__APPLE__)
     llvm::StringRef paths[] = {"/dev/null"};
     llvm::StringRef uris[] = {"file:///dev/null"};
 #elif defined(_WIN32)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <format>
+#include <exception>
 
 #include "Support/Error.h"
 #include "Support/JSON.h"
