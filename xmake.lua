@@ -16,7 +16,7 @@ if has_config("dev") then
     if is_plat("windows") then
         set_runtimes("MD")
         if is_mode("debug") then
-            print("Clice does not support build in debug mode with pre-compiled llvm binary on windows.\n"
+            print("clice does not support build in debug mode with pre-compiled llvm binary on windows.\n"
                 .."See https://github.com/clice-io/clice/issues/42 for more information.")
             os.raise()
         end
@@ -41,7 +41,7 @@ if has_config("release") then
 end
 
 add_defines("TOML_EXCEPTIONS=0")
-add_requires(libuv_require, "spdlog[header_only=n,std_format,noexcept]" ,"toml++")
+add_requires(libuv_require, "spdlog[header_only=n,std_format,noexcept]" ,"toml++", "croaring")
 add_requires("clice-llvm", {alias = "llvm"})
 
 add_rules("mode.release", "mode.debug", "mode.releasedbg")
@@ -53,7 +53,7 @@ target("clice-core")
     add_files("src/**.cpp|Driver/*.cpp")
     add_includedirs("include", {public = true})
 
-    add_packages("libuv", "spdlog", "toml++", {public = true})
+    add_packages("libuv", "spdlog", "toml++", "croaring", {public = true})
 
     if is_mode("debug") then
         add_packages("llvm", {
@@ -116,7 +116,7 @@ target("clice-core")
 
 target("clice")
     set_kind("binary")
-    add_files("src/Driver/clice.cc")
+    add_files("bin/clice.cc")
 
     add_deps("clice-core")
 
@@ -136,7 +136,7 @@ target("clice")
 target("unit_tests")
     set_default(false)
     set_kind("binary")
-    add_files("src/Driver/unit_tests.cc", "tests/unit/**.cpp")
+    add_files("bin/unit_tests.cc", "tests/unit/**.cpp")
     add_includedirs(".", {public = true})
 
     add_deps("clice-core")
