@@ -2,7 +2,9 @@
 
 #include "IncludeGraph.h"
 #include "AST/SourceCode.h"
+#include "AST/SymbolKind.h"
 #include "AST/RelationKind.h"
+#include "Support/Bitmap.h"
 
 namespace clice::index {
 
@@ -12,15 +14,19 @@ using SymbolHash = std::uint64_t;
 struct Relation {
     RelationKind kind;
 
-    char padding[4] = {0, 0, 0, 0};
+    std::uint32_t padding = 0;
 
     LocalSourceRange range;
 
-    union {
-        LocalSourceRange definition_range;
+    SymbolHash target_symbol;
 
-        SymbolHash target_symbol;
-    };
+    void set_definition_range(LocalSourceRange range) {
+        target_symbol = std::bit_cast<SymbolHash>(range);
+    }
+
+    auto definition_range() {
+        return std::bit_cast<LocalSourceRange>(target_symbol);
+    }
 };
 
 struct Occurrence {
@@ -40,7 +46,10 @@ struct FileIndex {
 struct Symbol {
     std::string name;
 
-    /// ...
+    SymbolKind kind;
+
+    /// All files that referenced this symbol.
+    Bitmap reference_files;
 };
 
 struct TUIndex {
