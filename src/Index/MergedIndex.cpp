@@ -1,3 +1,4 @@
+#include "Support/Compare.h"
 #include "schema_generated.h"
 #include "Index/MergedIndex.h"
 #include "llvm/Support/SHA256.h"
@@ -84,119 +85,32 @@ void MergedIndex::merge(llvm::StringRef path, std::uint32_t include, FileIndex& 
     max_canonical_id += 1;
 }
 
-void MergedIndex::serialize(this MergedIndex& self, llvm::raw_ostream& out) {
-    namespace fbs = flatbuffers;
-    fbs::FlatBufferBuilder builder(1024);
-
-    std::vector<fbs::Offset<binary::CacheEntry>> canonical_cache;
-    canonical_cache.reserve(self.canonical_cache.size());
-    for(auto& [hash, canonical_id]: self.canonical_cache) {
-        canonical_cache.emplace_back(
-            binary::CreateCacheEntry(builder,
-                                     builder.CreateString(hash.data(), hash.size()),
-                                     canonical_id));
-    };
-
-    std::vector<fbs::Offset<binary::HeaderContextsEntry>> header_contexts;
-    header_contexts.reserve(self.contexts.size());
-    for(auto& [path, contexts]: self.contexts) {
-        header_contexts.emplace_back(binary::CreateHeaderContextsEntry(
-            builder,
-            builder.CreateString(path.data(), path.size()),
-            binary::CreateHeaderContexts(
-                builder,
-                contexts.version,
-                builder.CreateVectorOfStructs(
-                    reinterpret_cast<binary::Context*>(contexts.includes.data()),
-                    contexts.includes.size()))));
-    };
-
-    llvm::SmallVector<char, 256> buffer;
-
-    std::vector<fbs::Offset<binary::OccurrenceEntry>> occurrences;
-    occurrences.reserve(self.occurrences.size());
-    for(auto& [occurrence, bitmap]: self.occurrences) {
-        buffer.resize_for_overwrite(bitmap.getSizeInBytes(false));
-        bitmap.write(buffer.data(), false);
-        occurrences.emplace_back(binary::CreateOccurrenceEntry(
-            builder,
-            reinterpret_cast<binary::Occurrence*>(&occurrence),
-            builder.CreateVector(reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size())));
-        buffer.clear();
+std::vector<Occurrence> MergedIndex::lookup(std::uint32_t offset) {
+    if(cache_occurrences.size() != occurrences.size()) {
+        cache_occurrences.clear();
+        for(auto& [occurrence, _]: occurrences) {
+            cache_occurrences.emplace_back(occurrence);
+        }
+        std::ranges::sort(cache_occurrences, refl::less);
     }
 
-    std::vector<fbs::Offset<binary::SymbolRelationsEntry>> relations;
-    relations.reserve(self.relations.size());
-    for(auto& [symbold_id, symbol_relations]: self.relations) {
-        std::vector<fbs::Offset<binary::RelationEntry>> entries;
-        entries.reserve(symbol_relations.size());
-        for(auto& [relation, bitmap]: symbol_relations) {
-            buffer.resize_for_overwrite(bitmap.getSizeInBytes(false));
-            bitmap.write(buffer.data(), false);
-            entries.emplace_back(binary::CreateRelationEntry(
-                builder,
-                reinterpret_cast<binary::Relation*>(&relation),
-                builder.CreateVector(reinterpret_cast<const uint8_t*>(buffer.data()),
-                                     buffer.size())));
-            buffer.clear();
+    auto it =
+        std::ranges::lower_bound(cache_occurrences, offset, {}, [](index::Occurrence& occurrence) {
+            return occurrence.range.end;
+        });
+
+    std::vector<index::Occurrence> occurrences;
+    while(it != cache_occurrences.end()) {
+        if(it->range.contains(offset)) {
+            occurrences.emplace_back(*it);
+            it++;
+            continue;
         }
 
-        relations.emplace_back(
-            binary::CreateSymbolRelationsEntryDirect(builder, symbold_id, &entries));
+        break;
     }
 
-    auto merged_index = binary::CreateMergedIndexDirect(builder,
-                                                        self.max_canonical_id,
-                                                        &canonical_cache,
-                                                        &header_contexts,
-                                                        &occurrences,
-                                                        &relations);
-    builder.Finish(merged_index);
-
-    out.write(reinterpret_cast<char*>(builder.GetBufferPointer()), builder.GetSize());
-}
-
-MergedIndex MergedIndexView::deserialize() {
-    namespace fbs = flatbuffers;
-    auto root = fbs::GetRoot<binary::MergedIndex>(data);
-
-    MergedIndex index;
-    index.max_canonical_id = root->max_canonical_id();
-
-    for(auto entry: *root->canonical_cache()) {
-        index.canonical_cache.try_emplace(entry->sha256()->string_view(), entry->canonical_id());
-    }
-
-    index.canonical_ref_counts.resize(index.max_canonical_id, 0);
-
-    HeaderContexts contexts;
-    for(auto entry: *root->contexts()) {
-        auto path = entry->path()->string_view();
-        contexts.version = entry->contexts()->version();
-        for(auto include: *entry->contexts()->includes()) {
-            index.canonical_ref_counts[include->canonical_id()] += 1;
-            contexts.includes.emplace_back(include->include_(), include->canonical_id());
-        }
-        index.contexts.try_emplace(path, std::move(contexts));
-    }
-
-    for(auto entry: *root->occurrences()) {
-        index.occurrences.try_emplace(
-            *reinterpret_cast<const Occurrence*>(entry->occurrence()),
-            Bitmap::read(reinterpret_cast<const char*>(entry->context()->data()), false));
-    }
-
-    for(auto entry: *root->relations()) {
-        auto& relations = index.relations[entry->symbol()];
-        for(auto relation_entry: *entry->relations()) {
-            relations.try_emplace(
-                *reinterpret_cast<const Relation*>(relation_entry->relation()),
-                Bitmap::read(reinterpret_cast<const char*>(relation_entry->context()->data()),
-                             false));
-        }
-    }
-
-    return index;
+    return occurrences;
 }
 
 }  // namespace clice::index
