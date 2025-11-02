@@ -1,4 +1,4 @@
-set_xmakever("3.0.3")
+set_xmakever("3.0.0")
 set_project("clice")
 
 set_allowedplats("windows", "linux", "macosx")
@@ -127,7 +127,7 @@ target("clice")
     end)
 
     after_build(function (target)
-        local res_dir = path.join(target:targetdir(), "lib/clang")
+        local res_dir = path.join(target:targetdir(), "../lib/clang")
         if not os.exists(res_dir) then
             local llvm_dir = target:dep("clice-core"):pkg("llvm"):installdir()
             os.vcp(path.join(llvm_dir, "lib/clang"), res_dir)
@@ -146,8 +146,7 @@ target("unit_tests")
 
     after_load(function (target)
         target:set("runargs",
-            "--test-dir=" .. path.absolute("tests/data"),
-            "--resource-dir=" .. path.join(target:dep("clice-core"):pkg("llvm"):installdir(), "lib/clang/20")
+            "--test-dir=" .. path.absolute("tests/data")
         )
     end)
 
@@ -169,7 +168,6 @@ target("integration_tests")
             "--log-cli-level=INFO",
             "-s", "tests/integration",
             "--executable=" .. target:dep("clice"):targetfile(),
-            "--resource-dir=" .. path.join(target:pkg("llvm"):installdir(), "lib/clang/20"),
         }
         local opt = {envs = envs, curdir = os.projectdir()}
         os.vrunv(uv.program, argv, opt)
@@ -271,8 +269,9 @@ package("clice-llvm")
 
             local info = json.loadfile("./config/prebuilt-llvm.json")
             for _, info in ipairs(info) do
-                if  get_config("mode") == info.build_type:lower()
-                and get_config("plat") == info.platform:lower()
+                if info.platform:lower() == get_config("plat")
+                and (info.build_type:lower() == get_config("mode")
+                or info.build_type:lower() == "release" and get_config("mode") == "releasedbg")
                 and (info.is_lto == has_config("release")) then
                     package:add("urls", format("https://github.com/clice-io/llvm-binary/releases/download/%s/%s", info.version, info.filename))
                     package:add("versions", info.version, info.sha256)
