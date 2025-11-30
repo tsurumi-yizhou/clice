@@ -1,10 +1,10 @@
 #pragma once
 
-#include "Test.h"
 #include "Annotation.h"
-#include "Protocol/Protocol.h"
+#include "Test.h"
 #include "Compiler/Command.h"
 #include "Compiler/Compilation.h"
+#include "Protocol/Protocol.h"
 #include "Support/Logging.h"
 
 namespace clice::testing {
@@ -38,7 +38,7 @@ struct Tester {
 
     bool compile_with_pch(llvm::StringRef standard = "-std=c++20");
 
-    std::uint32_t operator[] (llvm::StringRef file, llvm::StringRef pos) {
+    std::uint32_t operator[](llvm::StringRef file, llvm::StringRef pos) {
         return sources.all_files.lookup(file).offsets.lookup(pos);
     }
 
