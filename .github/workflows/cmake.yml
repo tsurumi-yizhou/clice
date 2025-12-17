@@ -42,28 +42,16 @@ jobs:
       - name: Setup Pixi
         uses: prefix-dev/setup-pixi@v0.9.3
         with:
-          pixi-version: v0.59.0
+          pixi-version: v0.61.0
           environments: develop
           activate-environment: true
           cache: true
           locked: true
 
-      - name: Build clice
-        shell: bash
+      - name: Build
         run: |
-          cmake -B build -G Ninja \
-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
-            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake \
-            -DCLICE_ENABLE_TEST=ON \
-            -DCLICE_CI_ENVIRONMENT=ON
-          cmake --build build
+          pixi run ci-cmake-build ${{ matrix.build_type }}
 
-      - name: Run tests
-        shell: bash
+      - name: Test
         run: |
-          EXE_EXT=""
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            EXE_EXT=".exe"
-          fi
-          ./build/bin/unit_tests${EXE_EXT} --test-dir="./tests/data"
-          uv run --project tests pytest -s --log-cli-level=INFO tests/integration --executable=./build/bin/clice${EXE_EXT}
+          pixi run ci-cmake-test
