@@ -12,6 +12,7 @@ option("ci", { default = false })
 
 if has_config("dev") then
 	set_policy("build.ccache", true)
+	set_policy("package.install_only", true) -- Don't fetch system package
 	if is_plat("windows") then
 		set_runtimes("MD")
 		if is_mode("debug") then
@@ -31,9 +32,10 @@ local libuv_require = "libuv"
 if has_config("release") then
 	set_policy("build.optimization.lto", true)
 	set_policy("package.cmake_generator.ninja", true)
+	set_policy("package.install_only", true) -- Don't fetch system package
 
 	if is_plat("windows") then
-		set_runtimes("MT")
+		set_runtimes("MD")
 		-- workaround cmake
 		libuv_require = "libuv[toolchains=clang-cl]"
 	end
@@ -41,22 +43,26 @@ if has_config("release") then
 	includes("@builtin/xpack")
 end
 
-if is_plat("macosx") then
-	-- https://conda-forge.org/docs/maintainer/knowledge_base/#newer-c-features-with-old-sdk
-	add_defines("_LIBCPP_DISABLE_AVAILABILITY=1")
-	add_ldflags("-fuse-ld=lld")
-	add_shflags("-fuse-ld=lld")
+if is_plat("macosx", "linux") then
+	local cxflags
+	if is_plat("macosx") then
+		-- https://conda-forge.org/docs/maintainer/knowledge_base/#newer-c-features-with-old-sdk
+		cxflags = "-D_LIBCPP_DISABLE_AVAILABILITY=1"
+	end
+	local ldflags = "-fuse-ld=lld"
+	local shflags = "-fuse-ld=lld"
+
+	add_cxflags(cxflags)
+	add_ldflags(ldflags)
+	add_shflags(shflags)
 
 	add_requireconfs("**|cmake", {
 		configs = {
-			ldflags = "-fuse-ld=lld",
-			shflags = "-fuse-ld=lld",
-			cxflags = "-D_LIBCPP_DISABLE_AVAILABILITY=1",
+			cxflags = cxflags,
+			ldflags = ldflags,
+			shflags = shflags,
 		},
 	})
-elseif is_plat("linux") then
-	-- don't fetch system package
-	set_policy("package.install_only", true)
 end
 
 add_defines("TOML_EXCEPTIONS=0")
@@ -247,10 +253,15 @@ rule("clice_build_config", function()
 			target:add("ldflags", "-fuse-ld=lld", "-static-libstdc++", "-Wl,--gc-sections")
 		elseif target:is_plat("macosx") then
 			target:add("ldflags", "-fuse-ld=lld", "-Wl,-dead_strip,-object_path_lto,clice.lto.o", { force = true })
-			-- dsymutil so slow, disable it in daily ci
+			-- dsymutil so slow, disable it in dev ci
 			if not has_config("release") and is_mode("releasedbg") and has_config("ci") then
 				target:rule_enable("utils.symbols.extract", false)
 			end
+		end
+
+		if has_config("release") then
+			-- pixi clang failed to add lto flags because it need `-fuse-ld=lld`
+			target:add("ldflags", "-flto=thin", { force = true })
 		end
 
 		if has_config("ci") then
