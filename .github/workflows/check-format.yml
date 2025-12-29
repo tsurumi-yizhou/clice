@@ -1,16 +1,7 @@
 name: format
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-permissions:
-  contents: read
-  pull-requests: write
-  checks: write
-  issues: write
+  workflow_call:
 
 jobs:
   check-format:
@@ -19,14 +10,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Pixi
-        uses: prefix-dev/setup-pixi@v0.9.3
+      - uses: ./.github/actions/setup-pixi
         with:
-          pixi-version: v0.61.0
           environments: format
-          activate-environment: true
-          cache: true
-          locked: true
 
       - name: Run formatter
         run: pixi run format
