@@ -46,10 +46,10 @@ std::string scanModuleName(CompilationParams& params) {
 
         if(token.is(clang::tok::hash)) {
             lexer.LexFromRawLexer(token);
-            auto diretive = token.getRawIdentifier();
-            if(diretive == "if" || diretive == "ifdef" || diretive == "ifndef") {
+            auto directive = token.getRawIdentifier();
+            if(directive == "if" || directive == "ifdef" || directive == "ifndef") {
                 is_in_directive = true;
-            } else if(diretive == "endif") {
+            } else if(directive == "endif") {
                 is_in_directive = false;
             }
         } else if(token.is(clang::tok::raw_identifier)) {
@@ -106,16 +106,15 @@ std::string scanModuleName(CompilationParams& params) {
 std::expected<ModuleInfo, std::string> scanModule(CompilationParams& params) {
     ModuleInfo info;
     auto unit = preprocess(params);
-    if(!unit) {
-        return std::unexpected(unit.error());
-    }
+    /// FIXME: handle error here.
+    assert(unit.completed());
 
-    for(auto& import: unit->directives()[unit->interested_file()].imports) {
+    for(auto& import: unit.directives()[unit.interested_file()].imports) {
         info.mods.emplace_back(import.name);
     }
 
-    info.isInterfaceUnit = unit->is_module_interface_unit();
-    info.name = unit->module_name();
+    info.isInterfaceUnit = unit.is_module_interface_unit();
+    info.name = unit.module_name();
 
     return info;
 }

@@ -12,45 +12,71 @@
 
 namespace clice {
 
-/// All AST related information needed for language server.
-class CompilationUnit {
+enum class CompilationKind : std::uint8_t {
+    /// From preprocessing the source file. Therefore directives
+    /// are available but AST nodes are not.
+    Preprocess,
+
+    /// From indexing the static source file.
+    Indexing,
+
+    /// From building preamble for the source file.
+    Preamble,
+
+    /// From building precompiled module for the module interface unit.
+    ModuleInterface,
+
+    /// From building normal AST for source file(except preamble), interested file and top level
+    /// declarations are available.
+    Content,
+
+    /// From running code completion for the source file(preamble is applied).
+    Completion,
+};
+
+enum class CompilationStatus : std::uint8_t {
+    Completed,
+    Cancelled,
+    SetupFail,
+    FatalError,
+};
+
+class CompilationUnitRef {
 public:
-    /// The kind describes how we preprocess this source file
-    /// to get this compilation unit.
-    enum class Kind : std::uint8_t {
-        /// From preprocessing the source file. Therefore directives
-        /// are available but AST nodes are not.
-        Preprocess,
+    struct Self;
 
-        /// From indexing the static source file.
-        Indexing,
+    CompilationUnitRef(Self* self) : self(self) {}
 
-        /// From building preamble for the source file.
-        Preamble,
-
-        /// From building precompiled module for the module interface unit.
-        ModuleInterface,
-
-        /// From building normal AST for source file(except preamble), interested file and top level
-        /// declarations are available.
-        Content,
-
-        /// From running code completion for the source file(preamble is applied).
-        Completion,
-    };
-
-    using enum Kind;
-    struct Impl;
-
-    CompilationUnit(Kind kind, Impl* impl) : kind(kind), impl(impl) {}
-
-    CompilationUnit(const CompilationUnit&) = delete;
-
-    CompilationUnit(CompilationUnit&& other) : kind(other.kind), impl(other.impl) {
-        other.impl = nullptr;
+    Self* operator->() {
+        return self;
     }
 
-    ~CompilationUnit();
+public:
+    CompilationKind kind();
+
+    CompilationStatus status();
+
+    /// Parse finished; ASTContext is usable but diagnostics may still contain errors.
+    bool completed() {
+        return status() == CompilationStatus::Completed;
+    }
+
+    /// Compilation was cancelled; consumers should not touch any state.
+    bool cancelled() {
+        return status() == CompilationStatus::Cancelled;
+    }
+
+    /// Failed during initial setup; diagnostics exist (location-free), ASTContext
+    /// is unavailable.
+    bool setup_fail() {
+        return status() == CompilationStatus::SetupFail;
+    }
+
+    /// Hit an unrecoverable error; diagnostics and decoded source locations
+    /// are usable, other states are not unavailable.
+    bool fatal_error() {
+        return status() == CompilationStatus::FatalError;
+    }
 
 public:
     /// Get the file id for given file. If such file doesn't exist, the result
@@ -165,7 +191,7 @@ public:
     bool is_module_interface_unit();
 
     /// Return all diagnostics in the process of compilation.
-    auto diagnostics() -> llvm::ArrayRef<Diagnostic>;
+    auto diagnostics() -> std::vector<Diagnostic>&;
 
     auto top_level_decls() -> llvm::ArrayRef<clang::Decl*>;
 
@@ -196,10 +222,22 @@ public:
     /// Get symbol ID for given marco.
     index::SymbolID getSymbolID(const clang::MacroInfo* macro);
 
-private:
-    Kind kind;
+protected:
+    Self* self;
+};
 
-    Impl* impl;
+/// All AST related information needed for language server.
+class CompilationUnit : public CompilationUnitRef {
+public:
+    explicit CompilationUnit(Self* impl) : CompilationUnitRef(impl) {}
+
+    CompilationUnit(const CompilationUnit&) = delete;
+
+    CompilationUnit(CompilationUnit&& other) : CompilationUnitRef(other.self) {
+        other.self = nullptr;
+    }
+
+    ~CompilationUnit();
 };
 
 }  // namespace clice

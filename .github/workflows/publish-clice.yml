@@ -46,7 +46,7 @@ jobs:
 
       - uses: ./.github/actions/setup-pixi
         with:
-          environments: develop
+          environments: package
 
       - name: Remove ci llvm toolchain on Windows
         if: runner.os == 'Windows'

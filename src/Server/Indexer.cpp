@@ -9,9 +9,9 @@ namespace clice {
 
 async::Task<> Indexer::index(llvm::StringRef path) {
     CompilationParams params;
-    params.kind = CompilationUnit::Indexing;
+    params.kind = CompilationKind::Indexing;
     params.arguments_from_database = true;
-    params.arguments = database.lookup(path).arguments;
+    params.arguments = database.lookup(path, {.query_toolchain = true}).arguments;
 
     auto path_id = project_index.path_pool.path_id(path);
     auto& merged_index = get_index(path_id);
@@ -25,12 +25,12 @@ async::Task<> Indexer::index(llvm::StringRef path) {
 
     auto tu_index = co_await async::submit([&]() -> std::optional<index::TUIndex> {
         auto unit = compile(params);
-        if(!unit) {
-            LOG_INFO("Fail to index for {}, because: {}", path, unit.error());
+        if(!unit.completed()) {
+            /// LOG_INFO("Fail to index for {}, because: {}", path, unit.error());
             return std::nullopt;
         }
 
-        return index::TUIndex::build(*unit);
+        return index::TUIndex::build(unit);
     });
 
     if(!tu_index) {

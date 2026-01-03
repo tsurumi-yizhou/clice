@@ -6,7 +6,7 @@ void Tester::prepare(llvm::StringRef standard) {
     auto command = std::format("clang++ {} {} -fms-extensions", standard, src_path);
 
     database.add_command("fake", src_path, command);
-    params.kind = CompilationUnit::Content;
+    params.kind = CompilationKind::Content;
 
     CommandOptions options;
     options.resource_dir = true;
@@ -31,24 +31,22 @@ bool Tester::compile(llvm::StringRef standard) {
     prepare(standard);
 
     auto unit = clice::compile(params);
-    if(!unit) {
-        LOG_ERROR("{}", unit.error());
-        for(auto& diag: *params.diagnostics) {
+    if(!unit.completed()) {
+        for(auto& diag: unit.diagnostics()) {
             LOG_ERROR("{}", diag.message);
         }
         return false;
     }
 
-    this->unit.emplace(std::move(*unit));
+    this->unit.emplace(std::move(unit));
     return true;
 }
 
 bool Tester::compile_with_pch(llvm::StringRef standard) {
-    params.diagnostics = std::make_shared<std::vector<Diagnostic>>();
     auto command = std::format("clang++ {} {} -fms-extensions", standard, src_path);
 
     database.add_command("fake", src_path, command);
-    params.kind = CompilationUnit::Preamble;
+    params.kind = CompilationKind::Preamble;
 
     CommandOptions options;
     options.resource_dir = true;
@@ -80,9 +78,8 @@ bool Tester::compile_with_pch(llvm::StringRef standard) {
     PCHInfo info;
     {
         auto unit = clice::compile(params, info);
-        if(!unit) {
-            LOG_ERROR("{}", unit.error());
-            for(auto& diag: *params.diagnostics) {
+        if(!unit.completed()) {
+            for(auto& diag: unit.diagnostics()) {
                 LOG_ERROR("{}", diag.message);
             }
             return false;
@@ -91,7 +88,7 @@ bool Tester::compile_with_pch(llvm::StringRef standard) {
 
     /// Build AST
     params.output_file.clear();
-    params.kind = CompilationUnit::Content;
+    params.kind = CompilationKind::Content;
     params.pch = {info.path, info.preamble.size()};
     for(auto& [file, source]: sources.all_files) {
         if(file == src_path) {
@@ -104,15 +101,14 @@ bool Tester::compile_with_pch(llvm::StringRef standard) {
     }
 
     auto unit = clice::compile(params);
-    if(!unit) {
-        LOG_ERROR("{}", unit.error());
-        for(auto& diag: *params.diagnostics) {
+    if(!unit.completed()) {
+        for(auto& diag: unit.diagnostics()) {
             LOG_ERROR("{}", diag.message);
         }
         return false;
     }
 
-    this->unit.emplace(std::move(*unit));
+    this->unit.emplace(std::move(unit));
     return true;
 }
 

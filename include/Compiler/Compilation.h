@@ -15,7 +15,7 @@ namespace clice {
 
 struct CompilationParams {
     /// The kind of this compilation.
-    CompilationUnit::Kind kind;
+    CompilationKind kind;
 
     /// Whether to run clang-tidy.
     bool clang_tidy = false;
@@ -48,9 +48,6 @@ struct CompilationParams {
     /// to cancel old compilation task.
     std::shared_ptr<std::atomic_bool> stop = std::make_shared<std::atomic_bool>(false);
 
-    /// Store all compilation errors in the process.
-    std::shared_ptr<std::vector<Diagnostic>> diagnostics;
-
     void add_remapped_file(llvm::StringRef path,
                            llvm::StringRef content,
                            std::uint32_t bound = -1) {
@@ -62,23 +59,21 @@ struct CompilationParams {
     }
 };
 
-using CompilationResult = std::expected<CompilationUnit, std::string>;
-
 /// Only preprocess ths source flie.
-CompilationResult preprocess(CompilationParams& params);
+CompilationUnit preprocess(CompilationParams& params);
 
 /// Build AST from given file path and content. If pch or pcm provided, apply them to the compiler.
 /// Note this function will not check whether we need to update the PCH or PCM, caller should check
 /// their reusability and update in time.
-CompilationResult compile(CompilationParams& params);
+CompilationUnit compile(CompilationParams& params);
 
 /// Build PCH from given file path and content.
-CompilationResult compile(CompilationParams& params, PCHInfo& out);
+CompilationUnit compile(CompilationParams& params, PCHInfo& out);
 
 /// Build PCM from given file path and content.
-CompilationResult compile(CompilationParams& params, PCMInfo& out);
+CompilationUnit compile(CompilationParams& params, PCMInfo& out);
 
 /// Run code completion at the given location.
-CompilationResult complete(CompilationParams& params, clang::CodeCompleteConsumer* consumer);
+CompilationUnit complete(CompilationParams& params, clang::CodeCompleteConsumer* consumer);
 
 }  // namespace clice
