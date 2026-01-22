@@ -100,6 +100,11 @@ TEST_CASE(MSVC, {.skip = !CIEnvironment || !Windows}) {
     params.arguments = arguments;
     params.add_remapped_file(file->c_str(), R"(
             #include <iostream>
+
+            #if __cplusplus < 202302L
+            #error "C++23 required"
+            #endif
+
             int main() {
                 std::cout << "Hello world!" << std::endl;
                 return 0;
