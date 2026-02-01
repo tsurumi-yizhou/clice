@@ -20,9 +20,10 @@ jobs:
         run: pixi run build-docs
 
       - name: Deploy to GitHub Pages
-        if: github.ref == 'refs/heads/main'
         uses: peaceiris/actions-gh-pages@v4
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: docs/.vitepress/dist
-          cname: clice.io
+          github_token: ${{ secrets.PUBLISH_DOCS }}
+          external_repository: clice-io/docs
+          publish_dir: ./docs/.vitepress/dist
+          destination_dir: clice
+          keep_files: true
