@@ -70,6 +70,7 @@ jobs:
     permissions:
       contents: write
     uses: ./.github/workflows/deploy-docs.yml
+    secrets: inherit
 
   clice:
     needs: changes

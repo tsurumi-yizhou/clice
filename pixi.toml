@@ -5,13 +5,13 @@ name = "clice"
 version = "0.1.0"
 description = "A next-generation C++ language server for modern C++"
 authors = [
-    "ykiko <ykikoykikoykiko@gmail.com>",
+    "ykiko <ykiko@clice.io>",
     "clice contributors <clice@clice.io>",
 ]
 license = "Apache-2.0"
 license-file = "LICENSE"
 readme = "README.md"
-documentation = "https://clice.io"
+documentation = "https://docs.clice.io/clice/"
 repository = "https://github.com/clice-io/clice"
 channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "osx-arm64"]

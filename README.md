@@ -5,7 +5,7 @@
 ![C++ Standard](https://img.shields.io/badge/C++-23-blue.svg)
 [![GitHub license](https://img.shields.io/github/license/clice-io/clice)](https://github.com/clice-io/clice/blob/main/LICENSE)
 [![Actions status](https://github.com/clice-io/clice/workflows/CI/badge.svg)](https://github.com/clice-io/clice/actions)
-[![Documentation](https://img.shields.io/badge/view-documentation-blue)](https://clice.io)
+[![Documentation](https://img.shields.io/badge/view-documentation-blue)](https://docs.clice.io/clice/)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/clice-io/clice)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?logo=discord&logoColor=white)](https://discord.gg/PA3UxW2VA3)
 
@@ -35,4 +35,4 @@ Download the latest `clice` binary from the [releases page](https://github.com/c
 
 ## Documentation
 
-To learn more about building, installing, and configuring clice, or to dive deep into its features and architecture, please visit our official documentation at [**clice.io**](https://clice.io/).
+To learn more about building, installing, and configuring clice, or to dive deep into its features and architecture, please visit our official documentation at [**clice.io**](https://docs.clice.io/clice/).
