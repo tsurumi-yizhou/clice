@@ -1,136 +1,186 @@
-#include "Server/Server.h"
-#include "Server/Version.h"
-#include "Support/Format.h"
-#include "Support/Logging.h"
+#include <cstdio>
+#include <expected>
+#include <filesystem>
+#include <iostream>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
-#include "llvm/ADT/StringSwitch.h"
-#include "llvm/Support/CommandLine.h"
-#include "llvm/Support/InitLLVM.h"
-#include "llvm/Support/Process.h"
-
-namespace cl = llvm::cl;
-using namespace clice;
+#include "eventide/deco/macro.h"
+#include "eventide/deco/runtime.h"
+#include "eventide/serde/config.h"
+#include "server/protocol.h"
+#include "server/runtime.h"
 
 namespace {
 
-static cl::OptionCategory category("clice options");
+using clice::server::Mode;
+using clice::server::Options;
 
-enum class Mode {
-    Pipe,
-    Socket,
-    Indexer,
+struct ModeOption {
+    Mode value = Mode::Pipe;
+
+    auto into(std::string_view text) -> std::optional<std::string_view> {
+        if(text == "pipe") {
+            value = Mode::Pipe;
+            return std::nullopt;
+        }
+        if(text == "socket") {
+            value = Mode::Socket;
+            return std::nullopt;
+        }
+        if(text == "worker") {
+            value = Mode::Worker;
+            return std::nullopt;
+        }
+        return "invalid --mode, expected: pipe|socket|worker";
+    }
 };
 
-cl::opt<Mode> mode{
-    "mode",
-    cl::cat(category),
-    cl::value_desc("string"),
-    cl::init(Mode::Pipe),
-    cl::values(clEnumValN(Mode::Pipe, "pipe", "pipe mode, clice will listen on stdio"),
-               clEnumValN(Mode::Socket, "socket", "socket mode, clice will listen on host:port")),
-    ///  clEnumValN(Mode::Indexer, "indexer", "indexer mode, to implement")
-    cl::desc("The mode of clice, default is pipe, socket is usually used for debugging"),
+struct CliOptions {
+    DECO_CFG_START(required = false;);
+
+    DecoFlag(names = {"-h", "--help"}; help = "Show this help message and exit"; required = false;)
+    help = false;
+
+    DecoFlag(names = {std::string_view(clice::server::k_worker_mode)};
+             help = "Run as worker process";
+             required = false;)
+    worker_mode = false;
+
+    DecoKVStyled(deco::decl::KVStyle::Joined, names = {"--mode=", "--mode"}; meta_var = "MODE";
+                 help = "Server mode: pipe|socket|worker";
+                 required = false;)
+    <ModeOption> mode;
+
+    DecoKVStyled(deco::decl::KVStyle::Joined, names = {"--host=", "--host"}; meta_var = "HOST";
+                 help = "Socket host (default: 127.0.0.1)";
+                 required = false;)
+    <std::string> host;
+
+    DecoKVStyled(deco::decl::KVStyle::Joined, names = {"--port=", "--port"}; meta_var = "PORT";
+                 help = "Socket port (default: 50051)";
+                 required = false)
+    <int> port;
+
+    DecoKVStyled(deco::decl::KVStyle::Joined, names = {"--worker-count=", "--worker-count"};
+                 meta_var = "N";
+                 help = "Worker process count (default: 2)";
+                 required = false)
+    <std::size_t> worker_count;
+
+    DecoKVStyled(deco::decl::KVStyle::Joined,
+                 names = {"--worker-doc-capacity=", "--worker-doc-capacity"};
+                 meta_var = "N";
+                 help = "Per-worker AST cache capacity (default: 32)";
+                 required = false;)
+    <std::size_t> worker_document_capacity;
+
+    DecoKVStyled(deco::decl::KVStyle::Joined,
+                 names = {"--master-doc-capacity=", "--master-doc-capacity"};
+                 meta_var = "N";
+                 help = "Master ownership cache capacity (default: 256)";
+                 required = false;)
+    <std::size_t> master_document_capacity;
+
+    DECO_CFG_END();
 };
 
-cl::opt<std::string> host{
-    "host",
-    cl::cat(category),
-    cl::value_desc("string"),
-    cl::init("127.0.0.1"),
-    cl::desc("The host to connect to (default: 127.0.0.1)"),
-};
+auto resolve_self_path(int argc, const char** argv) -> std::string {
+    if(argc <= 0 || argv == nullptr || argv[0] == nullptr) {
+        return "clice";
+    }
 
-cl::opt<unsigned int> port{
-    "port",
-    cl::cat(category),
-    cl::value_desc("unsigned int"),
-    cl::init(50051),
-    cl::desc("The port to connect to"),
-};
+    std::error_code ec;
+    auto absolute = std::filesystem::absolute(argv[0], ec);
+    if(ec) {
+        return std::string(argv[0]);
+    }
+    return absolute.string();
+}
 
-cl::opt<logging::ColorMode> log_color{
-    "log-color",
-    cl::cat(category),
-    cl::value_desc("always|auto|never"),
-    cl::init(logging::ColorMode::automatic),
-    cl::values(clEnumValN(logging::ColorMode::automatic, "auto", ""),
-               clEnumValN(logging::ColorMode::always, "always", ""),
-               clEnumValN(logging::ColorMode::never, "never", "")),
-    cl::desc("When to use terminal colors, default is auto"),
-};
+auto build_options(const CliOptions& cli_options, int argc, const char** argv)
+    -> std::expected<Options, std::string> {
+    Options options;
+    options.self_path = resolve_self_path(argc, argv);
 
-cl::opt<logging::Level> log_level{
-    "log-level",
-    cl::cat(category),
-    cl::value_desc("trace|debug|info|warn|error"),
-    cl::init(logging::Level::info),
-    cl::values(clEnumValN(logging::Level::trace, "trace", ""),
-               clEnumValN(logging::Level::debug, "debug", ""),
-               clEnumValN(logging::Level::info, "info", ""),
-               clEnumValN(logging::Level::warn, "warn", ""),
-               clEnumValN(logging::Level::err, "error", ""),
-               clEnumValN(logging::Level::off, "off", "")),
-    cl::desc("The log level, default is info"),
-};
+    if(cli_options.mode.value.has_value()) {
+        options.mode = cli_options.mode->value;
+    } else if(cli_options.worker_mode.value.value_or(false)) {
+        options.mode = Mode::Worker;
+    }
+
+    if(cli_options.host.value.has_value()) {
+        options.host = *cli_options.host;
+    }
+    if(cli_options.port.value.has_value()) {
+        if(*cli_options.port <= 0) {
+            return std::unexpected("--port must be a positive integer");
+        }
+        options.port = *cli_options.port;
+    }
+    if(cli_options.worker_count.value.has_value()) {
+        if(*cli_options.worker_count == 0) {
+            return std::unexpected("--worker-count must be a positive integer");
+        }
+        options.worker_count = *cli_options.worker_count;
+    }
+    if(cli_options.worker_document_capacity.value.has_value()) {
+        if(*cli_options.worker_document_capacity == 0) {
+            return std::unexpected("--worker-doc-capacity must be a positive integer");
+        }
+        options.worker_document_capacity = *cli_options.worker_document_capacity;
+    }
+    if(cli_options.master_document_capacity.value.has_value()) {
+        if(*cli_options.master_document_capacity == 0) {
+            return std::unexpected("--master-doc-capacity must be a positive integer");
+        }
+        options.master_document_capacity = *cli_options.master_document_capacity;
+    }
+
+    return options;
+}
+
+auto print_usage() -> void {
+    deco::cli::Dispatcher<CliOptions> dispatcher("clice [OPTIONS]");
+    dispatcher.usage(std::cerr, true);
+}
+
+auto run_with_options(const Options& options) -> int {
+    switch(options.mode) {
+        case Mode::Pipe: return clice::server::run_pipe_mode(options);
+        case Mode::Socket: return clice::server::run_socket_mode(options);
+        case Mode::Worker: return clice::server::run_worker_mode(options);
+    }
+    return 1;
+}
 
 }  // namespace
 
 int main(int argc, const char** argv) {
-    llvm::InitLLVM guard(argc, argv);
-    llvm::setBugReportMsg(
-        "Please report bugs to https://github.com/clice-io/clice/issues and include the crash backtrace");
-    cl::SetVersionPrinter([](llvm::raw_ostream& os) {
-        os << std::format("clice version: {}\nllvm version: {}\n",
-                          clice::config::version,
-                          clice::config::llvm_version);
-    });
-    cl::HideUnrelatedOptions(category);
-    cl::ParseCommandLineOptions(argc,
-                                argv,
-                                "clice is a new generation of language server for C/C++");
+    eventide::serde::config::set_field_rename_policy<eventide::serde::rename_policy::lower_camel>();
 
-    logging::options.color = log_color;
-    logging::options.level = log_level;
-    logging::stderr_logger("clice", logging::options);
-
-    if(auto result = fs::init_resource_dir(argv[0]); !result) {
-        LOG_FATAL("Cannot find default resource directory, because {}", result.error());
+    auto args = deco::util::argvify(argc, argv);
+    auto parsed = deco::cli::parse<CliOptions>(args);
+    if(!parsed) {
+        std::fprintf(stderr, "%s\n", parsed.error().message.c_str());
+        print_usage();
+        return 1;
     }
 
-    for(int i = 0; i < argc; ++i) {
-        LOG_INFO("argv[{}] = {}", i, argv[i]);
+    const auto& cli_options = parsed->options;
+    if(cli_options.help.value.value_or(false)) {
+        print_usage();
+        return 0;
     }
 
-    async::init();
-
-    /// The global server instance.
-    static Server instance;
-    auto loop = [&](json::Value value) -> async::Task<> {
-        co_await instance.on_receive(value);
-    };
-
-    switch(mode) {
-        case Mode::Pipe: {
-            async::net::listen(loop);
-            LOG_INFO("Server starts listening on stdin/stdout");
-            break;
-        }
-
-        case Mode::Socket: {
-            async::net::listen(host.c_str(), port, loop);
-            LOG_INFO("Server starts listening on {}:{}", host.getValue(), port.getValue());
-            break;
-        }
-
-        case Mode::Indexer: {
-            /// TODO:
-            break;
-        }
+    auto options = build_options(cli_options, argc, argv);
+    if(!options) {
+        std::fprintf(stderr, "%s\n", options.error().c_str());
+        print_usage();
+        return 1;
     }
 
-    async::run();
-
-    LOG_INFO("clice exit normally!");
-
-    return 0;
+    return run_with_options(*options);
 }

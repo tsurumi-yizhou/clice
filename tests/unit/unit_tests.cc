@@ -1,54 +1,31 @@
-#include "Test/Test.h"
-#include "Support/GlobPattern.h"
-#include "Support/Logging.h"
+#include <string_view>
 
-#include "llvm/ADT/SmallString.h"
-#include "llvm/Support/CommandLine.h"
-#include "llvm/Support/Signals.h"
-
-using namespace clice;
-using namespace clice::testing;
+#include "eventide/zest/runner.h"
+#include "support/filesystem.h"
 
 namespace {
 
-namespace cl = llvm::cl;
+std::string_view parse_filter(int argc, const char** argv) {
+    constexpr std::string_view prefix = "--test-filter=";
+    for(int i = 1; i < argc; ++i) {
+        std::string_view arg = argv[i];
+        if(arg.starts_with(prefix)) {
+            return arg.substr(prefix.size());
+        }
 
-cl::OptionCategory unittest_category("clice Unittest Options");
+        if(arg == "--test-filter" && i + 1 < argc) {
+            return argv[i + 1];
+        }
+    }
 
-cl::opt<std::string> test_dir{
-    "test-dir",
-    cl::desc("Specify the test source directory path"),
-    cl::value_desc("path"),
-    cl::Required,
-    cl::cat(unittest_category),
-};
-
-cl::opt<std::string> test_filter{
-    "test-filter",
-    cl::desc("A glob pattern to run subset of tests"),
-    cl::cat(unittest_category),
-};
-
-cl::opt<bool> enable_example{
-    "enable-example",
-    cl::init(false),
-    cl::cat(unittest_category),
-};
+    return {};
+}
 
 }  // namespace
 
-int main(int argc, const char* argv[]) {
-    llvm::sys::PrintStackTraceOnErrorSignal(argv[0]);
-    llvm::cl::HideUnrelatedOptions(unittest_category);
-    llvm::cl::ParseCommandLineOptions(argc, argv, "clice test\n");
-
-    logging::stderr_logger("clice", logging::options);
-
-    if(auto result = fs::init_resource_dir(argv[0]); !result) {
-        std::println("Failed to get resource directory, because {}", result.error());
+int main(int argc, const char** argv) {
+    if(auto result = clice::fs::init_resource_dir(argv[0]); !result) {
         return 1;
     }
-
-    using namespace clice::testing;
-    return Runner2::instance().run_tests(test_filter);
+    return eventide::zest::Runner::instance().run_tests(parse_filter(argc, argv));
 }
