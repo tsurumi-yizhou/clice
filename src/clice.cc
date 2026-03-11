@@ -95,19 +95,46 @@ auto search_in_path(std::string_view name) -> std::string {
 
 #ifdef _WIN32
     constexpr char path_sep = ';';
-    constexpr auto is_executable = [](const std::filesystem::path& p) {
-        return std::filesystem::exists(p) && !std::filesystem::is_directory(p);
+
+    // Get PATHEXT or use default extensions
+    std::vector<std::string> extensions;
+    const char* pathext_env = std::getenv("PATHEXT");
+    if(pathext_env) {
+        std::string_view pathext_view(pathext_env);
+        size_t ext_start = 0;
+        while(ext_start < pathext_view.size()) {
+            size_t ext_end = pathext_view.find(';', ext_start);
+            if(ext_end == std::string_view::npos) {
+                ext_end = pathext_view.size();
+            }
+            std::string_view ext = pathext_view.substr(ext_start, ext_end - ext_start);
+            if(!ext.empty()) {
+                extensions.emplace_back(ext);
+            }
+            ext_start = ext_end + 1;
+        }
+    } else {
+        extensions = {".exe", ".cmd", ".bat", ".com"};
+    }
+
+    // Check if name already has an extension
+    bool has_extension = name.find('.') != std::string_view::npos;
+
+    auto is_executable = [](const std::filesystem::path& p) {
+        std::error_code ec;
+        auto status = std::filesystem::status(p, ec);
+        return !ec && std::filesystem::exists(status) && !std::filesystem::is_directory(status);
     };
 #else
     constexpr char path_sep = ':';
-    constexpr auto is_executable = [](const std::filesystem::path& p) {
+    auto is_executable = [](const std::filesystem::path& p) {
         std::error_code ec;
         auto status = std::filesystem::status(p, ec);
         if(ec || !std::filesystem::exists(status) || std::filesystem::is_directory(status)) {
             return false;
         }
-        return (status.permissions() & (std::filesystem::perms::owner_exec | 
-                                        std::filesystem::perms::group_exec | 
+        return (status.permissions() & (std::filesystem::perms::owner_exec |
+                                        std::filesystem::perms::group_exec |
                                         std::filesystem::perms::others_exec)) != std::filesystem::perms::none;
     };
 #endif
@@ -119,20 +146,42 @@ auto search_in_path(std::string_view name) -> std::string {
         if(end == std::string_view::npos) {
             end = path_view.size();
         }
-        
+
         std::string_view dir = path_view.substr(start, end - start);
         if(!dir.empty()) {
+#ifdef _WIN32
+            // Try the name as-is first
             std::filesystem::path full_path = std::filesystem::path(dir) / name;
             std::error_code ec;
             auto canonical = std::filesystem::canonical(full_path, ec);
             if(!ec && is_executable(canonical)) {
                 return canonical.string();
             }
+
+            // If name doesn't have an extension, try each PATHEXT extension
+            if(!has_extension) {
+                for(const auto& ext : extensions) {
+                    std::string name_with_ext = std::string(name) + ext;
+                    full_path = std::filesystem::path(dir) / name_with_ext;
+                    canonical = std::filesystem::canonical(full_path, ec);
+                    if(!ec && is_executable(canonical)) {
+                        return canonical.string();
+                    }
+                }
+            }
+#else
+            std::filesystem::path full_path = std::filesystem::path(dir) / name;
+            std::error_code ec;
+            auto canonical = std::filesystem::canonical(full_path, ec);
+            if(!ec && is_executable(canonical)) {
+                return canonical.string();
+            }
+#endif
         }
-        
+
         start = end + 1;
     }
-    
+
     return std::string(name);
 }
 
