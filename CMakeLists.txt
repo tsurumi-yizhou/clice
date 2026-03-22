@@ -101,7 +101,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 if(MSVC OR (CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND
-            CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+         CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
     target_compile_options(clice_options INTERFACE
         /GR-
         /EHsc-
@@ -111,9 +111,9 @@ else()
     target_compile_options(clice_options INTERFACE
         -fno-rtti
         -Wno-deprecated-declarations
-        -Wno-undefined-inline
         -ffunction-sections
         -fdata-sections
+        $<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:-Wno-undefined-inline>
     )
 endif()
 
@@ -164,6 +164,11 @@ add_library(clice-core STATIC
     "${PROJECT_SOURCE_DIR}/src/index/usr_generation.cpp"
     "${PROJECT_SOURCE_DIR}/src/index/project_index.cpp"
     "${PROJECT_SOURCE_DIR}/src/index/merged_index.cpp"
+    "${PROJECT_SOURCE_DIR}/src/server/stateless_worker.cpp"
+    "${PROJECT_SOURCE_DIR}/src/server/stateful_worker.cpp"
+    "${PROJECT_SOURCE_DIR}/src/server/worker_pool.cpp"
+    "${PROJECT_SOURCE_DIR}/src/server/master_server.cpp"
+    "${PROJECT_SOURCE_DIR}/src/server/config.cpp"
 )
 add_library(clice::core ALIAS clice-core)
 add_dependencies(clice-core generate_flatbuffers_schema)
@@ -178,12 +183,12 @@ target_link_libraries(clice-core PUBLIC
     spdlog::spdlog
     roaring::roaring
     flatbuffers
-    eventide::async
-    eventide::language
+    eventide::ipc::lsp
+    eventide::serde::toml
 )
 
 add_executable(clice "${PROJECT_SOURCE_DIR}/src/clice.cc")
-target_link_libraries(clice PRIVATE clice::core)
+target_link_libraries(clice PRIVATE clice::core eventide::deco)
 install(TARGETS clice RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 message(STATUS "Copying resource directory for development build")
@@ -214,5 +219,5 @@ if(CLICE_ENABLE_TEST)
         "${PROJECT_SOURCE_DIR}/src"
         "${PROJECT_SOURCE_DIR}/tests/unit"
     )
-    target_link_libraries(unit_tests PRIVATE clice::core eventide::zest)
+    target_link_libraries(unit_tests PRIVATE clice::core eventide::zest eventide::deco)
 endif()

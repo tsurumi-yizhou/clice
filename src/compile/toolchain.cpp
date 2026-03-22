@@ -1,6 +1,5 @@
 #include "compile/toolchain.h"
 
-#include <format>
 #include <optional>
 #include <string>
 #include <vector>
@@ -383,6 +382,7 @@ std::vector<const char*> query_toolchain(const QueryParams& params) {
             query_driver(params_copy.arguments,
                          [&](const char* driver, llvm::ArrayRef<const char*> cc1_args) {
                              result.emplace_back(params.callback(driver));
+                             result.emplace_back(params.callback("-cc1"));
                              for(auto arg: cc1_args) {
                                  result.emplace_back(params.callback(arg));
                              }
@@ -390,6 +390,8 @@ std::vector<const char*> query_toolchain(const QueryParams& params) {
             return result;
         }
     }
+
+    return {};
 }
 
 std::vector<const char*> query_gcc_toolchain(const QueryParams& params) {
@@ -417,8 +419,13 @@ std::vector<const char*> query_gcc_toolchain(const QueryParams& params) {
         }
     }
 
-    target = std::format("--target={}", target);
-    install_path = std::format("--gcc-install-dir={}", install_path);
+    llvm::SmallString<64> formatted_target("--target=");
+    formatted_target += target;
+    target = formatted_target;
+
+    llvm::SmallString<64> formatted_install_path("--gcc-install-dir=");
+    formatted_install_path += install_path;
+    install_path = formatted_install_path;
 
     query_arguments.clear();
     query_arguments.emplace_back(arguments.consume_front());
@@ -429,6 +436,7 @@ std::vector<const char*> query_gcc_toolchain(const QueryParams& params) {
     std::vector<const char*> result;
     query_driver(query_arguments, [&](const char* driver, llvm::ArrayRef<const char*> cc1_args) {
         result.emplace_back(params.callback(driver));
+        result.emplace_back(params.callback("-cc1"));
         for(auto arg: cc1_args) {
             result.emplace_back(params.callback(arg));
         }

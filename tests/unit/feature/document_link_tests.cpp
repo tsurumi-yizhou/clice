@@ -9,7 +9,7 @@ namespace clice::testing {
 
 namespace {
 
-namespace protocol = eventide::language::protocol;
+namespace protocol = eventide::ipc::protocol;
 
 TEST_SUITE(DocumentLink) {
 
@@ -24,8 +24,8 @@ void run(llvm::StringRef source) {
 }
 
 auto to_local_range(const protocol::Range& range) -> LocalSourceRange {
-    eventide::language::PositionMapper converter(tester.unit->interested_content(),
-                                                 feature::PositionEncoding::UTF8);
+    feature::PositionMapper converter(tester.unit->interested_content(),
+                                      feature::PositionEncoding::UTF8);
     return LocalSourceRange(converter.to_offset(range.start), converter.to_offset(range.end));
 }
 
