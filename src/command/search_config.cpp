@@ -1,11 +1,12 @@
 #include "command/search_config.h"
 
-#include "command/driver.h"
+#include "command/argument_parser.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include "clang/Driver/Options.h"
 
 namespace clice {
 
