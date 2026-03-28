@@ -5,9 +5,11 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include "clang/Driver/Driver.h"
 #include "clang/Driver/Options.h"
+#include "clang/Driver/Types.h"
 
 namespace clice {
 
@@ -40,19 +42,23 @@ auto& option_table = driver::getDriverOptTable();
 std::unique_ptr<llvm::opt::Arg> ArgumentParser::parse_one(unsigned& index) {
     assert(!enable_dash_dash_parsing(option_table));
     assert(!enable_grouped_short_options(option_table));
-    return option_table.ParseOneArg(*this, index);
+    return option_table.ParseOneArg(*this, index, opt::Visibility(visibility_mask));
 }
 
 using ID = clang::driver::options::ID;
 
 bool is_discarded_option(unsigned id) {
     switch(id) {
-        /// Input file and output — we manage these ourselves.
+        /// Input file, unknown args, and output — we manage these ourselves.
         case ID::OPT_INPUT:
+        case ID::OPT_UNKNOWN:
+        case ID::OPT__DASH_DASH:
         case ID::OPT_c:
         case ID::OPT_o:
         case ID::OPT_dxc_Fc:
         case ID::OPT_dxc_Fo:
+        case ID::OPT__SLASH_Fo:
+        case ID::OPT__SLASH_Fd:
 
         /// PCH building.
         case ID::OPT_emit_pch:
@@ -113,6 +119,24 @@ bool is_include_path_option(unsigned id) {
 
 bool is_xclang_option(unsigned id) {
     return id == ID::OPT_Xclang;
+}
+
+bool is_toolchain_option(unsigned id) {
+    switch(id) {
+        case ID::OPT_target:
+        case ID::OPT_target_legacy_spelling:
+        case ID::OPT_isysroot:
+        case ID::OPT__sysroot_EQ:
+        case ID::OPT__sysroot:
+        case ID::OPT_stdlib_EQ:
+        case ID::OPT_gcc_toolchain:
+        case ID::OPT_gcc_install_dir_EQ:
+        case ID::OPT_nostdinc:
+        case ID::OPT_nostdincxx:
+        case ID::OPT_std_EQ:
+        case ID::OPT_x: return true;
+        default: return false;
+    }
 }
 
 std::optional<std::uint32_t> get_option_id(llvm::StringRef argument) {
@@ -219,6 +243,35 @@ std::string print_argv(llvm::ArrayRef<const char*> args) {
         os << '"';
     }
     return std::move(os.str());
+}
+
+unsigned default_visibility(llvm::StringRef driver) {
+    namespace options = clang::driver::options;
+    auto name = llvm::sys::path::filename(driver);
+    name.consume_back(".exe");
+
+    auto is_cl = [](llvm::StringRef s) {
+        return s.equals_insensitive("cl") || s.equals_insensitive("clang-cl");
+    };
+
+    /// cl.exe and clang-cl.exe both need MSVC-style /options.
+    /// Also handle versioned names like clang-cl-17, clang-cl-17.0.1.
+    if(is_cl(name) || is_cl(name.rtrim("0123456789.-"))) {
+        return ~0u;
+    }
+    /// Exclude CLOption to prevent /U, /D, /I from matching Unix paths.
+    return ~static_cast<unsigned>(options::CLOption);
+}
+
+bool is_c_family_file(llvm::StringRef filename) {
+    namespace types = clang::driver::types;
+    auto ext = llvm::sys::path::extension(filename);
+    if(ext.empty()) {
+        return false;
+    }
+    /// Drop the leading dot: ".cpp" → "cpp".
+    auto type = types::lookupTypeForExtension(ext.drop_front());
+    return type != types::TY_INVALID && types::isAcceptedByClang(type);
 }
 
 }  // namespace clice

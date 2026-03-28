@@ -104,6 +104,8 @@ object_ptr<CompilationInfo>
 
     bool remove_pch = false;
 
+    parser->set_visibility(default_visibility(arguments[0]));
+
     auto on_error = [&](int index, int count) {
         LOG_WARN("missing argument index: {}, count: {} when parse: {}", index, count, file);
     };
@@ -262,6 +264,13 @@ std::size_t CompilationDatabase::load(llvm::StringRef path) {
         llvm::StringRef dir_ref(dir_sv.data(), dir_sv.size());
         llvm::StringRef file_ref(file_sv.data(), file_sv.size());
 
+        // Skip non-C-family files (e.g. .rc, .asm, .def) that some build
+        // systems emit into compile_commands.json.
+        if(!is_c_family_file(file_ref)) {
+            ++index;
+            continue;
+        }
+
         // Resolve relative file paths against the directory so that entries
         // from different directories don't collide in the PathPool.
         std::string file_abs;
@@ -353,6 +362,9 @@ llvm::SmallVector<CompilationContext> CompilationDatabase::lookup(llvm::StringRe
                 append_args(info->patch);
             } else {
                 arguments.assign(cached.begin(), cached.end());
+                // TODO: add an assertion that the last arg is the temp source
+                // file (e.g., contains "query-toolchain") to guard against
+                // future changes in clang cc1 argument ordering.
                 arguments.pop_back();  // remove temp source file
 
                 // Replace resource dir if needed.
@@ -530,13 +542,13 @@ CompilationDatabase::ToolchainExtract
 
     result.query_args.push_back(arguments[0]);
 
+    parser->set_visibility(default_visibility(arguments[0]));
+
     parser->parse(
         llvm::ArrayRef(arguments).drop_front(),
         [&](std::unique_ptr<llvm::opt::Arg> arg) {
-            auto& opt = arg->getOption();
-            auto id = opt.getID();
-            if(is_discarded_option(id) || is_user_content_option(id) ||
-               is_codegen_option(id, opt)) {
+            auto id = arg->getOption().getID();
+            if(!is_toolchain_option(id)) {
                 return;
             }
 
@@ -632,6 +644,14 @@ bool CompilationDatabase::has_cached_toolchain() const {
 
 llvm::StringRef CompilationDatabase::resolve_path(std::uint32_t path_id) {
     return paths.resolve(path_id);
+}
+
+std::uint32_t CompilationDatabase::intern_path(llvm::StringRef path) {
+    return paths.intern(path);
+}
+
+llvm::ArrayRef<CompilationEntry> CompilationDatabase::get_entries() const {
+    return entries;
 }
 
 #ifdef CLICE_ENABLE_TEST

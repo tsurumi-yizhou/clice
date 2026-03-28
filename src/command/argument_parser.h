@@ -38,6 +38,14 @@ public:
         return p;
     }
 
+    /// Set visibility mask for option parsing. The default (~0u) accepts all
+    /// options. Pass a narrower mask to exclude option groups — e.g. exclude
+    /// MSVC cl.exe-style /U, /D, /I options that would otherwise misparse
+    /// Unix absolute paths like /Users/... on macOS.
+    void set_visibility(unsigned mask) {
+        visibility_mask = mask;
+    }
+
     /// Parse a single argument at the given index. Defined out-of-line in
     /// argument_parser.cpp to isolate the heavy clang driver option table include.
     std::unique_ptr<llvm::opt::Arg> parse_one(unsigned& index);
@@ -72,6 +80,7 @@ public:
 
 private:
     llvm::BumpPtrAllocator* allocator;
+    unsigned visibility_mask = ~0u;
 
     llvm::ArrayRef<const char*> arguments;
 };
@@ -101,6 +110,10 @@ bool is_include_path_option(unsigned id);
 /// Check if this is the -Xclang pass-through option.
 bool is_xclang_option(unsigned id);
 
+/// Options that affect system path discovery and should be included in the
+/// toolchain cache key. Only these flags are passed to the toolchain query.
+bool is_toolchain_option(unsigned id);
+
 /// Get the option ID for a specific argument string.
 std::optional<std::uint32_t> get_option_id(llvm::StringRef argument);
 
@@ -110,5 +123,16 @@ llvm::StringRef resource_dir();
 
 /// Format an argument list as a human-readable string: "[arg1 arg2 ...]".
 std::string print_argv(llvm::ArrayRef<const char*> args);
+
+/// Return the visibility mask to exclude MSVC cl.exe-style options (/U, /D,
+/// /I, etc.) unless the driver is cl.exe.  This prevents Unix absolute paths
+/// like /Users/... from being misparsed as /U sers/... on macOS/Linux.
+/// Defined out-of-line in argument_parser.cpp (needs ClangVisibility enum).
+unsigned default_visibility(llvm::StringRef driver);
+
+/// Check if a filename has a C/C++/ObjC/CUDA/etc. extension accepted by clang.
+/// Returns false for .rc (Windows resource), .asm, .def, and other non-C-family files.
+/// Defined out-of-line in argument_parser.cpp (needs clang::driver::types).
+bool is_c_family_file(llvm::StringRef filename);
 
 }  // namespace clice
