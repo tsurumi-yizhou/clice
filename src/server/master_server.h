@@ -9,6 +9,7 @@
 #include "eventide/ipc/lsp/protocol.h"
 #include "eventide/ipc/peer.h"
 #include "eventide/serde/serde/raw_value.h"
+#include "server/compile_graph.h"
 #include "server/config.h"
 #include "server/worker_pool.h"
 #include "support/path_pool.h"
@@ -44,6 +45,7 @@ enum class ServerLifecycle : std::uint8_t {
 class MasterServer {
 public:
     MasterServer(et::event_loop& loop, et::ipc::JsonPeer& peer, std::string self_path);
+    ~MasterServer();
 
     void register_handlers();
 
@@ -61,11 +63,20 @@ private:
     CompilationDatabase cdb;
     DependencyGraph dependency_graph;
 
+    // Module compilation graph (lazy dependency resolution).
+    std::unique_ptr<CompileGraph> compile_graph;
+
+    // path_id -> built PCM output path (set after successful module build).
+    llvm::DenseMap<std::uint32_t, std::string> pcm_paths;
+
+    // path_id -> module name (for files that provide a module interface).
+    llvm::DenseMap<std::uint32_t, std::string> path_to_module;
+
     // Document state: path_id -> DocumentState
     llvm::DenseMap<std::uint32_t, DocumentState> documents;
 
-    // Per-document debounce timers
-    llvm::DenseMap<std::uint32_t, std::unique_ptr<et::timer>> debounce_timers;
+    // Per-document debounce timers (shared_ptr so drain coroutines survive didClose)
+    llvm::DenseMap<std::uint32_t, std::shared_ptr<et::timer>> debounce_timers;
 
     // Helper: convert URI to file path
     std::string uri_to_path(const std::string& uri);
@@ -89,7 +100,7 @@ private:
     et::task<> load_workspace();
 
     // Helper: fill compile arguments from CDB into worker params
-    void fill_compile_args(llvm::StringRef path,
+    bool fill_compile_args(llvm::StringRef path,
                            std::string& directory,
                            std::vector<std::string>& arguments);
 
