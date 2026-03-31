@@ -1,38 +1,27 @@
-"""Lifecycle tests for the clice LSP server using pygls."""
+"""Lifecycle tests for the clice LSP server."""
 
 import pytest
-from lsprotocol.types import (
-    ClientCapabilities,
-    InitializeParams,
-    InitializedParams,
-    WorkspaceFolder,
-)
+from lsprotocol.types import ClientCapabilities, InitializeParams
 
 
-@pytest.mark.asyncio
-async def test_initialize(client, test_data_dir):
-    ws = test_data_dir / "hello_world"
-    result = await client.initialize_async(
-        InitializeParams(
-            capabilities=ClientCapabilities(),
-            root_uri=ws.as_uri(),
-            workspace_folders=[WorkspaceFolder(uri=ws.as_uri(), name="test")],
+@pytest.mark.workspace("hello_world")
+async def test_initialize(client, workspace):
+    assert client.init_result is not None
+    assert client.init_result.server_info is not None
+    assert client.init_result.server_info.name == "clice"
+
+
+@pytest.mark.workspace("hello_world")
+async def test_double_initialize_rejected(client, workspace):
+    with pytest.raises(Exception):
+        await client.initialize_async(
+            InitializeParams(
+                capabilities=ClientCapabilities(),
+                workspace_folders=[],
+            )
         )
-    )
-    client.initialized(InitializedParams())
-    assert result.server_info is not None
-    assert result.server_info.name == "clice"
 
 
-@pytest.mark.asyncio
-async def test_shutdown(client, test_data_dir):
-    ws = test_data_dir / "hello_world"
-    await client.initialize_async(
-        InitializeParams(
-            capabilities=ClientCapabilities(),
-            root_uri=ws.as_uri(),
-            workspace_folders=[WorkspaceFolder(uri=ws.as_uri(), name="test")],
-        )
-    )
-    client.initialized(InitializedParams())
+@pytest.mark.workspace("hello_world")
+async def test_shutdown(client, workspace):
     await client.shutdown_async(None)

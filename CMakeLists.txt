@@ -32,12 +32,8 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_options(-fsanitize=address)
 
-    if(NOT WIN32)
-        string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=address")
-        string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=address")
-    endif()
-
-    if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        # clang-cl (MSVC frontend): manually link ASan runtime.
         execute_process(
             COMMAND ${CMAKE_CXX_COMPILER} --print-resource-dir
             OUTPUT_VARIABLE CLANG_RESOURCE_DIR
@@ -47,7 +43,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         link_directories(${ASAN_LIB_PATH})
 
         set(ASAN_LINK_FLAGS "")
-
         list(APPEND ASAN_LINK_FLAGS "clang_rt.asan_dynamic-x86_64.lib")
         list(APPEND ASAN_LINK_FLAGS "/wholearchive:clang_rt.asan_dynamic_runtime_thunk-x86_64.lib")
 
@@ -56,6 +51,16 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
             set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${flag}")
             set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${flag}")
         endforeach()
+    else()
+        # GNU frontend (clang++/gcc): -fsanitize=address handles linking automatically.
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " -fsanitize=address")
+        string(APPEND CMAKE_SHARED_LINKER_FLAGS " -fsanitize=address")
+    endif()
+
+    if(WIN32)
+        # Disable Identical COMDAT Folding in Debug to avoid ASan ODR false positives.
+        string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,/OPT:NOICF")
+        string(APPEND CMAKE_SHARED_LINKER_FLAGS " -Wl,/OPT:NOICF")
     endif()
 endif()
 
