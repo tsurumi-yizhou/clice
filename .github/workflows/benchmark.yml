@@ -22,7 +22,7 @@ jobs:
 
       - name: Build scan_benchmark
         run: |
-          pixi run cmake-config RelWithDebInfo ON
+          pixi run cmake-config RelWithDebInfo ON "-DCLICE_ENABLE_BENCHMARK=ON"
           cmake --build build/RelWithDebInfo --target scan_benchmark
 
       - name: Clone LLVM
@@ -39,3 +39,7 @@ jobs:
 
       - name: Run benchmark
         run: ./build/RelWithDebInfo/bin/scan_benchmark --runs 20 llvm-build/compile_commands.json
+
+      - name: Stop sccache server
+        if: runner.os == 'Windows'
+        run: pixi run -- sccache --stop-server || true
