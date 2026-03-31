@@ -38,17 +38,16 @@ struct InputFinder : clang::RecursiveASTVisitor<InputFinder> {
     }
 };
 
-TEST_SUITE(TemplateResolver) {
+TEST_SUITE(TemplateResolver, Tester) {
 
 void run(llvm::StringRef code) {
-    Tester tester;
-    tester.add_main("main.cpp", code);
-    ASSERT_TRUE(tester.compile());
+    add_main("main.cpp", code);
+    ASSERT_TRUE(compile());
 
-    InputFinder finder(*tester.unit);
-    finder.TraverseAST(tester.unit->context());
+    InputFinder finder(*unit);
+    finder.TraverseAST(unit->context());
 
-    auto input = tester.unit->resolver().resolve(finder.input);
+    auto input = unit->resolver().resolve(finder.input);
     auto target = finder.expect;
     ASSERT_FALSE(input.isNull() || target.isNull());
     EXPECT_EQ(input.getCanonicalType(), target.getCanonicalType());
@@ -458,7 +457,7 @@ TEST_CASE(BasePackExpansion) {
 }
 
 TEST_CASE(Standard) {
-    run(R"code(
+    add_main("main.cpp", R"code(
         #include <vector>
 
         template <typename T>
@@ -467,6 +466,15 @@ TEST_CASE(Standard) {
             using expect = T&;
         };
     )code");
+    ASSERT_TRUE(compile_driver());
+
+    InputFinder finder(*unit);
+    finder.TraverseAST(unit->context());
+
+    auto input = unit->resolver().resolve(finder.input);
+    auto target = finder.expect;
+    ASSERT_FALSE(input.isNull() || target.isNull());
+    EXPECT_EQ(input.getCanonicalType(), target.getCanonicalType());
 };
 
 };  // TEST_SUITE(TemplateResolver)
