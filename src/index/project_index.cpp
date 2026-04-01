@@ -9,12 +9,16 @@ llvm::SmallVector<std::uint32_t> ProjectIndex::merge(this ProjectIndex& self, TU
     llvm::SmallVector<std::uint32_t> file_ids_map;
     file_ids_map.resize_for_overwrite(paths.size());
 
-    for(auto i = 0; i < paths.size(); i++) {
+    for(std::uint32_t i = 0; i < paths.size(); i++) {
         file_ids_map[i] = self.path_pool.path_id(paths[i]);
     }
 
     for(auto& [symbol_id, symbol]: index.symbols) {
         auto& target_symbol = self.symbols[symbol_id];
+        if(target_symbol.name.empty()) {
+            target_symbol.name = symbol.name;
+            target_symbol.kind = symbol.kind;
+        }
         for(auto ref: symbol.reference_files) {
             target_symbol.reference_files.add(file_ids_map[ref]);
         }
@@ -48,10 +52,12 @@ void ProjectIndex::serialize(this ProjectIndex& self, llvm::raw_ostream& os) {
         buffer.resize_for_overwrite(symbol.reference_files.getSizeInBytes(false));
         symbol.reference_files.write(buffer.data(), false);
 
-        return binary::CreateSymbolEntry(
-            builder,
-            symbol_id,
-            binary::CreateSymbol(builder, symbol.kind.value(), CreateVector(builder, buffer)));
+        return binary::CreateSymbolEntry(builder,
+                                         symbol_id,
+                                         binary::CreateSymbol(builder,
+                                                              CreateString(builder, symbol.name),
+                                                              symbol.kind.value(),
+                                                              CreateVector(builder, buffer)));
     });
 
     auto project_index =
@@ -72,7 +78,11 @@ ProjectIndex ProjectIndex::from(const void* data) {
     auto& pool = index.path_pool;
     pool.paths.resize(root->paths()->size());
     for(auto entry: *root->paths()) {
-        auto k = pool.save(entry->path()->string_view());
+        // Normalize backslashes to forward slashes for cross-platform consistency
+        // (persisted index may contain native-separator paths from Windows).
+        llvm::SmallString<256> normalized(entry->path()->string_view());
+        std::replace(normalized.begin(), normalized.end(), '\\', '/');
+        auto k = pool.save(normalized.str());
         pool.paths[entry->id()] = k;
         pool.cache.try_emplace(k, entry->id());
     }
@@ -83,8 +93,12 @@ ProjectIndex ProjectIndex::from(const void* data) {
 
     for(auto entry: *root->symbols()) {
         auto& symbol = index.symbols[entry->symbol_id()];
-        symbol.kind = SymbolKind(static_cast<std::uint8_t>(entry->symbol()->kind()));
-        symbol.reference_files = read_bitmap(entry->symbol()->refs());
+        auto* fb_symbol = entry->symbol();
+        if(auto* name = fb_symbol->name()) {
+            symbol.name = name->str();
+        }
+        symbol.kind = SymbolKind(static_cast<std::uint8_t>(fb_symbol->kind()));
+        symbol.reference_files = read_bitmap(fb_symbol->refs());
     }
 
     return index;
