@@ -20,6 +20,7 @@
 #include "syntax/dependency_graph.h"
 #include "syntax/scan.h"
 
+#include "llvm/Support/Chrono.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 
@@ -30,6 +31,62 @@ namespace lsp = eventide::ipc::lsp;
 namespace refl = eventide::refl;
 using et::ipc::RequestResult;
 using RequestContext = et::ipc::JsonPeer::RequestContext;
+
+/// Hash a file's content using xxh3_64bits. Returns 0 on read failure.
+static std::uint64_t hash_file(llvm::StringRef path) {
+    auto buf = llvm::MemoryBuffer::getFile(path);
+    if(!buf)
+        return 0;
+    return llvm::xxh3_64bits((*buf)->getBuffer());
+}
+
+/// Capture a two-layer staleness snapshot after a successful compilation.
+/// Interns dependency paths into the PathPool and hashes each file's content.
+static DepsSnapshot capture_deps_snapshot(PathPool& pool, llvm::ArrayRef<std::string> deps) {
+    DepsSnapshot snap;
+    // Capture timestamp BEFORE hashing to avoid TOCTOU: if a file is modified
+    // during hashing, its mtime will be > build_at, triggering Layer 2 re-hash.
+    snap.build_at = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    snap.path_ids.reserve(deps.size());
+    snap.hashes.reserve(deps.size());
+    for(const auto& file: deps) {
+        snap.path_ids.push_back(pool.intern(file));
+        snap.hashes.push_back(hash_file(file));
+    }
+    return snap;
+}
+
+/// Two-layer staleness check.
+///
+/// Layer 1 (fast): stat each dep file, compare mtime against build_at.
+///   If all mtimes <= build_at → nothing changed, return false immediately.
+///
+/// Layer 2 (precise): for files with mtime > build_at, re-hash their content.
+///   If the hash matches the stored hash → file was touched but not modified.
+///   If any hash differs → truly changed, return true.
+static bool deps_changed(const PathPool& pool, const DepsSnapshot& snap) {
+    for(std::size_t i = 0; i < snap.path_ids.size(); ++i) {
+        auto path = pool.resolve(snap.path_ids[i]);
+        llvm::sys::fs::file_status status;
+        if(auto ec = llvm::sys::fs::status(path, status)) {
+            // File disappeared — definitely changed.
+            if(snap.hashes[i] != 0)
+                return true;
+            continue;
+        }
+
+        // Layer 1: mtime check (cheap, stat only).
+        auto current_mtime = llvm::sys::toTimeT(status.getLastModificationTime());
+        if(current_mtime <= snap.build_at)
+            continue;
+
+        // Layer 2: mtime is newer — re-hash content to confirm actual change.
+        auto current_hash = hash_file(path);
+        if(current_hash != snap.hashes[i])
+            return true;
+    }
+    return false;
+}
 
 MasterServer::MasterServer(et::event_loop& loop, et::ipc::JsonPeer& peer, std::string self_path) :
     loop(loop), peer(peer), pool(loop), self_path(std::move(self_path)) {}
@@ -270,34 +327,34 @@ et::task<bool> MasterServer::ensure_pch(std::uint32_t path_id,
     auto bound = compute_preamble_bound(text);
     if(bound == 0) {
         // No preamble directives — PCH would be empty. Clear any stale entry.
-        if(auto old_it = pch_paths.find(path_id); old_it != pch_paths.end()) {
-            fs::remove(old_it->second);
+        auto it = pch_states.find(path_id);
+        if(it != pch_states.end()) {
+            fs::remove(it->second.path);
+            pch_states.erase(it);
         }
-        pch_paths.erase(path_id);
-        pch_bounds.erase(path_id);
-        pch_hashes.erase(path_id);
         co_return true;
     }
 
     auto preamble_hash = llvm::xxh3_64bits(llvm::StringRef(text).substr(0, bound));
 
-    // Reuse existing PCH if preamble content hasn't changed.
-    if(auto it = pch_hashes.find(path_id); it != pch_hashes.end()) {
-        if(it->second == preamble_hash && pch_paths.contains(path_id)) {
-            pch_bounds[path_id] = bound;
+    // Reuse existing PCH if preamble content and deps haven't changed.
+    if(auto it = pch_states.find(path_id); it != pch_states.end()) {
+        auto& st = it->second;
+        if(st.hash == preamble_hash && !st.path.empty() && !deps_changed(path_pool, st.deps)) {
+            st.bound = bound;
             co_return true;
         }
     }
 
     // If another coroutine is already building PCH for this file, wait for it.
-    if(auto it = pch_building.find(path_id); it != pch_building.end()) {
-        co_await it->second->wait();
-        co_return pch_paths.contains(path_id);
+    if(auto it = pch_states.find(path_id); it != pch_states.end() && it->second.building) {
+        co_await it->second.building->wait();
+        co_return !pch_states[path_id].path.empty();
     }
 
     // Register in-flight build so concurrent requests wait on us.
     auto completion = std::make_shared<et::event>();
-    pch_building[path_id] = completion;
+    pch_states[path_id].building = completion;
 
     // Build a new PCH via stateless worker.
     worker::BuildPCHParams pch_params;
@@ -315,24 +372,25 @@ et::task<bool> MasterServer::ensure_pch(std::uint32_t path_id,
         LOG_WARN("PCH build failed for {}: {}",
                  path,
                  result.has_value() ? result.value().error : result.error().message);
-        pch_building.erase(path_id);
+        pch_states[path_id].building.reset();
         completion->set();
         co_return false;
     }
 
     // Delete old PCH temp file before replacing.
-    if(auto old_it = pch_paths.find(path_id); old_it != pch_paths.end()) {
-        fs::remove(old_it->second);
+    auto& st = pch_states[path_id];
+    if(!st.path.empty()) {
+        fs::remove(st.path);
     }
 
-    pch_paths[path_id] = result.value().pch_path;
-    pch_bounds[path_id] = bound;
-    pch_hashes[path_id] = preamble_hash;
+    st.path = result.value().pch_path;
+    st.bound = bound;
+    st.hash = preamble_hash;
+    st.deps = capture_deps_snapshot(path_pool, result.value().deps);
+    st.building.reset();
 
     LOG_INFO("PCH built for {}: {}", path, result.value().pch_path);
 
-    // Signal waiters after state is fully updated, then remove in-flight entry.
-    pch_building.erase(path_id);
     completion->set();
     co_return true;
 }
@@ -355,8 +413,8 @@ et::task<bool> MasterServer::ensure_deps(std::uint32_t path_id,
     // Build or reuse PCH.
     auto pch_ok = co_await ensure_pch(path_id, path, text, directory, arguments);
     if(pch_ok) {
-        if(auto pch_it = pch_paths.find(path_id); pch_it != pch_paths.end()) {
-            pch = {pch_it->second, pch_bounds[path_id]};
+        if(auto pch_it = pch_states.find(path_id); pch_it != pch_states.end()) {
+            pch = {pch_it->second.path, pch_it->second.bound};
         }
     }
 
@@ -410,9 +468,27 @@ et::task<bool> MasterServer::ensure_compiled(std::uint32_t path_id) {
 
     auto& doc = it->second;
 
-    // Fast path: AST is already up-to-date, nothing to do.
+    // Fast path: AST was previously compiled successfully.
+    // Check if any dependency file has changed since the last compilation.
+    // We check both AST deps (body includes) and PCH deps (preamble includes),
+    // because when PCH is active the preamble headers are baked into the PCH
+    // and won't appear in the AST's directive list.
     if(!doc.ast_dirty) {
-        co_return true;
+        bool changed = false;
+        auto ast_deps_it = ast_deps.find(path_id);
+        if(ast_deps_it != ast_deps.end() && deps_changed(path_pool, ast_deps_it->second)) {
+            changed = true;
+        }
+        if(!changed) {
+            auto pch_it = pch_states.find(path_id);
+            if(pch_it != pch_states.end() && deps_changed(path_pool, pch_it->second.deps)) {
+                changed = true;
+            }
+        }
+        if(!changed) {
+            co_return true;
+        }
+        doc.ast_dirty = true;
     }
 
     // Snapshot the generation counter *before* any co_await.  After compilation
@@ -502,6 +578,7 @@ et::task<bool> MasterServer::ensure_compiled(std::uint32_t path_id) {
 
     publish_diagnostics(uri_str, doc2.version, result.value().diagnostics);
     doc2.ast_dirty = false;
+    ast_deps[path_id] = capture_deps_snapshot(path_pool, result.value().deps);
     schedule_indexing();
     co_return true;
 }
@@ -975,7 +1052,7 @@ protocol::SymbolKind MasterServer::to_lsp_symbol_kind(SymbolKind kind) {
     }
 }
 
-et::task<std::optional<MasterServer::SymbolInfo>>
+et::task<std::optional<SymbolInfo>>
     MasterServer::lookup_symbol_at_position(const std::string& uri,
                                             const protocol::Position& position) {
     auto path = uri_to_path(uri);
@@ -1113,7 +1190,7 @@ protocol::TypeHierarchyItem MasterServer::build_type_hierarchy_item(const Symbol
     return item;
 }
 
-et::task<std::optional<MasterServer::SymbolInfo>>
+et::task<std::optional<SymbolInfo>>
     MasterServer::resolve_hierarchy_item(const std::string& uri,
                                          const protocol::Range& range,
                                          const std::optional<protocol::LSPAny>& data) {
@@ -1344,9 +1421,8 @@ void MasterServer::register_handlers() {
         }
 
         documents.erase(path_id);
-        pch_paths.erase(path_id);
-        pch_bounds.erase(path_id);
-        pch_hashes.erase(path_id);
+        pch_states.erase(path_id);
+        ast_deps.erase(path_id);
 
         // Clear diagnostics for closed file
         clear_diagnostics(params.text_document.uri);
@@ -1376,16 +1452,6 @@ void MasterServer::register_handlers() {
                     doc_it->second.ast_dirty = true;
                 }
             }
-        }
-
-        // Invalidate all cached PCH hashes — the saved file may be a header
-        // included by other TUs, so we must force rebuild for all open documents.
-        pch_hashes.clear();
-
-        // A saved header may be included by any open TU. Since pch_hashes
-        // were cleared, all cached ASTs are potentially stale.
-        for(auto& [_, doc]: documents) {
-            doc.ast_dirty = true;
         }
 
         // Trigger background indexing after save.

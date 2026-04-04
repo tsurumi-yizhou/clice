@@ -30,9 +30,71 @@ namespace protocol = et::ipc::protocol;
 
 struct DocumentState {
     int version = 0;
+
     std::string text;
+
     std::uint64_t generation = 0;
+
     bool ast_dirty = true;
+};
+
+/// Two-layer staleness snapshot for compilation artifacts (PCH, AST, etc.).
+///
+/// Layer 1 (fast): compare each file's current mtime against build_at.
+///   If all mtimes <= build_at, the artifact is fresh (zero I/O beyond stat).
+///
+/// Layer 2 (precise): for files whose mtime changed, re-hash their content
+///   and compare against the stored hash.  If the hash matches, the file was
+///   "touched" but not actually modified — skip the rebuild.
+///
+/// This avoids unnecessary recompilation from timestamp-only changes (e.g.
+/// git checkout, touch, backup restore) while remaining cheap in the common
+/// case where nothing changed.
+struct DepsSnapshot {
+    /// File path IDs interned via PathPool.
+    llvm::SmallVector<std::uint32_t> path_ids;
+
+    /// xxh3_64bits of file content at build time.
+    llvm::SmallVector<std::uint64_t> hashes;
+
+    /// time_t when this snapshot was captured.
+    std::int64_t build_at = 0;
+};
+
+/// Cached PCH state for a single source file.
+struct PCHState {
+    /// Built PCH file path.
+    std::string path;
+
+    /// Preamble byte offset used when building.
+    std::uint32_t bound = 0;
+
+    /// xxh3 hash of preamble content.
+    std::uint64_t hash = 0;
+
+    /// Dependency snapshot for staleness detection.
+    DepsSnapshot deps;
+
+    /// Non-null while a build is in flight.
+    std::shared_ptr<et::event> building;
+};
+
+/// Information about a symbol at a given position.
+struct SymbolInfo {
+    /// Unique hash identifying this symbol across the project.
+    index::SymbolHash hash = 0;
+
+    /// Human-readable symbol name.
+    std::string name;
+
+    /// Symbol kind (function, class, variable, etc.).
+    SymbolKind kind;
+
+    /// URI of the file containing this symbol.
+    std::string uri;
+
+    /// Source range of the symbol's identifier.
+    protocol::Range range;
 };
 
 enum class ServerLifecycle : std::uint8_t {
@@ -51,95 +113,110 @@ public:
     void register_handlers();
 
 private:
+    /// Event loop for scheduling async tasks.
     et::event_loop& loop;
+
+    /// JSON-RPC peer for LSP communication.
     et::ipc::JsonPeer& peer;
+
+    /// Pool of stateful/stateless worker processes.
     WorkerPool pool;
+
+    /// Interning pool for file paths (path string -> uint32_t ID).
     PathPool path_pool;
+
+    /// Current server lifecycle state.
     ServerLifecycle lifecycle = ServerLifecycle::Uninitialized;
 
+    /// Path to the clice binary itself.
     std::string self_path;
+
+    /// Root directory of the opened workspace.
     std::string workspace_root;
+
+    /// User/project configuration.
     CliceConfig config;
 
+    /// Compilation database (compile_commands.json).
     CompilationDatabase cdb;
+
+    /// Include/module dependency graph built from fast lexer scanning.
     DependencyGraph dependency_graph;
 
-    // Module compilation graph (lazy dependency resolution).
+    /// Module compilation graph (lazy dependency resolution).
     std::unique_ptr<CompileGraph> compile_graph;
 
-    // path_id -> built PCM output path (set after successful module build).
+    /// path_id -> built PCM output path (set after successful module build).
     llvm::DenseMap<std::uint32_t, std::string> pcm_paths;
 
-    // path_id -> module name (for files that provide a module interface).
+    /// path_id -> module name (for files that provide a module interface).
     llvm::DenseMap<std::uint32_t, std::string> path_to_module;
 
-    // path_id -> built PCH file path.
-    llvm::DenseMap<std::uint32_t, std::string> pch_paths;
-
-    // path_id -> preamble bound (byte offset) used when building the PCH.
-    llvm::DenseMap<std::uint32_t, std::uint32_t> pch_bounds;
-
-    // path_id -> hash of preamble content at PCH build time (for staleness detection).
-    llvm::DenseMap<std::uint32_t, std::uint64_t> pch_hashes;
-
-    // path_id -> in-flight PCH build event (later arrivals co_await the same build).
-    llvm::DenseMap<std::uint32_t, std::shared_ptr<et::event>> pch_building;
+    /// path_id -> cached PCH state (path, preamble hash, deps, build event).
+    llvm::DenseMap<std::uint32_t, PCHState> pch_states;
 
     // === Index state ===
 
-    // Global symbol table and path mapping for the project.
+    /// Global symbol table and path mapping for the project.
     index::ProjectIndex project_index;
 
-    // Per-file merged index shards (keyed by project-level path_id).
+    /// Per-file merged index shards (keyed by project-level path_id).
     llvm::DenseMap<std::uint32_t, index::MergedIndex> merged_indices;
 
-    // Files queued for background indexing (server-level path_ids from CDB).
+    /// Files queued for background indexing (server-level path_ids from CDB).
     std::vector<std::uint32_t> index_queue;
 
-    // Index of next file to process in index_queue.
+    /// Index of next file to process in index_queue.
     std::size_t index_queue_pos = 0;
 
-    // Whether background indexing is currently in progress.
+    /// Whether background indexing is currently in progress.
     bool indexing_active = false;
 
-    // Whether a background indexing coroutine has been scheduled (waiting on timer).
+    /// Whether a background indexing coroutine has been scheduled (waiting on timer).
     bool indexing_scheduled = false;
 
-    // Timer for idle-triggered background indexing.
+    /// Timer for idle-triggered background indexing.
     std::shared_ptr<et::timer> index_idle_timer;
 
-    // Document state: path_id -> DocumentState
+    /// path_id -> open document state (text, version, generation, dirty flag).
     llvm::DenseMap<std::uint32_t, DocumentState> documents;
 
-    // Helper: convert URI to file path
+    /// Per-file dependency snapshots from last successful AST compilation.
+    llvm::DenseMap<std::uint32_t, DepsSnapshot> ast_deps;
+
+    // === Helpers ===
+
+    /// Convert a file:// URI to a local file path.
     std::string uri_to_path(const std::string& uri);
 
-    // Publish diagnostics to client
+    /// Publish diagnostics to the LSP client.
     void publish_diagnostics(const std::string& uri,
                              int version,
                              const eventide::serde::RawValue& diagnostics_json);
+
+    /// Clear diagnostics for a file (publish empty array).
     void clear_diagnostics(const std::string& uri);
 
-    // Ensure a file has been compiled before servicing feature requests
+    /// Pull-based compilation entry point. Ensures AST is up-to-date.
     et::task<bool> ensure_compiled(std::uint32_t path_id);
 
-    // Load CDB and build initial include graph
+    /// Load CDB and build initial include/module dependency graph.
     et::task<> load_workspace();
 
-    // Helper: fill compile arguments from CDB into worker params
+    /// Fill compile arguments from CDB for a given file.
     bool fill_compile_args(llvm::StringRef path,
                            std::string& directory,
                            std::vector<std::string>& arguments);
 
-    // Build or reuse PCH for a source file. Returns true if PCH is available.
+    /// Build or reuse PCH for a source file. Returns true if PCH is available.
     et::task<bool> ensure_pch(std::uint32_t path_id,
                               llvm::StringRef path,
                               const std::string& text,
                               const std::string& directory,
                               const std::vector<std::string>& arguments);
 
-    // Compile module dependencies, build/reuse PCH, and fill PCM paths into
-    // the given fields. Shared by ensure_compiled() and forward_stateless().
+    /// Compile module dependencies, build/reuse PCH, and fill PCM paths.
+    /// Shared preparation step for ensure_compiled() and forward_stateless().
     et::task<bool> ensure_deps(std::uint32_t path_id,
                                llvm::StringRef path,
                                const std::string& text,
@@ -148,22 +225,23 @@ private:
                                std::pair<std::string, uint32_t>& pch,
                                std::unordered_map<std::string, std::string>& pcms);
 
-    // Schedule background indexing when idle.
+    /// Schedule background indexing when idle.
     void schedule_indexing();
 
-    // Background indexing coroutine: picks files from queue and dispatches to workers.
+    /// Background indexing coroutine: picks files from queue and dispatches to workers.
     et::task<> run_background_indexing();
 
-    // Merge a TUIndex result into ProjectIndex and MergedIndex shards.
+    /// Merge a TUIndex result into ProjectIndex and MergedIndex shards.
     void merge_index_result(const void* tu_index_data, std::size_t size);
 
-    // Persist index state to disk.
+    /// Persist index state to disk.
     void save_index();
 
-    // Load index state from disk.
+    /// Load index state from disk.
     void load_index();
 
-    // Forwarding helpers for feature requests (RawValue passthrough)
+    // === Feature request forwarding ===
+
     using RawResult = et::task<et::serde::RawValue, et::ipc::Error>;
 
     /// Forward a simple stateful request (path-only worker params).
@@ -178,20 +256,12 @@ private:
     template <typename WorkerParams>
     RawResult forward_stateless(const std::string& uri, const protocol::Position& position);
 
+    // === Index query helpers ===
+
     /// Query index for symbol relations (GoToDefinition, FindReferences, etc.).
-    /// Returns LSP Location array as RawValue.
     RawResult query_index_relations(const std::string& uri,
                                     const protocol::Position& position,
                                     RelationKind kind);
-
-    /// Information about a symbol at a given position.
-    struct SymbolInfo {
-        index::SymbolHash hash = 0;
-        std::string name;
-        SymbolKind kind;
-        std::string uri;
-        protocol::Range range;
-    };
 
     /// Look up a symbol at a position, returning its hash, name, kind, and range.
     et::task<std::optional<SymbolInfo>>
@@ -210,7 +280,6 @@ private:
     protocol::TypeHierarchyItem build_type_hierarchy_item(const SymbolInfo& info);
 
     /// Resolve SymbolInfo from a hierarchy item's stored data (symbol hash).
-    /// Falls back to position-based lookup if data is missing.
     et::task<std::optional<SymbolInfo>>
         resolve_hierarchy_item(const std::string& uri,
                                const protocol::Range& range,
