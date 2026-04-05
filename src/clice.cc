@@ -30,24 +30,6 @@ struct Options {
     <int> port = 50051;
 
     DecoKV(style = KVStyle::JoinedOrSeparate,
-           names = {"--stateful-worker-count", "--stateful-worker-count="},
-           help = "Number of stateful workers",
-           required = false)
-    <std::uint32_t> stateful_worker_count;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           names = {"--stateless-worker-count", "--stateless-worker-count="},
-           help = "Number of stateless workers",
-           required = false)
-    <std::uint32_t> stateless_worker_count;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate,
-           names = {"--worker-memory-limit", "--worker-memory-limit="},
-           help = "Memory limit per stateful worker (bytes)",
-           required = false)
-    <std::uint64_t> worker_memory_limit;
-
-    DecoKV(style = KVStyle::JoinedOrSeparate,
            names = {"--log-level", "--log-level="},
            help = "Log level: trace, debug, info, warn, error, off",
            required = false)
@@ -57,6 +39,20 @@ struct Options {
            help = "Record LSP input to file for replay testing",
            required = false)
     <std::string> record;
+
+    // Internal options (passed from master to worker processes)
+    DecoKV(style = KVStyle::JoinedOrSeparate,
+           names = {"--worker-memory-limit", "--worker-memory-limit="},
+           required = false)
+    <std::uint64_t> worker_memory_limit;
+
+    DecoKV(style = KVStyle::JoinedOrSeparate,
+           names = {"--worker-name", "--worker-name="},
+           required = false)
+    <std::string> worker_name;
+
+    DecoKV(style = KVStyle::JoinedOrSeparate, names = {"--log-dir", "--log-dir="}, required = false)
+    <std::string> log_dir;
 
     DecoFlag(names = {"-h", "--help"}, help = "Show help message", required = false)
     help;
@@ -108,13 +104,21 @@ int main(int argc, const char** argv) {
 
     auto& mode = *opts.mode;
 
+    auto worker_name = opts.worker_name.value_or("");
+    auto log_dir = opts.log_dir.value_or("");
+
     if(mode == "stateless-worker") {
-        return clice::run_stateless_worker_mode();
+        return clice::run_stateless_worker_mode(worker_name.empty() ? "stateless-worker"
+                                                                    : worker_name,
+                                                log_dir);
     }
 
     if(mode == "stateful-worker") {
         auto mem_limit = opts.worker_memory_limit.value_or(4ULL * 1024 * 1024 * 1024);
-        return clice::run_stateful_worker_mode(mem_limit);
+        return clice::run_stateful_worker_mode(mem_limit,
+                                               worker_name.empty() ? "stateful-worker"
+                                                                   : worker_name,
+                                               log_dir);
     }
 
     if(mode == "pipe") {
