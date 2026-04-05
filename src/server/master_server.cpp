@@ -1,5 +1,7 @@
 #include "server/master_server.h"
 
+#include <algorithm>
+#include <format>
 #include <optional>
 #include <string>
 #include <type_traits>
@@ -132,6 +134,214 @@ void MasterServer::clear_diagnostics(const std::string& uri) {
     peer.send_notification(params);
 }
 
+/// Serializable cache structures for cache.json persistence.
+/// Paths are stored in a shared table and referenced by index to avoid
+/// redundant storage (a single file can depend on thousands of headers,
+/// many of which are shared across entries).
+namespace {
+
+struct CacheDepEntry {
+    std::uint32_t path;  // index into CacheData::paths
+    std::uint64_t hash;
+};
+
+struct CachePCHEntry {
+    std::string filename;
+    std::uint32_t source_file;  // index into CacheData::paths
+    std::uint64_t hash;
+    std::uint32_t bound;
+    std::int64_t build_at;
+    std::vector<CacheDepEntry> deps;
+};
+
+struct CachePCMEntry {
+    std::string filename;
+    std::uint32_t source_file;  // index into CacheData::paths
+    std::string module_name;
+    std::int64_t build_at;
+    std::vector<CacheDepEntry> deps;
+};
+
+struct CacheData {
+    std::vector<std::string> paths;
+    std::vector<CachePCHEntry> pch;
+    std::vector<CachePCMEntry> pcm;
+};
+
+}  // namespace
+
+void MasterServer::load_cache() {
+    if(config.cache_dir.empty())
+        return;
+
+    auto cache_path = path::join(config.cache_dir, "cache", "cache.json");
+    auto content = fs::read(cache_path);
+    if(!content) {
+        LOG_DEBUG("No cache.json found at {}", cache_path);
+        return;
+    }
+
+    CacheData data;
+    auto status = et::serde::json::from_json(*content, data);
+    if(!status) {
+        LOG_WARN("Failed to parse cache.json");
+        return;
+    }
+
+    auto resolve = [&](std::uint32_t idx) -> llvm::StringRef {
+        return idx < data.paths.size() ? llvm::StringRef(data.paths[idx]) : "";
+    };
+
+    for(auto& entry: data.pch) {
+        auto pch_path = path::join(config.cache_dir, "cache", "pch", entry.filename);
+        auto source = resolve(entry.source_file);
+        if(!llvm::sys::fs::exists(pch_path) || source.empty())
+            continue;
+
+        DepsSnapshot deps;
+        deps.build_at = entry.build_at;
+        for(auto& dep: entry.deps) {
+            auto dep_path = resolve(dep.path);
+            if(dep_path.empty())
+                continue;
+            deps.path_ids.push_back(path_pool.intern(dep_path));
+            deps.hashes.push_back(dep.hash);
+        }
+
+        auto path_id = path_pool.intern(source);
+        auto& st = pch_states[path_id];
+        st.path = pch_path;
+        st.hash = entry.hash;
+        st.bound = entry.bound;
+        st.deps = std::move(deps);
+
+        LOG_DEBUG("Loaded cached PCH: {} -> {}", source, pch_path);
+    }
+
+    for(auto& entry: data.pcm) {
+        auto pcm_path = path::join(config.cache_dir, "cache", "pcm", entry.filename);
+        auto source = resolve(entry.source_file);
+        if(!llvm::sys::fs::exists(pcm_path) || source.empty())
+            continue;
+
+        DepsSnapshot deps;
+        deps.build_at = entry.build_at;
+        for(auto& dep: entry.deps) {
+            auto dep_path = resolve(dep.path);
+            if(dep_path.empty())
+                continue;
+            deps.path_ids.push_back(path_pool.intern(dep_path));
+            deps.hashes.push_back(dep.hash);
+        }
+
+        auto path_id = path_pool.intern(source);
+        pcm_states[path_id] = {pcm_path, std::move(deps)};
+        pcm_paths[path_id] = pcm_path;
+
+        LOG_DEBUG("Loaded cached PCM: {} (module {}) -> {}", source, entry.module_name, pcm_path);
+    }
+
+    LOG_INFO("Loaded cache.json: {} PCH entries, {} PCM entries",
+             pch_states.size(),
+             pcm_states.size());
+}
+
+void MasterServer::save_cache() {
+    if(config.cache_dir.empty())
+        return;
+
+    CacheData data;
+    std::unordered_map<std::string, std::uint32_t> index_map;
+
+    auto intern = [&](std::uint32_t runtime_path_id) -> std::uint32_t {
+        auto path = std::string(path_pool.resolve(runtime_path_id));
+        auto [it, inserted] =
+            index_map.try_emplace(path, static_cast<std::uint32_t>(data.paths.size()));
+        if(inserted) {
+            data.paths.push_back(path);
+        }
+        return it->second;
+    };
+
+    for(auto& [path_id, st]: pch_states) {
+        if(st.path.empty())
+            continue;
+
+        CachePCHEntry entry;
+        entry.filename = std::string(path::filename(st.path));
+        entry.source_file = intern(path_id);
+        entry.hash = st.hash;
+        entry.bound = st.bound;
+        entry.build_at = st.deps.build_at;
+        for(std::size_t i = 0; i < st.deps.path_ids.size(); ++i) {
+            entry.deps.push_back({intern(st.deps.path_ids[i]), st.deps.hashes[i]});
+        }
+        data.pch.push_back(std::move(entry));
+    }
+
+    for(auto& [path_id, st]: pcm_states) {
+        if(st.path.empty())
+            continue;
+
+        CachePCMEntry entry;
+        entry.filename = std::string(path::filename(st.path));
+        entry.source_file = intern(path_id);
+        auto mod_it = path_to_module.find(path_id);
+        entry.module_name = mod_it != path_to_module.end() ? mod_it->second : "";
+        entry.build_at = st.deps.build_at;
+        for(std::size_t i = 0; i < st.deps.path_ids.size(); ++i) {
+            entry.deps.push_back({intern(st.deps.path_ids[i]), st.deps.hashes[i]});
+        }
+        data.pcm.push_back(std::move(entry));
+    }
+
+    auto json_str = et::serde::json::to_json(data);
+    if(!json_str) {
+        LOG_WARN("Failed to serialize cache.json");
+        return;
+    }
+
+    auto cache_path = path::join(config.cache_dir, "cache", "cache.json");
+    auto tmp_path = cache_path + ".tmp";
+    auto write_result = fs::write(tmp_path, *json_str);
+    if(!write_result) {
+        LOG_WARN("Failed to write cache.json.tmp: {}", write_result.error().message());
+        return;
+    }
+    auto rename_result = fs::rename(tmp_path, cache_path);
+    if(!rename_result) {
+        LOG_WARN("Failed to rename cache.json.tmp to cache.json: {}",
+                 rename_result.error().message());
+    }
+}
+
+void MasterServer::cleanup_cache(int max_age_days) {
+    if(config.cache_dir.empty())
+        return;
+
+    auto now = std::chrono::system_clock::now();
+    auto max_age = std::chrono::hours(max_age_days * 24);
+
+    for(auto* subdir: {"cache/pch", "cache/pcm"}) {
+        auto dir = path::join(config.cache_dir, subdir);
+        std::error_code ec;
+        for(auto it = llvm::sys::fs::directory_iterator(dir, ec);
+            !ec && it != llvm::sys::fs::directory_iterator();
+            it.increment(ec)) {
+            llvm::sys::fs::file_status status;
+            if(auto stat_ec = llvm::sys::fs::status(it->path(), status))
+                continue;
+
+            auto mtime = status.getLastModificationTime();
+            auto age = now - mtime;
+            if(age > max_age) {
+                llvm::sys::fs::remove(it->path());
+                LOG_DEBUG("Cleaned up stale cache file: {}", it->path());
+            }
+        }
+    }
+}
+
 et::task<> MasterServer::load_workspace() {
     if(workspace_root.empty())
         co_return;
@@ -144,6 +354,20 @@ et::task<> MasterServer::load_workspace() {
         } else {
             LOG_INFO("Cache directory: {}", config.cache_dir);
         }
+
+        // Create cache/pch/ and cache/pcm/ subdirectories
+        for(auto* subdir: {"cache/pch", "cache/pcm"}) {
+            auto dir = path::join(config.cache_dir, subdir);
+            auto ec2 = llvm::sys::fs::create_directories(dir);
+            if(ec2) {
+                LOG_WARN("Failed to create {}: {}", dir, ec2.message());
+            }
+        }
+
+        // Clean up stale files first, then load — load_cache() only restores
+        // entries still listed in cache.json, so cleanup won't delete live files.
+        cleanup_cache();
+        load_cache();
     }
 
     // Search for compile_commands.json
@@ -270,18 +494,44 @@ et::task<> MasterServer::load_workspace() {
         }
 
         auto file_path = std::string(path_pool.resolve(path_id));
+
         worker::BuildPCMParams pcm_params;
         pcm_params.file = file_path;
         if(!fill_compile_args(file_path, pcm_params.directory, pcm_params.arguments)) {
             co_return false;
         }
+
+        // Compute deterministic content-addressed PCM path.
+        // Replace ':' with '-' in module name for filesystem safety.
+        // Hash includes file path AND compile arguments so that argument
+        // changes (e.g. -DFOO) invalidate the cached PCM.
+        auto safe_module_name = mod_it->second;
+        std::ranges::replace(safe_module_name, ':', '-');
+        std::string hash_input = file_path;
+        for(auto& arg: pcm_params.arguments) {
+            hash_input += arg;
+        }
+        auto args_hash = llvm::xxh3_64bits(llvm::StringRef(hash_input));
+        auto pcm_filename = std::format("{}-{:016x}.pcm", safe_module_name, args_hash);
+        auto pcm_path = path::join(config.cache_dir, "cache", "pcm", pcm_filename);
+
+        // Check if cached PCM is still valid.
+        if(auto pcm_it = pcm_states.find(path_id); pcm_it != pcm_states.end()) {
+            if(!pcm_it->second.path.empty() && llvm::sys::fs::exists(pcm_it->second.path) &&
+               !deps_changed(path_pool, pcm_it->second.deps)) {
+                pcm_paths[path_id] = pcm_it->second.path;
+                co_return true;
+            }
+        }
+
         pcm_params.module_name = mod_it->second;
+        pcm_params.output_path = pcm_path;
 
         // Clang needs ALL transitive PCM deps, not just direct imports.
-        for(auto& [pid, pcm_path]: pcm_paths) {
+        for(auto& [pid, existing_pcm_path]: pcm_paths) {
             auto dep_mod_it = path_to_module.find(pid);
             if(dep_mod_it != path_to_module.end()) {
-                pcm_params.pcms[dep_mod_it->second] = pcm_path;
+                pcm_params.pcms[dep_mod_it->second] = existing_pcm_path;
             }
         }
 
@@ -294,7 +544,13 @@ et::task<> MasterServer::load_workspace() {
         }
 
         pcm_paths[path_id] = result.value().pcm_path;
+        pcm_states[path_id] = {result.value().pcm_path,
+                               capture_deps_snapshot(path_pool, result.value().deps)};
         LOG_INFO("Built PCM for module {}: {}", mod_it->second, result.value().pcm_path);
+
+        // Persist cache metadata after successful build.
+        save_cache();
+
         co_return true;
     };
 
@@ -327,15 +583,15 @@ et::task<bool> MasterServer::ensure_pch(std::uint32_t path_id,
     auto bound = compute_preamble_bound(text);
     if(bound == 0) {
         // No preamble directives — PCH would be empty. Clear any stale entry.
-        auto it = pch_states.find(path_id);
-        if(it != pch_states.end()) {
-            fs::remove(it->second.path);
-            pch_states.erase(it);
-        }
+        pch_states.erase(path_id);
         co_return true;
     }
 
     auto preamble_hash = llvm::xxh3_64bits(llvm::StringRef(text).substr(0, bound));
+
+    // Deterministic content-addressed PCH path.
+    auto pch_path =
+        path::join(config.cache_dir, "cache", "pch", std::format("{:016x}.pch", preamble_hash));
 
     // Reuse existing PCH if preamble content and deps haven't changed.
     if(auto it = pch_states.find(path_id); it != pch_states.end()) {
@@ -363,8 +619,9 @@ et::task<bool> MasterServer::ensure_pch(std::uint32_t path_id,
     pch_params.arguments = arguments;
     pch_params.content = text;
     pch_params.preamble_bound = bound;
+    pch_params.output_path = pch_path;
 
-    LOG_DEBUG("Building PCH for {}, bound={}", path, bound);
+    LOG_DEBUG("Building PCH for {}, bound={}, output={}", path, bound, pch_path);
 
     auto result = co_await pool.send_stateless(pch_params);
 
@@ -377,12 +634,9 @@ et::task<bool> MasterServer::ensure_pch(std::uint32_t path_id,
         co_return false;
     }
 
-    // Delete old PCH temp file before replacing.
+    // Update state — no need to delete old file; content-addressed names differ
+    // when content differs, and the 7-day cleanup handles orphaned files.
     auto& st = pch_states[path_id];
-    if(!st.path.empty()) {
-        fs::remove(st.path);
-    }
-
     st.path = result.value().pch_path;
     st.bound = bound;
     st.hash = preamble_hash;
@@ -390,6 +644,9 @@ et::task<bool> MasterServer::ensure_pch(std::uint32_t path_id,
     st.building.reset();
 
     LOG_INFO("PCH built for {}: {}", path, result.value().pch_path);
+
+    // Persist cache metadata after successful build.
+    save_cache();
 
     completion->set();
     co_return true;
@@ -1331,8 +1588,9 @@ void MasterServer::register_handlers() {
         lifecycle = ServerLifecycle::Exited;
         LOG_INFO("Exit notification received");
 
-        // Persist index state before stopping.
+        // Persist index and cache state before stopping.
         save_index();
+        save_cache();
 
         // Graceful shutdown: cancel compilations, stop workers, then stop loop
         loop.schedule([this]() -> et::task<> {
@@ -1442,6 +1700,7 @@ void MasterServer::register_handlers() {
             // Remove stale PCMs for all invalidated units.
             for(auto dirty_id: dirtied) {
                 pcm_paths.erase(dirty_id);
+                pcm_states.erase(dirty_id);
             }
             // Mark ast_dirty for open documents that depend on the saved file.
             for(auto dirty_id: dirtied) {
