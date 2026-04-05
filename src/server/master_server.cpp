@@ -1373,7 +1373,7 @@ void MasterServer::register_handlers() {
         auto& doc = it->second;
         doc.version = params.text_document.version;
 
-        // Apply incremental changes
+        // Apply content changes.
         for(auto& change: params.content_changes) {
             std::visit(
                 [&](auto& c) {
@@ -1384,7 +1384,6 @@ void MasterServer::register_handlers() {
                     } else {
                         // Incremental change: replace range
                         auto& range = c.range;
-
                         lsp::PositionMapper mapper(doc.text, lsp::PositionEncoding::UTF16);
                         auto start = mapper.to_offset(range.start);
                         auto end = mapper.to_offset(range.end);
@@ -1403,7 +1402,6 @@ void MasterServer::register_handlers() {
         worker::DocumentUpdateParams update;
         update.path = path;
         update.version = doc.version;
-        update.text = doc.text;
         pool.notify_stateful(path_id, update);
     });
 

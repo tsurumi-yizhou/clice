@@ -78,7 +78,7 @@ class StatefulWorker {
     et::ipc::BincodePeer& peer;
     std::uint64_t memory_limit;
 
-    llvm::StringMap<std::unique_ptr<DocumentEntry>> documents;
+    llvm::StringMap<std::shared_ptr<DocumentEntry>> documents;
 
     // LRU tracking — owns keys so they don't dangle after request handler returns
     std::list<std::string> lru;
@@ -106,13 +106,13 @@ class StatefulWorker {
         }
     }
 
-    DocumentEntry& get_or_create(llvm::StringRef path) {
+    std::shared_ptr<DocumentEntry> get_or_create(llvm::StringRef path) {
         auto [it, inserted] = documents.try_emplace(path, nullptr);
         if(inserted) {
-            it->second = std::make_unique<DocumentEntry>();
+            it->second = std::make_shared<DocumentEntry>();
             LOG_DEBUG("Created new document entry: {}", path.str());
         }
-        return *it->second;
+        return it->second;
     }
 
     /// Look up document, wait for AST, lock strand, run fn(doc) on thread pool, unlock.
@@ -123,19 +123,20 @@ class StatefulWorker {
         if(it == documents.end())
             co_return et::serde::RawValue{"null"};
 
-        auto& doc = *it->second;
+        // Hold shared_ptr so Evict can't destroy the entry mid-request.
+        auto doc = it->second;
         touch_lru(path);
 
-        co_await doc.ast_ready.wait();
-        co_await doc.strand.lock();
+        co_await doc->ast_ready.wait();
+        co_await doc->strand.lock();
 
         auto result = co_await et::queue([&]() -> et::serde::RawValue {
-            if(!doc.has_ast || (!doc.unit.completed() && !doc.unit.fatal_error()))
+            if(!doc->has_ast || (!doc->unit.completed() && !doc->unit.fatal_error()))
                 return et::serde::RawValue{"null"};
-            return fn(doc);
+            return fn(*doc);
         });
 
-        doc.strand.unlock();
+        doc->strand.unlock();
         co_return result.value();
     }
 
@@ -153,71 +154,78 @@ void StatefulWorker::register_handlers() {
                const worker::CompileParams& params) -> RequestResult<worker::CompileParams> {
             LOG_INFO("Compile request: path={}, version={}", params.path, params.version);
 
-            auto& doc = get_or_create(params.path);
-            doc.version = params.version;
-            doc.text = params.text;
-            doc.directory = params.directory;
-            doc.arguments = params.arguments;
-            doc.pch = params.pch;
-            doc.pcms.clear();
-            for(auto& [name, pcm_path]: params.pcms) {
-                doc.pcms.try_emplace(name, pcm_path);
-            }
-
+            // Hold shared_ptr so Evict can't destroy the entry mid-compile.
+            auto doc = get_or_create(params.path);
             touch_lru(params.path);
 
-            co_await doc.strand.lock();
+            co_await doc->strand.lock();
+
+            // Copy params to doc AFTER acquiring the strand lock, so that
+            // concurrent Compile requests waiting on the strand don't
+            // overwrite our fields before we use them.
+            doc->version = params.version;
+            doc->text = params.text;
+            doc->directory = params.directory;
+            doc->arguments = params.arguments;
+            doc->pch = params.pch;
+            doc->pcms.clear();
+            for(auto& [name, pcm_path]: params.pcms) {
+                doc->pcms.try_emplace(name, pcm_path);
+            }
 
             auto compile_result = co_await et::queue([&]() -> worker::CompileResult {
-                LOG_DEBUG("Compiling: path={}, {} args", params.path, doc.arguments.size());
-
                 ScopedTimer timer;
 
                 CompilationParams cp;
                 cp.kind = CompilationKind::Content;
-                fill_args(cp, doc.directory, doc.arguments);
-                if(!doc.pch.first.empty()) {
-                    cp.pch = doc.pch;
+                fill_args(cp, doc->directory, doc->arguments);
+                if(!doc->pch.first.empty()) {
+                    cp.pch = doc->pch;
                 }
-                cp.add_remapped_file(params.path, doc.text);
-                for(auto& entry: doc.pcms) {
+                cp.add_remapped_file(params.path, doc->text);
+                for(auto& entry: doc->pcms) {
                     cp.pcms.try_emplace(entry.getKey(), entry.getValue());
                 }
 
-                doc.unit = compile(cp);
-                doc.has_ast = true;
-                doc.dirty.store(false, std::memory_order_release);
+                doc->unit = compile(cp);
+                doc->has_ast = true;
+                doc->dirty.store(false, std::memory_order_release);
 
                 worker::CompileResult result;
-                result.version = doc.version;
-                if(doc.unit.completed() || doc.unit.fatal_error()) {
-                    auto diags = feature::diagnostics(doc.unit);
+                result.version = doc->version;
+                if(doc->unit.completed() || doc->unit.fatal_error()) {
+                    auto diags = feature::diagnostics(doc->unit);
                     auto json = et::serde::json::to_json<et::ipc::lsp_config>(diags);
                     result.diagnostics = et::serde::RawValue{json ? std::move(*json) : "[]"};
                     LOG_INFO("Compile done: path={}, {}ms, {} diags, fatal={}",
                              params.path,
                              timer.ms(),
                              diags.size(),
-                             doc.unit.fatal_error());
+                             doc->unit.fatal_error());
                 } else {
                     result.diagnostics = et::serde::RawValue{"[]"};
                     LOG_WARN("Compile incomplete: path={}, {}ms", params.path, timer.ms());
                 }
                 result.memory_usage = 0;  // TODO: query actual memory
-                if(doc.unit.completed()) {
-                    result.deps = doc.unit.deps();
+                if(doc->unit.completed()) {
+                    result.deps = doc->unit.deps();
                 }
                 return result;
             });
 
-            doc.strand.unlock();
-            doc.ast_ready.set();
+            doc->strand.unlock();
+            doc->ast_ready.set();
             shrink_if_over_limit();
 
             co_return compile_result.value();
         });
 
     // === DocumentUpdate ===
+    // Only mark the document dirty — do NOT update doc.text or doc.version
+    // here.  The et::queue compilation work may be reading doc.text on the
+    // thread pool concurrently, so writing it from the event loop would be
+    // a data race.  The next Compile request will bring the correct text
+    // and update it inside the strand lock.
     peer.on_notification([this](const worker::DocumentUpdateParams& params) {
         LOG_TRACE("DocumentUpdate: path={}, version={}", params.path, params.version);
 
@@ -227,10 +235,7 @@ void StatefulWorker::register_handlers() {
             return;
         }
 
-        auto& doc = *it->second;
-        doc.version = params.version;
-        doc.text = params.text;
-        doc.dirty.store(true, std::memory_order_release);
+        it->second->dirty.store(true, std::memory_order_release);
     });
 
     // === Evict ===
