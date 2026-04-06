@@ -55,6 +55,13 @@ struct DocumentState {
     std::shared_ptr<PendingCompile> compiling;
 };
 
+/// Context for compiling a header file that lacks its own CDB entry.
+struct HeaderFileContext {
+    std::uint32_t host_path_id;   // Source file acting as host
+    std::string preamble_path;    // Path to generated preamble file on disk
+    std::uint64_t preamble_hash;  // Hash of preamble content for staleness
+};
+
 /// Two-layer staleness snapshot for compilation artifacts (PCH, AST, etc.).
 ///
 /// Layer 1 (fast): compare each file's current mtime against build_at.
@@ -216,6 +223,14 @@ private:
     /// Per-file dependency snapshots from last successful AST compilation.
     llvm::DenseMap<std::uint32_t, DepsSnapshot> ast_deps;
 
+    /// Header context cache: header_path_id -> context
+    llvm::DenseMap<std::uint32_t, HeaderFileContext> header_file_contexts;
+
+    /// Active compilation context overrides: path_id -> context_path_id.
+    /// When a file has an entry here, it is compiled using the context file's
+    /// compile command (e.g. a header compiled through a specific source file).
+    llvm::DenseMap<std::uint32_t, std::uint32_t> active_contexts;
+
     // === Helpers ===
 
     /// Convert a file:// URI to a local file path.
@@ -239,6 +254,18 @@ private:
     bool fill_compile_args(llvm::StringRef path,
                            std::string& directory,
                            std::vector<std::string>& arguments);
+
+    /// Fill compile arguments using header context (host source's CDB entry
+    /// with file path replaced and preamble injected).
+    bool fill_header_context_args(llvm::StringRef path,
+                                  std::uint32_t path_id,
+                                  std::string& directory,
+                                  std::vector<std::string>& arguments);
+
+    /// Generate a preamble file for compiling a header in context.
+    /// The preamble contains all code from the host source (and intermediate
+    /// headers) that comes BEFORE the #include of the target header.
+    std::optional<HeaderFileContext> resolve_header_context(std::uint32_t header_path_id);
 
     /// Build or reuse PCH for a source file. Returns true if PCH is available.
     et::task<bool> ensure_pch(std::uint32_t path_id,

@@ -1,0 +1,263 @@
+"""Integration tests for header context LSP extension commands.
+
+Tests the clice/queryContext, clice/currentContext, and clice/switchContext
+extension commands that allow switching the compilation context for header files.
+
+utils.h uses Point without including types.h itself -- it depends on
+main.cpp to provide that include.  Without header context resolution, the
+server cannot compile utils.h at all.
+"""
+
+import asyncio
+
+import pytest
+from lsprotocol.types import (
+    HoverParams,
+    Position,
+    TextDocumentIdentifier,
+)
+
+
+def _doc(uri: str) -> TextDocumentIdentifier:
+    return TextDocumentIdentifier(uri=uri)
+
+
+def _get(obj, key, default=None):
+    """Access a field from either a dict or an object with attributes."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+@pytest.mark.workspace("header_context")
+async def test_query_context_returns_host_sources(client, workspace):
+    """clice/queryContext on a header should return source files that include it."""
+    await client.open_and_wait(workspace / "main.cpp")
+
+    utils_h = workspace / "utils.h"
+    utils_uri, _ = client.open(utils_h)
+
+    result = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/queryContext", {"uri": utils_uri}),
+        timeout=30.0,
+    )
+    assert result is not None
+    total = _get(result, "total")
+    contexts = _get(result, "contexts", [])
+    assert total >= 1, f"Should find at least main.cpp as context, got total={total}"
+    # Check that main.cpp is among the contexts.
+    uris = [_get(c, "uri") for c in contexts]
+    assert any("main.cpp" in u for u in uris), (
+        f"main.cpp should be listed as a context option, got: {uris}"
+    )
+
+
+@pytest.mark.workspace("header_context")
+async def test_query_context_source_file_returns_cdb_entries(client, workspace):
+    """clice/queryContext on a source file should return its CDB entries."""
+    main_uri, _ = await client.open_and_wait(workspace / "main.cpp")
+
+    result = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/queryContext", {"uri": main_uri}),
+        timeout=30.0,
+    )
+    assert result is not None
+    # header_context workspace has exactly 1 CDB entry for main.cpp.
+    assert _get(result, "total") == 1
+    contexts = _get(result, "contexts", [])
+    assert len(contexts) == 1
+
+
+@pytest.mark.workspace("header_context")
+async def test_current_context_default_null(client, workspace):
+    """clice/currentContext should return null context by default."""
+    await client.open_and_wait(workspace / "main.cpp")
+
+    utils_h = workspace / "utils.h"
+    utils_uri, _ = client.open(utils_h)
+
+    result = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/currentContext", {"uri": utils_uri}),
+        timeout=30.0,
+    )
+    assert result is not None
+    assert _get(result, "context") is None, (
+        "Default context should be null (no explicit override)"
+    )
+
+
+@pytest.mark.workspace("header_context")
+async def test_switch_context_and_current_context(client, workspace):
+    """switchContext should set the active context, currentContext should reflect it."""
+    main_uri, _ = await client.open_and_wait(workspace / "main.cpp")
+
+    utils_h = workspace / "utils.h"
+    utils_uri, _ = client.open(utils_h)
+
+    # Switch context to main.cpp.
+    switch_result = await asyncio.wait_for(
+        client.protocol.send_request_async(
+            "clice/switchContext",
+            {"uri": utils_uri, "contextUri": main_uri},
+        ),
+        timeout=30.0,
+    )
+    assert switch_result is not None
+    assert _get(switch_result, "success") is True
+
+    # Verify currentContext now returns main.cpp.
+    current = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/currentContext", {"uri": utils_uri}),
+        timeout=30.0,
+    )
+    assert current is not None
+    ctx = _get(current, "context")
+    assert ctx is not None, (
+        "After switchContext, currentContext should return the active context"
+    )
+    assert "main.cpp" in _get(ctx, "uri")
+
+
+@pytest.mark.workspace("header_context")
+async def test_full_context_flow(client, workspace):
+    """Full flow: open, query, switch, verify hover works in header context."""
+    # 1. Open main.cpp, wait for initial compile.
+    main_uri, _ = await client.open_and_wait(workspace / "main.cpp")
+
+    # 2. Open utils.h (non self-contained header using Point from types.h).
+    utils_h = workspace / "utils.h"
+    utils_uri, _ = client.open(utils_h)
+
+    # 3. queryContext on utils.h -> should return main.cpp as a context option.
+    query = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/queryContext", {"uri": utils_uri}),
+        timeout=30.0,
+    )
+    assert _get(query, "total") >= 1
+    contexts = _get(query, "contexts", [])
+    context_uris = [_get(c, "uri") for c in contexts]
+    assert any("main.cpp" in u for u in context_uris)
+
+    # 4. currentContext on utils.h -> should be null (default).
+    current = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/currentContext", {"uri": utils_uri}),
+        timeout=30.0,
+    )
+    assert _get(current, "context") is None
+
+    # 5. switchContext on utils.h to main.cpp.
+    switch = await asyncio.wait_for(
+        client.protocol.send_request_async(
+            "clice/switchContext",
+            {"uri": utils_uri, "contextUri": main_uri},
+        ),
+        timeout=30.0,
+    )
+    assert _get(switch, "success") is True
+
+    # 6. currentContext on utils.h -> should now be main.cpp.
+    current2 = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/currentContext", {"uri": utils_uri}),
+        timeout=30.0,
+    )
+    ctx = _get(current2, "context")
+    assert ctx is not None
+    assert "main.cpp" in _get(ctx, "uri")
+
+    # 7. Hover on 'calc' function in utils.h -> should work (proves header compiled).
+    diag_event = client.wait_for_diagnostics(utils_uri)
+    hover = await asyncio.wait_for(
+        client.text_document_hover_async(
+            HoverParams(
+                text_document=_doc(utils_uri),
+                position=Position(line=6, character=12),  # 'calc' function
+            )
+        ),
+        timeout=30.0,
+    )
+    assert hover is not None, (
+        "Hover on 'calc' in header should work after switchContext"
+    )
+
+    # 8. Check diagnostics on utils.h -> should have 0 errors.
+    await asyncio.wait_for(diag_event.wait(), timeout=30.0)
+    diags = client.diagnostics.get(utils_uri, [])
+    errors = [d for d in diags if d.severity == 1]
+    assert len(errors) == 0, (
+        f"Header should have no errors after switchContext, got: {errors}"
+    )
+
+
+@pytest.mark.workspace("header_context")
+async def test_deep_nested_header_context(client, workspace):
+    """queryContext on a deeply nested header (main.cpp -> utils.h -> inner.h)
+    should still find main.cpp as the host source."""
+    await client.open_and_wait(workspace / "main.cpp")
+
+    inner_h = workspace / "inner.h"
+    inner_uri, _ = client.open(inner_h)
+
+    # queryContext on inner.h should find main.cpp through the chain.
+    result = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/queryContext", {"uri": inner_uri}),
+        timeout=30.0,
+    )
+    assert result is not None
+    total = _get(result, "total")
+    assert total >= 1, f"Deep nested header should find host sources, got total={total}"
+    contexts = _get(result, "contexts", [])
+    uris = [_get(c, "uri") for c in contexts]
+    assert any("main.cpp" in u for u in uris), (
+        f"main.cpp should be a context for inner.h, got: {uris}"
+    )
+
+
+@pytest.mark.workspace("header_context")
+async def test_deep_nested_switch_context_and_hover(client, workspace):
+    """switchContext + hover on deeply nested header (main.cpp -> utils.h -> inner.h)."""
+    main_uri, _ = await client.open_and_wait(workspace / "main.cpp")
+
+    inner_h = workspace / "inner.h"
+    inner_uri, _ = client.open(inner_h)
+
+    # Switch inner.h context to main.cpp.
+    switch = await asyncio.wait_for(
+        client.protocol.send_request_async(
+            "clice/switchContext",
+            {"uri": inner_uri, "contextUri": main_uri},
+        ),
+        timeout=30.0,
+    )
+    assert _get(switch, "success") is True
+
+    # Hover on 'inner_origin' in inner.h should work (Point available via preamble).
+    hover = await asyncio.wait_for(
+        client.text_document_hover_async(
+            HoverParams(
+                text_document=_doc(inner_uri),
+                position=Position(line=3, character=14),  # 'inner_origin'
+            )
+        ),
+        timeout=30.0,
+    )
+    assert hover is not None, "Hover on inner_origin should work after switchContext"
+
+
+@pytest.mark.workspace("multi_context")
+async def test_query_context_multiple_cdb_entries(client, workspace):
+    """queryContext on a source file with multiple CDB entries should return all."""
+    main_cpp = workspace / "main.cpp"
+    main_uri, _ = await client.open_and_wait(main_cpp)
+
+    result = await asyncio.wait_for(
+        client.protocol.send_request_async("clice/queryContext", {"uri": main_uri}),
+        timeout=30.0,
+    )
+    assert result is not None
+    total = _get(result, "total")
+    assert total >= 2, f"Should find at least 2 CDB entries, got total={total}"
+    contexts = _get(result, "contexts", [])
+    labels = [_get(c, "label") for c in contexts]
+    # Each entry should have distinguishing flags in the label.
+    assert any("CONFIG_A" in l for l in labels), f"Should find CONFIG_A, got: {labels}"
+    assert any("CONFIG_B" in l for l in labels), f"Should find CONFIG_B, got: {labels}"

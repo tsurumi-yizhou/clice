@@ -140,6 +140,10 @@ class CliceClient(BaseLanguageClient):
         )
         return self._normalize_uri(wire_uri), content
 
+    def path_to_uri(self, filepath: Path) -> str:
+        """Convert a file path to a normalized URI without opening it."""
+        return self._normalize_uri(filepath.as_uri())
+
     async def wait_diagnostics(self, uri: str, timeout: float = 30.0) -> None:
         """Wait for diagnostics on the given URI."""
         uri = self._normalize_uri(uri)
@@ -220,6 +224,58 @@ def test_data_dir() -> Path:
         ]
         cdb_path.write_text(json.dumps(cdb, indent=2))
 
+    # Generate compile_commands.json for header_context (always regenerate
+    # because it contains absolute paths).
+    hc_dir = data_dir / "header_context"
+    hc_main = hc_dir / "main.cpp"
+    hc_cdb = hc_dir / "compile_commands.json"
+    if hc_main.exists():
+        cdb = [
+            {
+                "directory": hc_dir.as_posix(),
+                "file": hc_main.as_posix(),
+                "arguments": [
+                    "clang++",
+                    "-std=c++17",
+                    f"-I{hc_dir.as_posix()}",
+                    "-fsyntax-only",
+                    hc_main.as_posix(),
+                ],
+            }
+        ]
+        hc_cdb.write_text(json.dumps(cdb, indent=2))
+
+    # Generate compile_commands.json for multi_context (same file, two configs)
+    mc_dir = data_dir / "multi_context"
+    mc_main = mc_dir / "main.cpp"
+    mc_cdb = mc_dir / "compile_commands.json"
+    if mc_main.exists():
+        cdb = [
+            {
+                "directory": mc_dir.as_posix(),
+                "file": mc_main.as_posix(),
+                "arguments": [
+                    "clang++",
+                    "-std=c++17",
+                    "-DCONFIG_A",
+                    "-fsyntax-only",
+                    mc_main.as_posix(),
+                ],
+            },
+            {
+                "directory": mc_dir.as_posix(),
+                "file": mc_main.as_posix(),
+                "arguments": [
+                    "clang++",
+                    "-std=c++17",
+                    "-DCONFIG_B",
+                    "-fsyntax-only",
+                    mc_main.as_posix(),
+                ],
+            },
+        ]
+        mc_cdb.write_text(json.dumps(cdb, indent=2))
+
     # Generate compile_commands.json for include_completion
     ic_dir = data_dir / "include_completion"
     ic_main = ic_dir / "main.cpp"
@@ -239,6 +295,31 @@ def test_data_dir() -> Path:
             }
         ]
         ic_cdb.write_text(json.dumps(cdb, indent=2))
+
+    # Generate compile_commands.json for pch_test (always regenerate for
+    # absolute paths).
+    pt_dir = data_dir / "pch_test"
+    pt_cdb = pt_dir / "compile_commands.json"
+    for src_name in ["main.cpp", "no_includes.cpp"]:
+        src = pt_dir / src_name
+        if not src.exists():
+            continue
+        if src_name == "main.cpp":
+            entries = []
+        entries.append(
+            {
+                "directory": pt_dir.as_posix(),
+                "file": src.as_posix(),
+                "arguments": [
+                    "clang++",
+                    "-std=c++17",
+                    "-fsyntax-only",
+                    src.as_posix(),
+                ],
+            }
+        )
+    if pt_dir.exists():
+        pt_cdb.write_text(json.dumps(entries, indent=2))
 
     return data_dir
 
