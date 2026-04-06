@@ -112,6 +112,25 @@ int run_stateless_worker_mode(const std::string& worker_name, const std::string&
                     }
                 }
 
+                // Index preamble headers before destroying the unit.
+                //
+                // Uses interested_only=false to traverse all AST nodes (every
+                // header pulled in by the preamble).  This can be expensive for
+                // large preambles (LLVM/Qt/Boost) but only runs once per unique
+                // preamble content (content-addressed PCH path), and avoids a
+                // separate full recompilation in background indexing.
+                //
+                // The main file index is cleared afterwards — only headers
+                // matter here; the main file's own index comes from the
+                // stateful worker compile (interested_only=true).
+                std::string tu_index_serialized;
+                if(success) {
+                    auto tu_index = index::TUIndex::build(unit);
+                    tu_index.main_file_index = index::FileIndex();
+                    llvm::raw_string_ostream os(tu_index_serialized);
+                    tu_index.serialize(os);
+                }
+
                 // Destroy CompilationUnit to flush PCH file to disk
                 // (EndSourceFile serializes the AST on destruction).
                 unit = CompilationUnit(nullptr);
@@ -138,6 +157,7 @@ int run_stateless_worker_mode(const std::string& worker_name, const std::string&
                              timer.ms());
                     worker::BuildPCHResult pch_result{true, "", std::move(final_path)};
                     pch_result.deps = pch_info.deps;
+                    pch_result.tu_index_data = std::move(tu_index_serialized);
                     return pch_result;
                 } else {
                     LOG_WARN("BuildPCH failed: file={}, {}ms, errors=[{}]",
@@ -196,6 +216,16 @@ int run_stateless_worker_mode(const std::string& worker_name, const std::string&
                     }
                 }
 
+                // Index module content before destroying the unit.
+                // Use interested_only=true — we only need the module interface's
+                // own symbols and relations, not transitive header content.
+                std::string tu_index_serialized;
+                if(success) {
+                    auto tu_index = index::TUIndex::build(unit, true);
+                    llvm::raw_string_ostream os(tu_index_serialized);
+                    tu_index.serialize(os);
+                }
+
                 unit = CompilationUnit(nullptr);
 
                 if(success) {
@@ -214,6 +244,7 @@ int run_stateless_worker_mode(const std::string& worker_name, const std::string&
                     LOG_INFO("BuildPCM done: module={}, {}ms", params.module_name, timer.ms());
                     worker::BuildPCMResult pcm_result{true, "", std::move(final_path)};
                     pcm_result.deps = pcm_info.deps;
+                    pcm_result.tu_index_data = std::move(tu_index_serialized);
                     return pcm_result;
                 } else {
                     LOG_WARN("BuildPCM failed: module={}, {}ms, errors=[{}]",
