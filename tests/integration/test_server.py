@@ -165,7 +165,7 @@ async def test_definition_request(client, workspace):
     uri, _ = await client.open_and_wait(workspace / "main.cpp")
     result = await client.text_document_definition_async(
         DefinitionParams(
-            text_document=_doc(uri), position=Position(line=0, character=4)
+            text_document=_doc(uri), position=Position(line=2, character=4)
         )
     )
     client.text_document_did_close(DidCloseTextDocumentParams(text_document=_doc(uri)))
@@ -281,13 +281,13 @@ async def test_all_features_after_compile_wait(client, workspace):
     uri, _ = await client.open_and_wait(workspace / "main.cpp")
 
     hover = await client.text_document_hover_async(
-        HoverParams(text_document=_doc(uri), position=Position(line=0, character=4))
+        HoverParams(text_document=_doc(uri), position=Position(line=2, character=4))
     )
     assert hover is not None
 
     completion = await client.text_document_completion_async(
         CompletionParams(
-            text_document=_doc(uri), position=Position(line=5, character=18)
+            text_document=_doc(uri), position=Position(line=7, character=18)
         )
     )
 
@@ -299,7 +299,7 @@ async def test_all_features_after_compile_wait(client, workspace):
 
     await client.text_document_definition_async(
         DefinitionParams(
-            text_document=_doc(uri), position=Position(line=0, character=4)
+            text_document=_doc(uri), position=Position(line=2, character=4)
         )
     )
 

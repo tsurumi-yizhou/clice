@@ -15,9 +15,6 @@
 
 namespace clice {
 
-/// Default timeout for IPC requests to worker processes.
-constexpr inline auto kWorkerRequestTimeout = std::chrono::milliseconds(30000);
-
 namespace et = eventide;
 using et::ipc::RequestResult;
 
@@ -95,9 +92,10 @@ RequestResult<Params> WorkerPool::send_stateful(std::uint32_t path_id,
     if(stateful_workers.empty()) {
         co_return et::outcome_error(et::ipc::Error{"No stateful workers available"});
     }
-    if(!opts.timeout.has_value()) {
-        opts.timeout = kWorkerRequestTimeout;
-    }
+    // No timeout: compile tasks run as detached tasks (loop.schedule) that
+    // are immune to LSP $/cancelRequest.  Adding a timeout here would use
+    // eventide's with_token/when_any which has a spurious-cancellation bug
+    // that kills requests within milliseconds instead of the configured period.
     auto idx = assign_worker(path_id);
     co_return co_await stateful_workers[idx].peer->send_request(params, opts);
 }
@@ -107,9 +105,6 @@ RequestResult<Params> WorkerPool::send_stateless(const Params& params,
                                                  et::ipc::request_options opts) {
     if(stateless_workers.empty()) {
         co_return et::outcome_error(et::ipc::Error{"No stateless workers available"});
-    }
-    if(!opts.timeout.has_value()) {
-        opts.timeout = kWorkerRequestTimeout;
     }
     auto idx = next_stateless;
     next_stateless = (next_stateless + 1) % stateless_workers.size();

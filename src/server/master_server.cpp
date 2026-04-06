@@ -9,6 +9,7 @@
 #include <variant>
 #include <vector>
 
+#include "command/search_config.h"
 #include "eventide/ipc/json_codec.h"
 #include "eventide/ipc/lsp/position.h"
 #include "eventide/ipc/lsp/protocol.h"
@@ -22,9 +23,12 @@
 #include "support/filesystem.h"
 #include "support/logging.h"
 #include "syntax/dependency_graph.h"
+#include "syntax/include_resolver.h"
 #include "syntax/scan.h"
 
 #include "llvm/Support/Chrono.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/Process.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
@@ -447,9 +451,6 @@ et::task<> MasterServer::load_workspace() {
         }
         if(!index_queue.empty()) {
             LOG_INFO("Queued {} files for background indexing", index_queue.size());
-            for(auto sid: index_queue) {
-                LOG_INFO("  queue entry: server_path_id={} path='{}'", sid, path_pool.resolve(sid));
-            }
             schedule_indexing();
         }
     }
@@ -605,6 +606,12 @@ et::task<bool> MasterServer::ensure_pch(std::uint32_t path_id,
         }
     }
 
+    // Preamble incomplete (user still typing) — defer rebuild, reuse old PCH if available.
+    if(!is_preamble_complete(text, bound)) {
+        LOG_DEBUG("Preamble incomplete for {}, deferring PCH rebuild", path);
+        co_return pch_states.count(path_id) && !pch_states[path_id].path.empty();
+    }
+
     // If another coroutine is already building PCH for this file, wait for it.
     if(auto it = pch_states.find(path_id); it != pch_states.end() && it->second.building) {
         co_await it->second.building->wait();
@@ -670,6 +677,34 @@ et::task<bool> MasterServer::ensure_deps(std::uint32_t path_id,
         co_return false;
     }
 
+    // Scan buffer text for module imports that might not be in compile_graph yet.
+    // When a user adds `import std;` without saving, the compile_graph (disk-based)
+    // doesn't know about the new dependency. Scan the in-memory text to find them.
+    {
+        auto scan_result = scan(text);
+        for(auto& mod_name: scan_result.modules) {
+            if(mod_name.empty()) {
+                continue;
+            }
+            bool found = false;
+            for(auto& [pid, name]: path_to_module) {
+                if(name == mod_name) {
+                    // If PCM not already built, try to build it.
+                    if(pcm_paths.find(pid) == pcm_paths.end()) {
+                        if(compile_graph && compile_graph->has_unit(pid)) {
+                            co_await compile_graph->compile_deps(pid);
+                        }
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if(!found) {
+                LOG_DEBUG("Buffer imports unknown module '{}', skipping", mod_name);
+            }
+        }
+    }
+
     // Build or reuse PCH.
     auto pch_ok = co_await ensure_pch(path_id, path, text, directory, arguments);
     if(pch_ok) {
@@ -716,23 +751,24 @@ et::task<bool> MasterServer::ensure_deps(std::uint32_t path_id,
 /// worker); every other file is read from disk by the compiler.
 ///
 /// Concurrency: multiple concurrent feature requests for the same file will
-/// each call ensure_compiled(). The first one triggers the actual compilation;
-/// subsequent ones observe ast_dirty == false after the first completes and
-/// take the fast path. This is safe because forward_stateful serialises
-/// requests per worker slot.
+/// each call ensure_compiled(). The first one launches a detached compile
+/// task via loop.schedule(); subsequent ones wait on the shared event.
+/// The detached task cannot be cancelled by LSP $/cancelRequest, preventing
+/// the race where cancellation wakes all waiters and they all start compiles.
 et::task<bool> MasterServer::ensure_compiled(std::uint32_t path_id) {
     auto it = documents.find(path_id);
     if(it == documents.end()) {
+        LOG_DEBUG("ensure_compiled: doc not found for path_id={}", path_id);
         co_return false;
     }
 
     auto& doc = it->second;
+    LOG_DEBUG("ensure_compiled: path_id={} version={} gen={} ast_dirty={}",
+              path_id,
+              doc.version,
+              doc.generation,
+              doc.ast_dirty);
 
-    // Fast path: AST was previously compiled successfully.
-    // Check if any dependency file has changed since the last compilation.
-    // We check both AST deps (body includes) and PCH deps (preamble includes),
-    // because when PCH is active the preamble headers are baked into the PCH
-    // and won't appear in the AST's directive list.
     if(!doc.ast_dirty) {
         bool changed = false;
         auto ast_deps_it = ast_deps.find(path_id);
@@ -751,96 +787,139 @@ et::task<bool> MasterServer::ensure_compiled(std::uint32_t path_id) {
         doc.ast_dirty = true;
     }
 
-    // Snapshot the generation counter *before* any co_await.  After compilation
-    // we compare it with the current value to detect edits that arrived while
-    // we were suspended — if they differ, the result is stale and we must not
-    // mark the AST as clean.
-    auto gen = doc.generation;
-
-    auto file_path = std::string(path_pool.resolve(path_id));
-    auto uri = lsp::URI::from_file_path(file_path);
-    std::string uri_str = uri.has_value() ? uri->str() : file_path;
-
-    // After co_await suspension points the iterator may be invalidated (the
-    // documents map could have been modified by didClose on another file).
-    auto recheck = [&]() -> bool {
+    // If another compile is already in flight, wait for it.
+    // This co_await may be cancelled by LSP $/cancelRequest — that's fine,
+    // it just means this particular feature request is abandoned.  The
+    // detached compile task keeps running independently.
+    while(it->second.compiling) {
+        auto pending = it->second.compiling;
+        co_await pending->done.wait();
         it = documents.find(path_id);
-        return it != documents.end();
-    };
-
-    // ── Phase 1–3: Module deps, PCH, PCM paths ─────────────────────────
-    worker::CompileParams params;
-    params.path = file_path;
-    if(!recheck())
-        co_return false;
-    params.version = it->second.version;
-    params.text = it->second.text;
-    if(!fill_compile_args(path_pool.resolve(path_id), params.directory, params.arguments)) {
-        co_return false;
+        if(it == documents.end())
+            co_return false;
+        if(!it->second.ast_dirty)
+            co_return true;
     }
 
-    if(!co_await ensure_deps(path_id,
-                             params.path,
-                             params.text,
-                             params.directory,
-                             params.arguments,
-                             params.pch,
-                             params.pcms)) {
-        LOG_WARN("Dependency preparation failed for {}, skipping compile", uri_str);
-        co_return false;
-    }
+    // No compile in flight and AST is dirty — launch a detached compile task.
+    // The detached task is scheduled via loop.schedule() so it is NOT subject
+    // to LSP $/cancelRequest cancellation.  This eliminates the race where
+    // cancellation fires the RAII guard, waking all waiters simultaneously
+    // and causing them all to start new compiles.
+    auto pending_compile = std::make_shared<DocumentState::PendingCompile>();
+    it->second.compiling = pending_compile;
 
-    if(!recheck())
-        co_return false;
+    LOG_INFO("ensure_compiled: launching detached compile path_id={} gen={}",
+             path_id,
+             doc.generation);
 
-    // ── Phase 4: Dispatch to stateful worker ────────────────────────────
-    //
-    // The stateful worker receives the full document text and compile args,
-    // builds the AST, and caches it for subsequent feature requests.  The
-    // response carries diagnostics collected during compilation.
-    LOG_DEBUG("Sending compile: path={}, args={}, gen={}",
-              params.path,
-              params.arguments.size(),
-              gen);
+    loop.schedule([](MasterServer* self,
+                     std::uint32_t pid,
+                     std::shared_ptr<DocumentState::PendingCompile> pc) -> et::task<> {
+        // All parameters are copied into the coroutine frame as function args,
+        // so they survive the lambda temporary's destruction.
+        auto finish_compile = [&]() {
+            if(auto it = self->documents.find(pid); it != self->documents.end()) {
+                if(it->second.compiling == pc) {
+                    it->second.compiling.reset();
+                }
+            }
+            LOG_INFO("ensure_compiled: finish_compile (detached) path_id={}", pid);
+            pc->done.set();
+        };
 
-    auto result = co_await pool.send_stateful(path_id, params);
+        auto it = self->documents.find(pid);
+        if(it == self->documents.end()) {
+            finish_compile();
+            co_return;
+        }
 
-    // Re-lookup: the document may have been closed while we were compiling.
+        auto gen = it->second.generation;
+        LOG_INFO("ensure_compiled: starting compile (detached) path_id={} gen={}", pid, gen);
+
+        auto file_path = std::string(self->path_pool.resolve(pid));
+        auto uri = lsp::URI::from_file_path(file_path);
+        std::string uri_str = uri.has_value() ? uri->str() : file_path;
+
+        // ── Phase 1–3: Module deps, PCH, PCM paths ─────────────────────
+        worker::CompileParams params;
+        params.path = file_path;
+        params.version = it->second.version;
+        params.text = it->second.text;
+        if(!self->fill_compile_args(self->path_pool.resolve(pid),
+                                    params.directory,
+                                    params.arguments)) {
+            finish_compile();
+            co_return;
+        }
+
+        if(!co_await self->ensure_deps(pid,
+                                       params.path,
+                                       params.text,
+                                       params.directory,
+                                       params.arguments,
+                                       params.pch,
+                                       params.pcms)) {
+            LOG_WARN("Dependency preparation failed for {}, skipping compile", uri_str);
+            finish_compile();
+            co_return;
+        }
+
+        it = self->documents.find(pid);
+        if(it == self->documents.end()) {
+            finish_compile();
+            co_return;
+        }
+
+        // ── Phase 4: Dispatch to stateful worker ────────────────────────
+        auto result = co_await self->pool.send_stateful(pid, params);
+
+        // Re-lookup: the document may have been closed while we were compiling.
+        it = self->documents.find(pid);
+        if(it == self->documents.end()) {
+            finish_compile();
+            co_return;
+        }
+
+        auto& doc2 = it->second;
+
+        // ── Phase 5: Handle result ──────────────────────────────────────
+        if(doc2.generation != gen) {
+            LOG_INFO("ensure_compiled: generation mismatch ({} vs {}) for {}",
+                     doc2.generation,
+                     gen,
+                     uri_str);
+            finish_compile();
+            co_return;
+        }
+
+        if(!result.has_value()) {
+            LOG_WARN("Compile failed for {}: {}", uri_str, result.error().message);
+            self->clear_diagnostics(uri_str);
+            finish_compile();
+            co_return;
+        }
+
+        doc2.ast_dirty = false;
+        pc->succeeded = true;
+        self->ast_deps[pid] = capture_deps_snapshot(self->path_pool, result.value().deps);
+        finish_compile();
+
+        // Publish diagnostics AFTER marking compile as done, so that concurrent
+        // forward_stateful() calls can proceed immediately.
+        self->publish_diagnostics(uri_str, doc2.version, result.value().diagnostics);
+        self->schedule_indexing();
+    }(this, path_id, pending_compile));
+
+    // Wait for the detached compile to finish.  If this wait is cancelled
+    // by LSP $/cancelRequest, the detached task continues unaffected.
+    co_await pending_compile->done.wait();
+
     it = documents.find(path_id);
     if(it == documents.end())
         co_return false;
 
-    auto& doc2 = it->second;
-
-    // ── Phase 5: Handle result ──────────────────────────────────────────
-    //
-    // Generation mismatch means the user edited the file while we compiled.
-    // The AST we just built corresponds to an older version of the text, so
-    // we discard the diagnostics and leave ast_dirty == true.  The next
-    // feature request will trigger another compile cycle with the latest text.
-    if(doc2.generation != gen) {
-        if(result.has_value()) {
-            LOG_DEBUG("Generation mismatch ({} vs {}), dropping diagnostics for {}",
-                      doc2.generation,
-                      gen,
-                      uri_str);
-        }
-        co_return false;
-    }
-
-    if(!result.has_value()) {
-        LOG_WARN("Compile failed for {}: {}", uri_str, result.error().message);
-        // Clear stale diagnostics so the editor doesn't show errors from a
-        // previous successful compilation that no longer apply.
-        clear_diagnostics(uri_str);
-        co_return false;
-    }
-
-    publish_diagnostics(uri_str, doc2.version, result.value().diagnostics);
-    doc2.ast_dirty = false;
-    ast_deps[path_id] = capture_deps_snapshot(path_pool, result.value().deps);
-    schedule_indexing();
-    co_return true;
+    co_return !it->second.ast_dirty;
 }
 
 // =========================================================================
@@ -917,9 +996,6 @@ void MasterServer::merge_index_result(const void* tu_index_data, std::size_t siz
              tu_index.graph.paths.size(),
              tu_index.symbols.size(),
              merged_indices.size());
-    for(auto& [pid, _]: merged_indices) {
-        LOG_INFO("  shard proj_path_id={} path='{}'", pid, project_index.path_pool.path(pid));
-    }
 }
 
 void MasterServer::save_index() {
@@ -1004,13 +1080,6 @@ void MasterServer::load_index() {
 }
 
 void MasterServer::schedule_indexing() {
-    LOG_INFO(
-        "schedule_indexing called: enable={} active={} scheduled={} queue_size={} queue_pos={}",
-        config.enable_indexing,
-        indexing_active,
-        indexing_scheduled,
-        index_queue.size(),
-        index_queue_pos);
     if(!config.enable_indexing || indexing_active || indexing_scheduled)
         return;
     indexing_scheduled = true;
@@ -1108,6 +1177,167 @@ et::task<> MasterServer::run_background_indexing() {
 }
 
 // =========================================================================
+// Include/import completion (handled in master)
+// =========================================================================
+
+PreambleCompletionContext MasterServer::detect_completion_context(const std::string& text,
+                                                                  uint32_t offset) {
+    // Find the start of the line containing offset.
+    auto line_start = text.rfind('\n', offset > 0 ? offset - 1 : 0);
+    line_start = (line_start == std::string::npos) ? 0 : line_start + 1;
+
+    // Find the end of the line.
+    auto line_end = text.find('\n', offset);
+    if(line_end == std::string::npos)
+        line_end = text.size();
+
+    // Extract the line up to the cursor position.
+    auto line = llvm::StringRef(text).slice(line_start, offset);
+
+    // Strip leading whitespace.
+    auto trimmed = line.ltrim();
+
+    // Check for #include "prefix or #include <prefix
+    if(trimmed.starts_with("#")) {
+        auto directive = trimmed.drop_front(1).ltrim();
+        if(directive.consume_front("include")) {
+            directive = directive.ltrim();
+            if(directive.consume_front("\"")) {
+                return {CompletionContext::IncludeQuoted, directive.str()};
+            }
+            if(directive.consume_front("<")) {
+                return {CompletionContext::IncludeAngled, directive.str()};
+            }
+        }
+        // Line starts with # but isn't #include — not a completion context.
+        return {};
+    }
+
+    // Check for [export] import prefix (without trailing semicolon).
+    auto import_check = trimmed;
+    if(import_check.consume_front("export") && !import_check.empty() &&
+       !std::isalnum(import_check[0])) {
+        import_check = import_check.ltrim();
+    }
+    if(import_check.consume_front("import") &&
+       (import_check.empty() || !std::isalnum(import_check[0]))) {
+        import_check = import_check.ltrim();
+        // Only treat as import if there's no semicolon in what follows.
+        auto rest_of_line = llvm::StringRef(text).slice(line_start, line_end);
+        if(!rest_of_line.contains(';')) {
+            return {CompletionContext::Import, import_check.str()};
+        }
+    }
+
+    return {};
+}
+
+et::serde::RawValue MasterServer::complete_include(const PreambleCompletionContext& ctx,
+                                                   llvm::StringRef path) {
+    std::string directory;
+    std::vector<std::string> arguments;
+    if(!fill_compile_args(path, directory, arguments))
+        return et::serde::RawValue{"[]"};
+
+    // Convert arguments to const char* array.
+    std::vector<const char*> args_ptrs;
+    args_ptrs.reserve(arguments.size());
+    for(auto& arg: arguments) {
+        args_ptrs.push_back(arg.c_str());
+    }
+
+    auto config = extract_search_config(args_ptrs, directory);
+    DirListingCache dir_cache;
+    auto resolved = resolve_search_config(config, dir_cache);
+
+    // Determine search range based on context.
+    unsigned start_idx = 0;
+    if(ctx.kind == CompletionContext::IncludeAngled) {
+        start_idx = resolved.angled_start_idx;
+    }
+
+    // Split prefix into dir_prefix and file_prefix if it contains '/'.
+    llvm::StringRef prefix_ref(ctx.prefix);
+    llvm::StringRef dir_prefix;
+    llvm::StringRef file_prefix = prefix_ref;
+    auto slash_pos = prefix_ref.rfind('/');
+    if(slash_pos != llvm::StringRef::npos) {
+        dir_prefix = prefix_ref.slice(0, slash_pos);
+        file_prefix = prefix_ref.slice(slash_pos + 1, llvm::StringRef::npos);
+    }
+
+    std::vector<protocol::CompletionItem> items;
+    llvm::StringSet<> seen;  // Deduplicate entries across search dirs.
+
+    for(unsigned i = start_idx; i < resolved.dirs.size(); ++i) {
+        auto& search_dir = resolved.dirs[i];
+
+        // If there's a dir_prefix, resolve the subdirectory.
+        const llvm::StringSet<>* entries = nullptr;
+        if(!dir_prefix.empty()) {
+            llvm::SmallString<256> sub_path(search_dir.path);
+            llvm::sys::path::append(sub_path, dir_prefix);
+            entries = resolve_dir(sub_path, dir_cache);
+        } else {
+            entries = search_dir.entries;
+        }
+
+        if(!entries)
+            continue;
+
+        for(auto& entry: *entries) {
+            auto name = entry.getKey();
+            if(!name.starts_with(file_prefix))
+                continue;
+            if(!seen.insert(name).second)
+                continue;
+
+            // Check if this entry is a directory.
+            llvm::SmallString<256> full_path(search_dir.path);
+            if(!dir_prefix.empty()) {
+                llvm::sys::path::append(full_path, dir_prefix);
+            }
+            llvm::sys::path::append(full_path, name);
+
+            bool is_dir = false;
+            llvm::sys::fs::is_directory(llvm::Twine(full_path), is_dir);
+
+            protocol::CompletionItem item;
+            if(is_dir) {
+                item.label = (name + "/").str();
+            } else {
+                item.label = name.str();
+            }
+            item.kind = protocol::CompletionItemKind::File;
+            items.push_back(std::move(item));
+        }
+    }
+
+    auto json = et::serde::json::to_json<et::ipc::lsp_config>(items);
+    return et::serde::RawValue{json ? std::move(*json) : "[]"};
+}
+
+et::serde::RawValue MasterServer::complete_import(const PreambleCompletionContext& ctx) {
+    std::vector<protocol::CompletionItem> items;
+    llvm::StringRef prefix_ref(ctx.prefix);
+
+    for(auto& [path_id, module_name]: path_to_module) {
+        llvm::StringRef name_ref(module_name);
+        if(!name_ref.starts_with(prefix_ref))
+            continue;
+
+        protocol::CompletionItem item;
+        item.label = module_name;
+        item.kind = protocol::CompletionItemKind::Module;
+        item.insert_text = module_name + ";";
+        items.push_back(std::move(item));
+    }
+
+    auto json = et::serde::json::to_json<et::ipc::lsp_config>(items);
+    return et::serde::RawValue{json ? std::move(*json) : "[]"};
+}
+
+// =========================================================================
 // Forwarding helpers
 // =========================================================================
 
@@ -1118,15 +1348,26 @@ MasterServer::RawResult MasterServer::forward_stateful(const std::string& uri) {
     auto path = uri_to_path(uri);
     auto path_id = path_pool.intern(path);
 
-    if(!co_await ensure_compiled(path_id))
+    if(!co_await ensure_compiled(path_id)) {
         co_return serde_raw{"null"};
+    }
+
+    // After ensure_compiled returns, a new didChange may have arrived making
+    // the AST stale again.  Sending a feature request with stale state is
+    // wasteful and — more importantly — the queued IPC writes can fill up
+    // the pipe buffer and deadlock the worker.  Drop the request instead.
+    auto dit = documents.find(path_id);
+    if(dit != documents.end() && dit->second.ast_dirty) {
+        co_return serde_raw{"null"};
+    }
 
     WorkerParams wp;
     wp.path = path;
 
     auto result = co_await pool.send_stateful(path_id, wp);
-    if(!result.has_value())
+    if(!result.has_value()) {
         co_return serde_raw{};
+    }
     co_return std::move(result.value());
 }
 
@@ -1136,24 +1377,33 @@ MasterServer::RawResult MasterServer::forward_stateful(const std::string& uri,
     auto path = uri_to_path(uri);
     auto path_id = path_pool.intern(path);
 
-    if(!co_await ensure_compiled(path_id))
+    if(!co_await ensure_compiled(path_id)) {
         co_return serde_raw{"null"};
+    }
+
+    auto doc_it = documents.find(path_id);
+    if(doc_it == documents.end()) {
+        co_return serde_raw{"null"};
+    }
+
+    // Drop stale requests — see comment in the other overload.
+    if(doc_it->second.ast_dirty) {
+        co_return serde_raw{"null"};
+    }
 
     WorkerParams wp;
     wp.path = path;
 
-    auto doc_it = documents.find(path_id);
-    if(doc_it != documents.end()) {
-        lsp::PositionMapper mapper(doc_it->second.text, lsp::PositionEncoding::UTF16);
-        auto offset = mapper.to_offset(position);
-        if(!offset)
-            co_return serde_raw{"null"};
-        wp.offset = *offset;
-    }
+    lsp::PositionMapper mapper(doc_it->second.text, lsp::PositionEncoding::UTF16);
+    auto offset = mapper.to_offset(position);
+    if(!offset)
+        co_return serde_raw{"null"};
+    wp.offset = *offset;
 
     auto result = co_await pool.send_stateful(path_id, wp);
-    if(!result.has_value())
+    if(!result.has_value()) {
         co_return serde_raw{};
+    }
     co_return std::move(result.value());
 }
 
@@ -1163,9 +1413,17 @@ MasterServer::RawResult MasterServer::forward_stateless(const std::string& uri,
     auto path = uri_to_path(uri);
     auto path_id = path_pool.intern(path);
 
+    LOG_DEBUG("forward_stateless: {} path={} pos={}:{}",
+              "request",
+              path,
+              position.line,
+              position.character);
+
     auto doc_it = documents.find(path_id);
-    if(doc_it == documents.end())
+    if(doc_it == documents.end()) {
+        LOG_DEBUG("forward_stateless: doc not found for {}", path);
         co_return serde_raw{};
+    }
 
     auto& doc = doc_it->second;
 
@@ -1173,11 +1431,14 @@ MasterServer::RawResult MasterServer::forward_stateless(const std::string& uri,
     wp.path = path;
     wp.version = doc.version;
     wp.text = doc.text;
-    if(!fill_compile_args(path, wp.directory, wp.arguments))
+    if(!fill_compile_args(path, wp.directory, wp.arguments)) {
+        LOG_DEBUG("forward_stateless: no CDB for {}", path);
         co_return serde_raw{};
+    }
 
     // Ensure module deps, PCH, and PCM paths are ready for stateless compilation.
     if(!co_await ensure_deps(path_id, path, wp.text, wp.directory, wp.arguments, wp.pch, wp.pcms)) {
+        LOG_DEBUG("forward_stateless: ensure_deps failed for {}", path);
         co_return serde_raw{};
     }
 
@@ -1188,8 +1449,11 @@ MasterServer::RawResult MasterServer::forward_stateless(const std::string& uri,
     wp.offset = *offset;
 
     auto result = co_await pool.send_stateless(wp);
-    if(!result.has_value())
+    if(!result.has_value()) {
+        LOG_DEBUG("forward_stateless: worker error for {}: {}", path, result.error().message);
         co_return serde_raw{};
+    }
+    LOG_DEBUG("forward_stateless: done {}", path);
     co_return std::move(result.value());
 }
 
@@ -1697,6 +1961,8 @@ void MasterServer::register_handlers() {
         doc.generation++;
         doc.ast_dirty = true;
 
+        LOG_DEBUG("didChange: path={} version={} gen={}", path, doc.version, doc.generation);
+
         // Notify the owning stateful worker so it marks the document dirty
         worker::DocumentUpdateParams update;
         update.path = path;
@@ -1879,9 +2145,30 @@ void MasterServer::register_handlers() {
     // --- textDocument/completion ---
     peer.on_request(
         [this](RequestContext& ctx, const protocol::CompletionParams& params) -> RawResult {
-            co_return co_await forward_stateless<worker::CompletionParams>(
-                params.text_document_position_params.text_document.uri,
-                params.text_document_position_params.position);
+            auto uri = params.text_document_position_params.text_document.uri;
+            auto position = params.text_document_position_params.position;
+
+            // Check if cursor is on an #include or import line.
+            auto path = uri_to_path(uri);
+            auto path_id = path_pool.intern(path);
+            auto doc_it = documents.find(path_id);
+            if(doc_it != documents.end()) {
+                lsp::PositionMapper mapper(doc_it->second.text, lsp::PositionEncoding::UTF16);
+                auto offset = mapper.to_offset(position);
+                if(offset) {
+                    auto pctx = detect_completion_context(doc_it->second.text, *offset);
+                    if(pctx.kind == CompletionContext::IncludeQuoted ||
+                       pctx.kind == CompletionContext::IncludeAngled) {
+                        co_return complete_include(pctx, path);
+                    }
+                    if(pctx.kind == CompletionContext::Import) {
+                        co_return complete_import(pctx);
+                    }
+                }
+            }
+
+            // Default: forward to stateless worker.
+            co_return co_await forward_stateless<worker::CompletionParams>(uri, position);
         });
 
     // --- textDocument/signatureHelp ---
