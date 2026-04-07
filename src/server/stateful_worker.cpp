@@ -1,7 +1,6 @@
 #include "server/stateful_worker.h"
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -10,14 +9,12 @@
 
 #include "compile/compilation.h"
 #include "eventide/async/async.h"
-#include "eventide/ipc/json_codec.h"
 #include "eventide/ipc/peer.h"
 #include "eventide/ipc/transport.h"
-#include "eventide/serde/json/serializer.h"
-#include "eventide/serde/serde/raw_value.h"
 #include "feature/feature.h"
 #include "index/tu_index.h"
 #include "server/protocol.h"
+#include "server/worker_common.h"
 #include "support/logging.h"
 
 #include "llvm/ADT/StringMap.h"
@@ -49,32 +46,6 @@ struct DocumentEntry {
     // Per-document serialization mutex
     et::mutex strand;
 };
-
-struct ScopedTimer {
-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-
-    long long ms() const {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(
-                   std::chrono::steady_clock::now() - start)
-            .count();
-    }
-};
-
-static void fill_args(CompilationParams& cp,
-                      const std::string& directory,
-                      const std::vector<std::string>& arguments) {
-    cp.directory = directory;
-    for(auto& arg: arguments) {
-        cp.arguments.push_back(arg.c_str());
-    }
-}
-
-/// Serialize any value to LSP JSON RawValue.
-template <typename T>
-static et::serde::RawValue to_raw(const T& value) {
-    auto json = et::serde::json::to_json<et::ipc::lsp_config>(value);
-    return et::serde::RawValue{json ? std::move(*json) : "null"};
-}
 
 class StatefulWorker {
     et::ipc::BincodePeer& peer;
@@ -258,74 +229,47 @@ void StatefulWorker::register_handlers() {
         documents.erase(params.path);
     });
 
-    // === Hover ===
+    // === Query (hover, definition, semantic tokens, etc.) ===
     peer.on_request(
         [this](RequestContext& ctx,
-               const worker::HoverParams& params) -> RequestResult<worker::HoverParams> {
-            co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
-                auto result = feature::hover(doc.unit, params.offset);
-                return result ? to_raw(*result) : et::serde::RawValue{"null"};
-            });
+               const worker::QueryParams& params) -> RequestResult<worker::QueryParams> {
+            using K = worker::QueryKind;
+            switch(params.kind) {
+                case K::Hover:
+                    co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
+                        auto result = feature::hover(doc.unit, params.offset);
+                        return result ? to_raw(*result) : et::serde::RawValue{"null"};
+                    });
+                case K::GoToDefinition:
+                    // TODO: Implement go-to-definition
+                    co_return et::serde::RawValue{"[]"};
+                case K::SemanticTokens:
+                    co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
+                        return to_raw(feature::semantic_tokens(doc.unit));
+                    });
+                case K::InlayHints:
+                    co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
+                        LocalSourceRange range{0, static_cast<uint32_t>(doc.text.size())};
+                        return to_raw(feature::inlay_hints(doc.unit, range));
+                    });
+                case K::FoldingRange:
+                    co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
+                        return to_raw(feature::folding_ranges(doc.unit));
+                    });
+                case K::DocumentSymbol:
+                    co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
+                        return to_raw(feature::document_symbols(doc.unit));
+                    });
+                case K::DocumentLink:
+                    co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
+                        return to_raw(feature::document_links(doc.unit));
+                    });
+                case K::CodeAction:
+                    // TODO: Implement code actions
+                    co_return et::serde::RawValue{"[]"};
+            }
+            co_return et::serde::RawValue{"null"};
         });
-
-    // === SemanticTokens ===
-    peer.on_request([this](RequestContext& ctx, const worker::SemanticTokensParams& params)
-                        -> RequestResult<worker::SemanticTokensParams> {
-        co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
-            return to_raw(feature::semantic_tokens(doc.unit));
-        });
-    });
-
-    // === InlayHints ===
-    peer.on_request(
-        [this](RequestContext& ctx,
-               const worker::InlayHintsParams& params) -> RequestResult<worker::InlayHintsParams> {
-            co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
-                LocalSourceRange range{0, static_cast<uint32_t>(doc.text.size())};
-                return to_raw(feature::inlay_hints(doc.unit, range));
-            });
-        });
-
-    // === FoldingRange ===
-    peer.on_request([this](RequestContext& ctx, const worker::FoldingRangeParams& params)
-                        -> RequestResult<worker::FoldingRangeParams> {
-        co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
-            return to_raw(feature::folding_ranges(doc.unit));
-        });
-    });
-
-    // === DocumentSymbol ===
-    peer.on_request([this](RequestContext& ctx, const worker::DocumentSymbolParams& params)
-                        -> RequestResult<worker::DocumentSymbolParams> {
-        co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
-            return to_raw(feature::document_symbols(doc.unit));
-        });
-    });
-
-    // === DocumentLink ===
-    peer.on_request([this](RequestContext& ctx, const worker::DocumentLinkParams& params)
-                        -> RequestResult<worker::DocumentLinkParams> {
-        co_return co_await with_ast(params.path, [&](DocumentEntry& doc) {
-            return to_raw(feature::document_links(doc.unit));
-        });
-    });
-
-    // === CodeAction ===
-    peer.on_request(
-        [this](RequestContext& ctx,
-               const worker::CodeActionParams& params) -> RequestResult<worker::CodeActionParams> {
-            LOG_TRACE("CodeAction request: path={}", params.path);
-            // TODO: Implement code actions
-            co_return et::serde::RawValue{"[]"};
-        });
-
-    // === GoToDefinition ===
-    peer.on_request([this](RequestContext& ctx, const worker::GoToDefinitionParams& params)
-                        -> RequestResult<worker::GoToDefinitionParams> {
-        LOG_TRACE("GoToDefinition request: path={}, offset={}", params.path, params.offset);
-        // TODO: Implement go-to-definition
-        co_return et::serde::RawValue{"[]"};
-    });
 }
 
 int run_stateful_worker_mode(std::uint64_t memory_limit,
