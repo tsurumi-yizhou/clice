@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -13,12 +12,10 @@
 #include "eventide/ipc/lsp/protocol.h"
 #include "eventide/ipc/peer.h"
 #include "eventide/serde/serde/raw_value.h"
-#include "server/compile_graph.h"
-#include "server/config.h"
-#include "server/indexer.h"
+#include "server/session.h"
 #include "server/worker_pool.h"
-#include "support/path_pool.h"
-#include "syntax/dependency_graph.h"
+#include "server/workspace.h"
+#include "syntax/completion.h"
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -30,230 +27,106 @@ namespace clice {
 namespace et = eventide;
 namespace protocol = et::ipc::protocol;
 
-/// State of a document opened by the client.
-struct DocumentState {
-    int version = 0;
-    std::string text;
-    std::uint64_t generation = 0;
-    bool ast_dirty = true;
+/// Convert a file:// URI to a local file path.
+std::string uri_to_path(const std::string& uri);
 
-    /// Non-null while a compile is in flight.  Callers wait on the event;
-    /// the compile task runs independently and cannot be cancelled by LSP
-    /// $/cancelRequest.
-    struct PendingCompile {
-        et::event done;
-        bool succeeded = false;
-    };
-
-    std::shared_ptr<PendingCompile> compiling;
-};
-
-/// Context for compiling a header file that lacks its own CDB entry.
-struct HeaderFileContext {
-    std::uint32_t host_path_id;   /// Source file acting as host
-    std::string preamble_path;    /// Path to generated preamble file on disk
-    std::uint64_t preamble_hash;  /// Hash of preamble content for staleness
-};
-
-/// Two-layer staleness snapshot for compilation artifacts (PCH, AST, etc.).
+/// Compilation service — drives worker processes to build ASTs, PCHs, and PCMs.
 ///
-/// Layer 1 (fast): compare each file's current mtime against build_at.
-///   If all mtimes <= build_at, the artifact is fresh (zero I/O beyond stat).
+/// Compiler holds no persistent state of its own.  All project-wide data
+/// lives in Workspace; per-file data lives in Session.  Compiler reads from
+/// both and writes compilation results back to Session (file_index, pch_ref,
+/// ast_deps, diagnostics).
 ///
-/// Layer 2 (precise): for files whose mtime changed, re-hash their content
-///   and compare against the stored hash.  If the hash matches, the file was
-///   "touched" but not actually modified — skip the rebuild.
-struct DepsSnapshot {
-    llvm::SmallVector<std::uint32_t> path_ids;
-    llvm::SmallVector<std::uint64_t> hashes;
-    std::int64_t build_at = 0;
-};
-
-/// Cached PCH state for a single source file.
-struct PCHState {
-    std::string path;
-    std::uint32_t bound = 0;
-    std::uint64_t hash = 0;
-    DepsSnapshot deps;
-    std::shared_ptr<et::event> building;
-};
-
-/// Cached PCM state for a single module file.
-struct PCMState {
-    std::string path;
-    DepsSnapshot deps;
-};
-
-enum class CompletionContext { None, IncludeQuoted, IncludeAngled, Import };
-
-struct PreambleCompletionContext {
-    CompletionContext kind = CompletionContext::None;
-    std::string prefix;
-};
-
-/// Manages the full compilation lifecycle: document state, compilation
-/// artifacts (PCH/PCM cache), compile argument resolution, header context,
-/// and feature request forwarding to workers.
+/// Responsibilities:
+///   - AST compilation lifecycle (ensure_compiled → ensure_pch → ensure_deps)
+///   - Feature request forwarding to stateful/stateless workers
+///   - Compile argument resolution (CDB lookup + header context fallback)
+///   - Compile graph initialization (module DAG setup)
 ///
-/// MasterServer delegates all document and compilation operations here,
-/// keeping itself as a pure LSP handler registration layer.
+/// NOT responsible for:
+///   - Document lifecycle (didOpen/didChange/didClose) — handled by MasterServer
+///   - Index queries — handled by Indexer
+///   - Background indexing scheduling — handled by Indexer
 class Compiler {
 public:
     Compiler(et::event_loop& loop,
              et::ipc::JsonPeer& peer,
-             PathPool& path_pool,
+             Workspace& workspace,
              WorkerPool& pool,
-             Indexer& indexer,
-             const CliceConfig& config,
-             CompilationDatabase& cdb,
-             DependencyGraph& dep_graph);
-
+             llvm::DenseMap<std::uint32_t, Session>& sessions);
     ~Compiler();
 
-    /// Convert a file:// URI to a local file path.
-    static std::string uri_to_path(const std::string& uri);
-
-    /// Document lifecycle — called from MasterServer handlers.
-    void open_document(const std::string& uri, std::string text, int version);
-    void apply_changes(const protocol::DidChangeTextDocumentParams& params);
-    std::uint32_t close_document(const std::string& uri);
-    llvm::SmallVector<std::uint32_t> on_save(const std::string& uri);
-
-    /// Document accessors.
-    bool is_file_open(std::uint32_t path_id) const;
-    const DocumentState* get_document(std::uint32_t path_id) const;
-
-    /// Cache persistence.
-    void load_cache();
-    void save_cache();
-    void cleanup_cache(int max_age_days = 7);
-
-    /// Build path_to_module reverse mapping from dependency graph.
-    void build_module_map();
-
-    /// Initialize the CompileGraph for C++20 module compilation ordering.
     void init_compile_graph();
 
     /// Fill compile arguments for a file (CDB lookup + header context fallback).
+    /// @param session  If non-null, used for header context resolution on open files.
     bool fill_compile_args(llvm::StringRef path,
                            std::string& directory,
-                           std::vector<std::string>& arguments);
+                           std::vector<std::string>& arguments,
+                           Session* session = nullptr);
 
-    /// Fill PCM paths for all built modules (for background indexing).
-    void fill_pcm_deps(std::unordered_map<std::string, std::string>& pcms,
-                       std::uint32_t exclude_path_id = UINT32_MAX) const;
+    /// Compile an open file's AST if dirty.  On success, updates session's
+    /// file_index, pch_ref, ast_deps, and publishes diagnostics.
+    et::task<bool> ensure_compiled(Session& session);
 
-    /// Pull-based compilation entry point for user-opened files.
-    et::task<bool> ensure_compiled(std::uint32_t path_id);
-
-    /// Feature request forwarding to workers.
     using RawResult = et::task<et::serde::RawValue, et::ipc::Error>;
 
-    /// Forward a stateful AST query to the worker owning this file.
-    RawResult forward_query(worker::QueryKind kind, const std::string& uri);
+    /// Forward a query to the stateful worker that holds this file's AST.
+    /// Ensures compilation first.  For position-sensitive queries (hover,
+    /// goto-definition), pass a Position.  For range-sensitive queries
+    /// (inlay hints), pass a Range.
     RawResult forward_query(worker::QueryKind kind,
-                            const std::string& uri,
-                            const protocol::Position& position);
+                            Session& session,
+                            std::optional<protocol::Position> position = {},
+                            std::optional<protocol::Range> range = {});
 
-    /// Forward a stateless build request (completion/signatureHelp).
+    /// Forward a build request (signature help, etc.) to a stateless worker.
+    /// Sends the full buffer content and compile arguments.
     RawResult forward_build(worker::BuildKind kind,
-                            const std::string& uri,
-                            const protocol::Position& position);
+                            const protocol::Position& position,
+                            Session& session);
 
-    /// Completion with preamble-aware include/import handling.
-    RawResult handle_completion(const std::string& uri, const protocol::Position& position);
+    /// Handle completion requests.  Detects preamble context (include/import)
+    /// and serves those locally; delegates code completion to a stateless worker.
+    RawResult handle_completion(const protocol::Position& position, Session& session);
 
-    /// Header context management.
-    void switch_context(std::uint32_t path_id, std::uint32_t context_path_id);
-    std::optional<std::uint32_t> get_active_context(std::uint32_t path_id) const;
-    void invalidate_host_contexts(std::uint32_t host_path_id,
-                                  llvm::SmallVectorImpl<std::uint32_t>& stale_headers);
+    /// Send an empty diagnostics notification to clear stale markers in the editor.
+    void clear_diagnostics(const std::string& uri);
 
-    CompileGraph* compile_graph_ptr() {
-        return compile_graph.get();
-    }
-
-    const llvm::DenseMap<std::uint32_t, std::string>& module_map() const {
-        return path_to_module;
-    }
-
-    void cancel_all();
-
-    /// Callback invoked when indexing should be scheduled (e.g. after compile success).
+    /// Callback invoked when indexing should be scheduled.
     std::function<void()> on_indexing_needed;
 
 private:
-    /// Compile module dependencies, build/reuse PCH, and fill PCM paths.
-    et::task<bool> ensure_deps(std::uint32_t path_id,
-                               llvm::StringRef path,
-                               const std::string& text,
+    et::task<bool> ensure_deps(Session& session,
                                const std::string& directory,
                                const std::vector<std::string>& arguments,
                                std::pair<std::string, uint32_t>& pch,
                                std::unordered_map<std::string, std::string>& pcms);
 
-    /// Build or reuse PCH for a source file.
-    et::task<bool> ensure_pch(std::uint32_t path_id,
-                              llvm::StringRef path,
-                              const std::string& text,
+    et::task<bool> ensure_pch(Session& session,
                               const std::string& directory,
                               const std::vector<std::string>& arguments);
 
-    /// Check if a file's AST or PCH deps have changed since last compile.
-    bool is_stale(std::uint32_t path_id);
-
-    /// Record dependency snapshot after a successful compile.
-    void record_deps(std::uint32_t path_id, llvm::ArrayRef<std::string> deps);
+    bool is_stale(const Session& session);
+    void record_deps(Session& session, llvm::ArrayRef<std::string> deps);
 
     void publish_diagnostics(const std::string& uri, int version, const et::serde::RawValue& diags);
-    void clear_diagnostics(const std::string& uri);
 
-    /// Clean up compilation state for a closed file.
-    void on_file_closed(std::uint32_t path_id);
+    std::optional<HeaderFileContext> resolve_header_context(std::uint32_t header_path_id,
+                                                            Session* session);
 
-    /// Invalidate artifacts after a file save.
-    /// Returns path_ids of all files dirtied (via compile_graph cascade).
-    llvm::SmallVector<std::uint32_t> on_file_saved(std::uint32_t path_id);
-
-    /// Header context resolution.
-    std::optional<HeaderFileContext> resolve_header_context(std::uint32_t header_path_id);
     bool fill_header_context_args(llvm::StringRef path,
                                   std::uint32_t path_id,
                                   std::string& directory,
-                                  std::vector<std::string>& arguments);
-
-    /// Include/import completion helpers.
-    PreambleCompletionContext detect_completion_context(const std::string& text, uint32_t offset);
-    et::serde::RawValue complete_include(const PreambleCompletionContext& ctx,
-                                         llvm::StringRef path);
-    et::serde::RawValue complete_import(const PreambleCompletionContext& ctx);
+                                  std::vector<std::string>& arguments,
+                                  Session* session);
 
 private:
     et::event_loop& loop;
     et::ipc::JsonPeer& peer;
-    PathPool& path_pool;
+    Workspace& workspace;
     WorkerPool& pool;
-    Indexer& indexer;
-    const CliceConfig& config;
-    CompilationDatabase& cdb;
-    DependencyGraph& dep_graph;
-
-    /// Open document state, keyed by server-level path_id.
-    llvm::DenseMap<std::uint32_t, DocumentState> documents;
-
-    /// PCH/PCM cache state.
-    llvm::DenseMap<std::uint32_t, PCHState> pch_states;
-    llvm::DenseMap<std::uint32_t, PCMState> pcm_states;
-    llvm::DenseMap<std::uint32_t, std::string> pcm_paths;
-
-    /// Module compilation ordering.
-    llvm::DenseMap<std::uint32_t, std::string> path_to_module;
-    std::unique_ptr<CompileGraph> compile_graph;
-
-    /// Per-file compilation state.
-    llvm::DenseMap<std::uint32_t, DepsSnapshot> ast_deps;
-    llvm::DenseMap<std::uint32_t, HeaderFileContext> header_file_contexts;
-    llvm::DenseMap<std::uint32_t, std::uint32_t> active_contexts;
+    llvm::DenseMap<std::uint32_t, Session>& sessions;
 };
 
 }  // namespace clice

@@ -10,6 +10,7 @@
 #include "eventide/ipc/lsp/protocol.h"
 #include "eventide/ipc/protocol.h"
 #include "eventide/serde/serde/raw_value.h"
+#include "syntax/token.h"
 
 namespace clice::worker {
 
@@ -32,7 +33,8 @@ enum class QueryKind : uint8_t {
 struct QueryParams {
     QueryKind kind;
     std::string path;
-    uint32_t offset = 0;  ///< Used by Hover and GoToDefinition.
+    uint32_t offset = 0;  ///< Byte offset for position-sensitive queries (Hover, GoToDefinition).
+    LocalSourceRange range;  ///< Byte range for range-sensitive queries (InlayHints).
 };
 
 /// Parameters for stateful compilation (builds AST, publishes diagnostics).
@@ -103,8 +105,6 @@ struct BuildResult {
     eventide::serde::RawValue result_json;  ///< Completion/SignatureHelp result
 };
 
-// === Notifications ===
-
 struct DocumentUpdateParams {
     std::string path;
     int version;
@@ -119,8 +119,6 @@ struct EvictedParams {
 };
 
 }  // namespace clice::worker
-
-// === clice/ LSP Extension Types ===
 
 namespace clice::ext {
 
@@ -178,8 +176,6 @@ struct RequestTraits<clice::worker::BuildParams> {
     using Result = clice::worker::BuildResult;
     constexpr inline static std::string_view method = "clice/worker/build";
 };
-
-// === Notifications ===
 
 template <>
 struct NotificationTraits<clice::worker::DocumentUpdateParams> {
