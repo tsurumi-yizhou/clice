@@ -6,6 +6,8 @@
 
 namespace clice {
 
+namespace ranges = std::ranges;
+
 CompileGraph::CompileGraph(dispatch_fn dispatch, resolve_fn resolve) :
     dispatch(std::move(dispatch)), resolve(std::move(resolve)) {}
 
@@ -31,13 +33,19 @@ void CompileGraph::ensure_resolved(std::uint32_t path_id) {
     }
 }
 
+et::task<bool> CompileGraph::compile_deps(std::uint32_t path_id) {
+    llvm::DenseSet<std::uint32_t> ancestors;
+    co_return co_await compile_impl(path_id, ancestors, false);
+}
+
 et::task<bool> CompileGraph::compile(std::uint32_t path_id) {
     llvm::DenseSet<std::uint32_t> ancestors;
     co_return co_await compile_impl(path_id, ancestors);
 }
 
 et::task<bool> CompileGraph::compile_impl(std::uint32_t path_id,
-                                          llvm::DenseSet<std::uint32_t> ancestors) {
+                                          llvm::DenseSet<std::uint32_t> ancestors,
+                                          bool dispatch_self) {
     ensure_resolved(path_id);
 
     // Cycle detection: if this unit is already in the compile chain, bail out.
@@ -47,6 +55,27 @@ et::task<bool> CompileGraph::compile_impl(std::uint32_t path_id,
 
     // Re-lookup after ensure_resolved may have mutated the map.
     auto it = units.find(path_id);
+
+    // For deps-only mode, compile dependencies concurrently and return.
+    if(!dispatch_self) {
+        auto deps = it->second.dependencies;
+        if(deps.empty()) {
+            co_return true;
+        }
+
+        std::vector<et::task<bool>> dep_tasks;
+        dep_tasks.reserve(deps.size());
+        for(auto dep_id: deps) {
+            dep_tasks.push_back(compile_impl(dep_id, ancestors));
+        }
+        auto results = co_await et::when_all(std::move(dep_tasks));
+        for(auto ok: results) {
+            if(!ok) {
+                co_return false;
+            }
+        }
+        co_return true;
+    }
 
     // Already clean.
     if(!it->second.dirty) {
@@ -64,9 +93,16 @@ et::task<bool> CompileGraph::compile_impl(std::uint32_t path_id,
         co_return !units.find(path_id)->second.dirty;
     }
 
-    // Begin compilation.
+    // Begin compilation. The finish lambda ensures compiling/completion state
+    // is always cleaned up, regardless of how the function exits.
     it->second.compiling = true;
     it->second.completion = std::make_unique<et::event>();
+
+    auto finish = [&, path_id] {
+        auto& u = units.find(path_id)->second;
+        u.compiling = false;
+        u.completion->set();
+    };
 
     // Copy deps and capture generation before co_await (DenseMap iterator safety).
     auto deps = it->second.dependencies;
@@ -85,52 +121,41 @@ et::task<bool> CompileGraph::compile_impl(std::uint32_t path_id,
 
         auto results = co_await et::when_all(std::move(dep_tasks));
 
-        auto& u = units.find(path_id)->second;
         if(results.is_cancelled()) {
-            u.compiling = false;
-            u.completion->set();
+            finish();
             co_await et::cancel();
         }
 
         for(auto ok: *results) {
             if(!ok) {
-                u.compiling = false;
-                u.completion->set();
+                finish();
                 co_return false;
             }
         }
     }
 
     // Dispatch the actual compilation, cancellable via the pre-captured token.
-    // Using the token captured before co_await ensures cancellation propagates
-    // correctly even if update() replaces the source during dependency compilation.
-    {
-        auto result = co_await et::with_token(dispatch(path_id), token);
+    auto result = co_await et::with_token(dispatch(path_id), token);
 
-        auto& u = units.find(path_id)->second;
-        if(!result.has_value()) {
-            u.compiling = false;
-            u.completion->set();
-            co_await et::cancel();
-        }
-        if(!*result) {
-            u.compiling = false;
-            u.completion->set();
-            co_return false;
-        }
+    if(!result.has_value()) {
+        finish();
+        co_await et::cancel();
+    }
+
+    if(!*result) {
+        finish();
+        co_return false;
     }
 
     // Success — only clear dirty if update() hasn't bumped the generation.
     auto& final_unit = units.find(path_id)->second;
     if(final_unit.generation != gen) {
-        // update() was called while dispatch was in flight.
-        final_unit.compiling = false;
-        final_unit.completion->set();
+        finish();
         co_return false;
     }
+
     final_unit.dirty = false;
-    final_unit.compiling = false;
-    final_unit.completion->set();
+    finish();
     co_return true;
 }
 
@@ -165,8 +190,7 @@ llvm::SmallVector<std::uint32_t> CompileGraph::update(std::uint32_t path_id) {
                 auto dep_it = units.find(dep_id);
                 if(dep_it != units.end()) {
                     auto& dependents = dep_it->second.dependents;
-                    dependents.erase(std::remove(dependents.begin(), dependents.end(), path_id),
-                                     dependents.end());
+                    dependents.erase(ranges::remove(dependents, path_id).begin(), dependents.end());
                 }
             }
             unit.dependencies.clear();

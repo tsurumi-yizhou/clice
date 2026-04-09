@@ -1,3 +1,4 @@
+#include <csignal>
 #include <cstdint>
 #include <iostream>
 #include <print>
@@ -6,6 +7,7 @@
 #include "eventide/async/async.h"
 #include "eventide/deco/deco.h"
 #include "eventide/ipc/peer.h"
+#include "eventide/ipc/recording_transport.h"
 #include "eventide/ipc/transport.h"
 #include "server/master_server.h"
 #include "server/stateful_worker.h"
@@ -14,40 +16,62 @@
 
 namespace clice {
 
+using deco::decl::KVStyle;
+
 struct Options {
-    DecoKV(names = {"--mode"};
-           help = "Running mode: pipe, socket, stateless-worker, stateful-worker";
-           required = false;)
+    DecoKV(style = KVStyle::JoinedOrSeparate,
+           help = "Running mode: pipe, socket, stateless-worker, stateful-worker",
+           required = false)
     <std::string> mode;
 
-    DecoKV(names = {"--host"}; help = "Socket mode address"; required = false;)
+    DecoKV(style = KVStyle::JoinedOrSeparate, help = "Socket mode address", required = false)
     <std::string> host = "127.0.0.1";
 
-    DecoKV(names = {"--port"}; help = "Socket mode port"; required = false;)
+    DecoKV(style = KVStyle::JoinedOrSeparate, help = "Socket mode port", required = false)
     <int> port = 50051;
 
-    DecoKV(names = {"--stateful-worker-count"}; help = "Number of stateful workers";
-           required = false;)
-    <std::uint32_t> stateful_worker_count;
+    DecoKV(style = KVStyle::JoinedOrSeparate,
+           names = {"--log-level", "--log-level="},
+           help = "Log level: trace, debug, info, warn, error, off",
+           required = false)
+    <std::string> log_level = "info";
 
-    DecoKV(names = {"--stateless-worker-count"}; help = "Number of stateless workers";
-           required = false;)
-    <std::uint32_t> stateless_worker_count;
+    DecoKV(style = KVStyle::JoinedOrSeparate,
+           help = "Record LSP input to file for replay testing",
+           required = false)
+    <std::string> record;
 
-    DecoKV(names = {"--worker-memory-limit"}; help = "Memory limit per stateful worker (bytes)";
-           required = false;)
+    // Internal options (passed from master to worker processes)
+    DecoKV(style = KVStyle::JoinedOrSeparate,
+           names = {"--worker-memory-limit", "--worker-memory-limit="},
+           required = false)
     <std::uint64_t> worker_memory_limit;
 
-    DecoFlag(names = {"-h", "--help"}; help = "Show help message"; required = false;)
+    DecoKV(style = KVStyle::JoinedOrSeparate,
+           names = {"--worker-name", "--worker-name="},
+           required = false)
+    <std::string> worker_name;
+
+    DecoKV(style = KVStyle::JoinedOrSeparate, names = {"--log-dir", "--log-dir="}, required = false)
+    <std::string> log_dir;
+
+    DecoFlag(names = {"-h", "--help"}, help = "Show help message", required = false)
     help;
 
-    DecoFlag(names = {"-v", "--version"}; help = "Show version"; required = false;)
+    DecoFlag(names = {"-v", "--version"}, help = "Show version", required = false)
     version;
 };
 
 }  // namespace clice
 
 int main(int argc, const char** argv) {
+#ifndef _WIN32
+    // On POSIX systems, ignore SIGPIPE so that writing to a closed pipe
+    // (e.g. when the LSP client disconnects) returns EPIPE instead of
+    // killing the process.  This is standard practice for pipe-based servers.
+    signal(SIGPIPE, SIG_IGN);
+#endif
+
     auto args = deco::util::argvify(argc, argv);
     auto result = deco::cli::parse<clice::Options>(args);
 
@@ -68,6 +92,17 @@ int main(int argc, const char** argv) {
         return 0;
     }
 
+    if(opts.log_level.has_value()) {
+        auto level = spdlog::level::from_str(*opts.log_level);
+        if(level == spdlog::level::off && *opts.log_level != "off") {
+            std::println(stderr,
+                         "unknown log level '{}', valid: trace, debug, info, warn, error, off",
+                         *opts.log_level);
+            return 1;
+        }
+        clice::logging::options.level = level;
+    }
+
     if(!opts.mode.has_value()) {
         LOG_ERROR("--mode is required");
         return 1;
@@ -77,13 +112,21 @@ int main(int argc, const char** argv) {
 
     auto& mode = *opts.mode;
 
+    auto worker_name = opts.worker_name.value_or("");
+    auto log_dir = opts.log_dir.value_or("");
+
     if(mode == "stateless-worker") {
-        return clice::run_stateless_worker_mode();
+        return clice::run_stateless_worker_mode(worker_name.empty() ? "stateless-worker"
+                                                                    : worker_name,
+                                                log_dir);
     }
 
     if(mode == "stateful-worker") {
         auto mem_limit = opts.worker_memory_limit.value_or(4ULL * 1024 * 1024 * 1024);
-        return clice::run_stateful_worker_mode(mem_limit);
+        return clice::run_stateful_worker_mode(mem_limit,
+                                               worker_name.empty() ? "stateful-worker"
+                                                                   : worker_name,
+                                               log_dir);
     }
 
     if(mode == "pipe") {
@@ -98,12 +141,20 @@ int main(int argc, const char** argv) {
             return 1;
         }
 
-        et::ipc::JsonPeer peer(loop, std::move(*transport));
+        std::unique_ptr<et::ipc::Transport> final_transport = std::move(*transport);
+        if(opts.record.has_value()) {
+            final_transport =
+                std::make_unique<et::ipc::RecordingTransport>(std::move(final_transport),
+                                                              *opts.record);
+        }
+
+        et::ipc::JsonPeer peer(loop, std::move(final_transport));
         clice::MasterServer server(loop, peer, std::move(self_path));
         server.register_handlers();
 
         loop.schedule(peer.run());
-        return loop.run();
+        loop.run();
+        return 0;
     }
 
     if(mode == "socket") {
@@ -133,7 +184,12 @@ int main(int argc, const char** argv) {
 
             LOG_INFO("Client connected");
 
-            auto transport = std::make_unique<et::ipc::StreamTransport>(std::move(client.value()));
+            std::unique_ptr<et::ipc::Transport> transport =
+                std::make_unique<et::ipc::StreamTransport>(std::move(client.value()));
+            if(opts.record.has_value()) {
+                transport = std::make_unique<et::ipc::RecordingTransport>(std::move(transport),
+                                                                          *opts.record);
+            }
             et::ipc::JsonPeer peer(loop, std::move(transport));
             clice::MasterServer server(loop, peer, std::string(self_path));
             server.register_handlers();
@@ -144,7 +200,8 @@ int main(int argc, const char** argv) {
         };
 
         loop.schedule(task());
-        return loop.run();
+        loop.run();
+        return 0;
     }
 
     LOG_ERROR("unknown mode '{}'", mode);

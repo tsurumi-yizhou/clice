@@ -25,10 +25,10 @@ void CliceConfig::apply_defaults(const std::string& workspace_root) {
         cpu_count = 4;
 
     if(stateful_worker_count == 0) {
-        stateful_worker_count = std::max(1u, cpu_count / 4);
+        stateful_worker_count = 2;
     }
     if(stateless_worker_count == 0) {
-        stateless_worker_count = std::max(1u, cpu_count / 4);
+        stateless_worker_count = 3;
     }
     if(worker_memory_limit == 0) {
         worker_memory_limit = 4ULL * 1024 * 1024 * 1024;  // 4GB default
@@ -41,10 +41,15 @@ void CliceConfig::apply_defaults(const std::string& workspace_root) {
         index_dir = path::join(cache_dir, "index");
     }
 
+    if(logging_dir.empty() && !cache_dir.empty()) {
+        logging_dir = path::join(cache_dir, "logs");
+    }
+
     // Apply variable substitution to string fields
     substitute_workspace(compile_commands_path, workspace_root);
     substitute_workspace(cache_dir, workspace_root);
     substitute_workspace(index_dir, workspace_root);
+    substitute_workspace(logging_dir, workspace_root);
 }
 
 std::optional<CliceConfig> CliceConfig::load(const std::string& path,

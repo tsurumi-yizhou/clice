@@ -6,13 +6,14 @@ import shutil
 import pytest
 from tests.conftest import generate_cdb
 from lsprotocol.types import (
-    DidCloseTextDocumentParams,
     DidOpenTextDocumentParams,
     HoverParams,
     Position,
     TextDocumentIdentifier,
     TextDocumentItem,
 )
+
+from tests.integration.utils.assertions import assert_clean_compile, assert_has_errors
 
 
 @pytest.mark.workspace("modules/single_module_no_deps")
@@ -165,20 +166,21 @@ async def test_save_recompile(client, test_data_dir, tmp_path):
     diags = client.diagnostics.get(mid_uri, [])
     assert len(diags) == 0
 
-    # Open Leaf and wait for its initial compilation.
+    # Open Leaf and trigger compilation via hover.
     leaf_uri, _ = client.open(tmp_path / "leaf.cppm")
-    event = client.wait_for_diagnostics(leaf_uri)
-    await asyncio.wait_for(event.wait(), timeout=60.0)
+    await client.text_document_hover_async(
+        HoverParams(
+            text_document=TextDocumentIdentifier(uri=leaf_uri),
+            position=Position(line=0, character=0),
+        )
+    )
 
     # Close Leaf, modify on disk, and reopen with new content.
-    client.text_document_did_close(
-        DidCloseTextDocumentParams(text_document=TextDocumentIdentifier(uri=leaf_uri))
-    )
+    client.close(leaf_uri)
 
     new_content = "export module Leaf;\nexport int leaf() { return 100; }\n"
     (tmp_path / "leaf.cppm").write_text(new_content)
 
-    event = client.wait_for_diagnostics(leaf_uri)
     client.text_document_did_open(
         DidOpenTextDocumentParams(
             text_document=TextDocumentItem(
@@ -186,7 +188,15 @@ async def test_save_recompile(client, test_data_dir, tmp_path):
             )
         )
     )
-    await asyncio.wait_for(event.wait(), timeout=60.0)
+    # Send hover to trigger recompilation via pull-based model.
+    event = client.wait_for_diagnostics(leaf_uri)
+    await client.text_document_hover_async(
+        HoverParams(
+            text_document=TextDocumentIdentifier(uri=leaf_uri),
+            position=Position(line=0, character=0),
+        )
+    )
+    await asyncio.wait_for(event.wait(), timeout=30.0)
 
     diags = client.diagnostics.get(leaf_uri, [])
     assert len(diags) == 0, f"Expected no diagnostics after save, got: {diags}"

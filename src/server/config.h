@@ -22,8 +22,8 @@ struct CliceConfig {
     // Index storage directory (default: <cache_dir>/index/)
     std::string index_dir;
 
-    // Debounce interval for re-compilation after edits (milliseconds)
-    int debounce_ms = 200;
+    // Logging directory (default: <cache_dir>/logs/)
+    std::string logging_dir;
 
     // Background indexing
     bool enable_indexing = true;

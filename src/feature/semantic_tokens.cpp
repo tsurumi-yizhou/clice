@@ -23,12 +23,8 @@ struct RawToken {
     std::uint32_t modifiers = 0;
 };
 
-constexpr std::uint32_t bit(SymbolModifiers::Kind kind) {
-    return static_cast<std::uint32_t>(kind);
-}
-
 void add_modifier(std::uint32_t& modifiers, SymbolModifiers::Kind kind) {
-    modifiers |= bit(kind);
+    modifiers |= SymbolModifiers::to_mask(kind);
 }
 
 auto type_index(SymbolKind kind) -> std::uint32_t {
@@ -37,6 +33,132 @@ auto type_index(SymbolKind kind) -> std::uint32_t {
 
 auto encode_modifiers(std::uint32_t modifiers) -> std::uint32_t {
     return modifiers;
+}
+
+bool is_dependent(const clang::Decl* D) {
+    return isa<clang::UnresolvedUsingValueDecl>(D);
+}
+
+/// Returns true if `decl` is considered to be from a default/system library.
+/// This currently checks the systemness of the file by include type, although
+/// different heuristics may be used in the future (e.g. sysroot paths).
+bool is_default_library(const clang::Decl* decl) {
+    clang::SourceLocation location = decl->getLocation();
+    if(!location.isValid()) {
+        return false;
+    }
+    return decl->getASTContext().getSourceManager().isInSystemHeader(location);
+}
+
+// "Static" means many things in C++, only some get the "static" modifier.
+//
+// Meanings that do:
+// - Members associated with the class rather than the instance.
+//   This is what 'static' most often means across languages.
+// - static local variables
+//   These are similarly "detached from their context" by the static keyword.
+//   In practice, these are rarely used inside classes, reducing confusion.
+//
+// Meanings that don't:
+// - Namespace-scoped variables, which have static storage class.
+//   This is implicit, so the keyword "static" isn't so strongly associated.
+//   If we want a modifier for these, "global scope" is probably the concept.
+// - Namespace-scoped variables/functions explicitly marked "static".
+//   There the keyword changes *linkage* , which is a totally different concept.
+//   If we want to model this, "file scope" would be a nice modifier.
+//
+// This is confusing, and maybe we should use another name, but because "static"
+// is a standard LSP modifier, having one with that name has advantages.
+bool is_static(const clang::Decl* decl) {
+    if(const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
+        return method->isStatic();
+    }
+    if(const auto* var_decl = llvm::dyn_cast<clang::VarDecl>(decl)) {
+        return var_decl->isStaticDataMember() || var_decl->isStaticLocal();
+    }
+    if(const auto* objc_property = llvm::dyn_cast<clang::ObjCPropertyDecl>(decl)) {
+        return objc_property->isClassProperty();
+    }
+    if(const auto* objc_method = llvm::dyn_cast<clang::ObjCMethodDecl>(decl)) {
+        return objc_method->isClassMethod();
+    }
+    if(const auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+        return function->isStatic();
+    }
+    return false;
+}
+
+// Whether `type` is const in a loose sense: would a value of this type be readonly?
+bool is_const(clang::QualType type) {
+    if(type.isNull()) {
+        return false;
+    }
+    type = type.getNonReferenceType();
+    if(type.isConstQualified()) {
+        return true;
+    }
+    if(const auto* array_type = type->getAsArrayTypeUnsafe()) {
+        return is_const(array_type->getElementType());
+    }
+    if(is_const(type->getPointeeType())) {
+        return true;
+    }
+    return false;
+}
+
+// Whether `decl` is const in a loose sense (should it be highlighted as such?)
+// FIXME: This is separate from whether a particular usage can mutate `decl`.
+//        We may want a receiver in `value.size()` to be readonly even if `value` is mutable.
+bool is_const(const clang::Decl* decl) {
+    if(llvm::isa<clang::EnumConstantDecl>(decl) ||
+       llvm::isa<clang::NonTypeTemplateParmDecl>(decl)) {
+        return true;
+    }
+    if(llvm::isa<clang::FieldDecl>(decl) || llvm::isa<clang::VarDecl>(decl) ||
+       llvm::isa<clang::MSPropertyDecl>(decl) || llvm::isa<clang::BindingDecl>(decl)) {
+        if(is_const(llvm::cast<clang::ValueDecl>(decl)->getType())) {
+            return true;
+        }
+    }
+    if(const auto* objc_property = llvm::dyn_cast<clang::ObjCPropertyDecl>(decl)) {
+        if(objc_property->isReadOnly()) {
+            return true;
+        }
+    }
+    if(const auto* ms_property = llvm::dyn_cast<clang::MSPropertyDecl>(decl)) {
+        if(!ms_property->hasSetter()) {
+            return true;
+        }
+    }
+    if(const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
+        if(method->isConst()) {
+            return true;
+        }
+    }
+    if(const auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+        return is_const(function->getReturnType());
+    }
+    return false;
+}
+
+// Indicates whether declaration `decl` is abstract in cases where it is a struct or a
+// class.
+bool is_abstract(const clang::Decl* decl) {
+    if(const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
+        return method->isPureVirtual();
+    }
+    if(const auto* record = llvm::dyn_cast<clang::CXXRecordDecl>(decl)) {
+        return record->hasDefinition() && record->isAbstract();
+    }
+    return false;
+}
+
+// Indicates whether declaration `decl` is virtual in cases where it is a method.
+bool is_virtual(const clang::Decl* decl) {
+    if(const auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(decl)) {
+        return method->isVirtual();
+    }
+    return false;
 }
 
 class SemanticTokensCollector : public SemanticVisitor<SemanticTokensCollector> {
@@ -55,6 +177,8 @@ public:
                               clang::SourceLocation location) {
         std::uint32_t modifiers = 0;
         if(relation.is_one_of(RelationKind::Definition)) {
+            // todo: clangd add both Declaration and Definition modifiers for definitions.
+            // add_modifier(modifiers, SymbolModifiers::Declaration);
             add_modifier(modifiers, SymbolModifiers::Definition);
         } else if(relation.is_one_of(RelationKind::Declaration)) {
             add_modifier(modifiers, SymbolModifiers::Declaration);
@@ -62,6 +186,42 @@ public:
 
         if(ast::is_templated(decl)) {
             add_modifier(modifiers, SymbolModifiers::Templated);
+        }
+        // Apply attribute-style modifiers to the underlying declaration.
+        // The attribute tests don't want to look at the template.
+        if(const auto* template_decl = llvm::dyn_cast<clang::TemplateDecl>(decl)) {
+            if(const auto* templated_decl = template_decl->getTemplatedDecl())
+                decl = templated_decl;
+        }
+
+        // TODO: add scope-based modifiers once the local model supports them.
+        // if (auto Mod = scopeModifier(Decl))
+        //     Tok.addModifier(*Mod);
+
+        if(is_const(decl)) {
+            add_modifier(modifiers, SymbolModifiers::Readonly);
+        }
+        if(is_static(decl)) {
+            add_modifier(modifiers, SymbolModifiers::Static);
+        }
+        if(is_abstract(decl)) {
+            add_modifier(modifiers, SymbolModifiers::Abstract);
+        }
+        if(is_virtual(decl)) {
+            add_modifier(modifiers, SymbolModifiers::Virtual);
+        }
+        if(is_default_library(decl)) {
+            add_modifier(modifiers, SymbolModifiers::DefaultLibrary);
+        }
+        if(decl->isDeprecated()) {
+            add_modifier(modifiers, SymbolModifiers::Deprecated);
+        }
+        if(is_dependent(decl)) {
+            add_modifier(modifiers, SymbolModifiers::DependentName);
+        }
+        if(llvm::isa<clang::CXXConstructorDecl>(decl) ||
+           llvm::isa<clang::CXXDestructorDecl>(decl)) {
+            add_modifier(modifiers, SymbolModifiers::ConstructorOrDestructor);
         }
 
         add_token(location, SymbolKind::from(decl), modifiers);
@@ -79,6 +239,10 @@ public:
 
         add_token(location, SymbolKind::Macro, modifiers);
     }
+
+    // handleModuleOccurrence
+
+    // handleRelation
 
     void handleAttrOccurrence(const clang::Attr* attr, clang::SourceRange range) {
         auto [begin, end] = range;

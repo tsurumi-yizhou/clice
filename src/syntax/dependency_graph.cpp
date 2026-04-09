@@ -1,5 +1,6 @@
 #include "syntax/dependency_graph.h"
 
+#include <algorithm>
 #include <chrono>
 
 #include "command/toolchain.h"
@@ -19,9 +20,7 @@ namespace clice {
 
 namespace et = eventide;
 
-// ============================================================================
 // DependencyGraph implementation
-// ============================================================================
 
 void DependencyGraph::add_module(llvm::StringRef module_name, std::uint32_t path_id) {
     auto& ids = module_to_path[module_name];
@@ -101,9 +100,110 @@ std::size_t DependencyGraph::edge_count() const {
     return count;
 }
 
-// ============================================================================
+void DependencyGraph::build_reverse_map() {
+    reverse_includes_.clear();
+    for(auto& [key, ids]: includes) {
+        for(auto flagged_id: ids) {
+            auto included_id = flagged_id & PATH_ID_MASK;
+            auto& vec = reverse_includes_[included_id];
+            if(llvm::find(vec, key.path_id) == vec.end()) {
+                vec.push_back(key.path_id);
+            }
+        }
+    }
+}
+
+llvm::ArrayRef<std::uint32_t> DependencyGraph::get_includers(std::uint32_t path_id) const {
+    auto it = reverse_includes_.find(path_id);
+    if(it != reverse_includes_.end()) {
+        return it->second;
+    }
+    return {};
+}
+
+llvm::SmallVector<std::uint32_t, 4>
+    DependencyGraph::find_host_sources(std::uint32_t header_path_id) const {
+    llvm::SmallVector<std::uint32_t, 4> result;
+    llvm::DenseSet<std::uint32_t> visited;
+    llvm::SmallVector<std::uint32_t, 16> queue;
+
+    queue.push_back(header_path_id);
+    visited.insert(header_path_id);
+
+    while(!queue.empty()) {
+        auto current = queue.pop_back_val();
+        auto includers = get_includers(current);
+        if(includers.empty()) {
+            // No includers: this is a root (source file).
+            // Exclude the starting header itself.
+            if(current != header_path_id) {
+                result.push_back(current);
+            }
+            continue;
+        }
+        for(auto includer: includers) {
+            if(visited.insert(includer).second) {
+                queue.push_back(includer);
+            }
+        }
+    }
+
+    return result;
+}
+
+std::vector<std::uint32_t> DependencyGraph::find_include_chain(std::uint32_t host_path_id,
+                                                               std::uint32_t target_path_id) const {
+    if(host_path_id == target_path_id) {
+        return {host_path_id};
+    }
+
+    // BFS: predecessor map for path reconstruction.
+    llvm::DenseMap<std::uint32_t, std::uint32_t> prev;
+    llvm::SmallVector<std::uint32_t, 16> queue;
+
+    prev[host_path_id] = host_path_id;
+    queue.push_back(host_path_id);
+
+    bool found = false;
+    while(!queue.empty() && !found) {
+        llvm::SmallVector<std::uint32_t, 16> next_queue;
+        for(auto current: queue) {
+            auto includes_union = get_all_includes(current);
+            for(auto flagged_id: includes_union) {
+                auto child = flagged_id & PATH_ID_MASK;
+                if(prev.find(child) == prev.end()) {
+                    prev[child] = current;
+                    if(child == target_path_id) {
+                        found = true;
+                        break;
+                    }
+                    next_queue.push_back(child);
+                }
+            }
+            if(found) {
+                break;
+            }
+        }
+        queue = std::move(next_queue);
+    }
+
+    if(!found) {
+        return {};
+    }
+
+    // Reconstruct path from target back to host.
+    std::vector<std::uint32_t> chain;
+    auto node = target_path_id;
+    while(node != host_path_id) {
+        chain.push_back(node);
+        node = prev[node];
+    }
+    chain.push_back(host_path_id);
+    std::reverse(chain.begin(), chain.end());
+    return chain;
+}
+
 // Wavefront BFS scanner — async implementation
-// ============================================================================
 
 namespace {
 
@@ -523,8 +623,9 @@ et::task<> scan_impl(CompilationDatabase& cdb,
                 auto contexts =
                     cdb.lookup(file_path, {.query_toolchain = true, .suppress_logging = true});
                 if(!contexts.empty()) {
-                    auto& ctx = contexts[0];
-                    auto fallback = scan_module_decl(ctx.arguments, ctx.directory, /*content=*/{});
+                    auto& cmd = contexts[0];
+                    auto fallback =
+                        scan_module_decl(cmd.to_argv(), cmd.resolved.directory, /*content=*/{});
                     if(!fallback.module_name.empty()) {
                         scan_result.scan_result.module_name = std::move(fallback.module_name);
                         scan_result.scan_result.is_interface_unit = fallback.is_interface_unit;
@@ -715,9 +816,7 @@ et::task<> scan_impl(CompilationDatabase& cdb,
 
 }  // namespace
 
-// ============================================================================
 // Public sync entry point
-// ============================================================================
 
 ScanReport scan_dependency_graph(CompilationDatabase& cdb,
                                  PathPool& path_pool,

@@ -26,7 +26,12 @@ extern Options options;
 
 void stderr_logger(std::string_view name, const Options& options);
 
-void file_loggger(std::string_view name, std::string_view dir, const Options& options);
+void file_logger(std::string_view name, std::string_view dir, const Options& options);
+
+/// Install a signal handler that writes crash stacktraces to the given log file.
+/// Also enables LLVM's default stderr stacktrace output.
+/// Must be called after file_logger so the log file path is known.
+void install_crash_handler(std::string_view log_path);
 
 template <typename... Args>
 struct logging_rformat {
@@ -95,9 +100,11 @@ void critical [[noreturn]] (logging_format<Args...> fmt, Args&&... args) {
 }  // namespace clice::logging
 
 #define LOG_MESSAGE(name, fmt, ...)                                                                \
-    if(clice::logging::options.level <= clice::logging::Level::name) {                             \
-        clice::logging::name(fmt __VA_OPT__(, ) __VA_ARGS__);                                      \
-    }
+    do {                                                                                           \
+        if(clice::logging::options.level <= clice::logging::Level::name) {                         \
+            clice::logging::name(fmt __VA_OPT__(, ) __VA_ARGS__);                                  \
+        }                                                                                          \
+    } while(0)
 
 #define LOG_TRACE(fmt, ...) LOG_MESSAGE(trace, fmt, __VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) LOG_MESSAGE(debug, fmt, __VA_ARGS__)

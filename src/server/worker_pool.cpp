@@ -10,14 +10,14 @@ namespace clice {
 
 namespace {
 
-/// Coroutine that reads lines from a worker's stderr pipe and logs them
-/// with a prefix like [SL-0] or [SF-1].
+/// Coroutine that drains a worker's stderr pipe.
+/// Workers write their own log files, so this only captures unexpected output
+/// (crash stacktraces, assertion failures, etc.) that bypasses spdlog.
 et::task<> drain_stderr(et::pipe stderr_pipe, std::string prefix) {
     std::string buffer;
     while(true) {
         auto result = co_await stderr_pipe.read();
         if(!result.has_value()) {
-            // EOF or error — worker has exited
             break;
         }
         auto& chunk = result.value();
@@ -26,7 +26,6 @@ et::task<> drain_stderr(et::pipe stderr_pipe, std::string prefix) {
 
         buffer += chunk;
 
-        // Log complete lines
         std::size_t pos = 0;
         while(true) {
             auto nl = buffer.find('\n', pos);
@@ -34,16 +33,15 @@ et::task<> drain_stderr(et::pipe stderr_pipe, std::string prefix) {
                 break;
             auto line = buffer.substr(pos, nl - pos);
             if(!line.empty()) {
-                LOG_INFO("{} {}", prefix, line);
+                LOG_DEBUG("{} {}", prefix, line);
             }
             pos = nl + 1;
         }
         buffer.erase(0, pos);
     }
 
-    // Flush any remaining partial line
     if(!buffer.empty()) {
-        LOG_INFO("{} {}", prefix, buffer);
+        LOG_DEBUG("{} {}", prefix, buffer);
     }
 }
 
@@ -52,6 +50,10 @@ et::task<> drain_stderr(et::pipe stderr_pipe, std::string prefix) {
 bool WorkerPool::spawn_worker(const std::string& self_path,
                               bool stateful,
                               std::uint64_t memory_limit) {
+    auto& workers = stateful ? stateful_workers : stateless_workers;
+    auto worker_index = workers.size();
+    std::string worker_name = std::string(stateful ? "SF-" : "SL-") + std::to_string(worker_index);
+
     et::process::options opts;
     opts.file = self_path;
     if(stateful) {
@@ -63,6 +65,15 @@ bool WorkerPool::spawn_worker(const std::string& self_path,
     } else {
         opts.args = {self_path, "--mode", "stateless-worker"};
     }
+
+    opts.args.push_back("--worker-name");
+    opts.args.push_back(worker_name);
+
+    if(!log_dir_.empty()) {
+        opts.args.push_back("--log-dir");
+        opts.args.push_back(log_dir_);
+    }
+
     opts.streams = {
         et::process::stdio::pipe(true, false),  // stdin: child reads
         et::process::stdio::pipe(false, true),  // stdout: child writes
@@ -85,14 +96,8 @@ bool WorkerPool::spawn_worker(const std::string& self_path,
                                                                 std::move(spawn.stdin_pipe));
     auto peer = std::make_unique<et::ipc::BincodePeer>(loop, std::move(transport));
 
-    auto& workers = stateful ? stateful_workers : stateless_workers;
-    auto worker_index = workers.size();
-
-    // Build log prefix: [SF-0] for stateful, [SL-0] for stateless
-    std::string prefix =
-        std::string("[") + (stateful ? "SF-" : "SL-") + std::to_string(worker_index) + "]";
-
     // Schedule stderr log collection
+    std::string prefix = "[" + worker_name + "]";
     loop.schedule(drain_stderr(std::move(spawn.stderr_pipe), prefix));
 
     workers.push_back(WorkerProcess{
@@ -108,6 +113,8 @@ bool WorkerPool::spawn_worker(const std::string& self_path,
 }
 
 bool WorkerPool::start(const WorkerPoolOptions& options) {
+    log_dir_ = options.log_dir;
+
     for(std::uint32_t i = 0; i < options.stateless_count; ++i) {
         if(!spawn_worker(options.self_path, false, 0)) {
             return false;

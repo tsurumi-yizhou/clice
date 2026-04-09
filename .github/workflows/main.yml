@@ -19,7 +19,7 @@ jobs:
       clice: ${{ steps.filter.outputs.clice }}
       vscode: ${{ steps.filter.outputs.vscode }}
       cmake: ${{ steps.filter.outputs.cmake }}
-      xmake: ${{ steps.filter.outputs.xmake }}
+
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -46,13 +46,31 @@ jobs:
               - 'tests/**'
               - 'config/**'
               - '.github/workflows/test-cmake.yml'
-            xmake:
-              - 'xmake.lua'
-              - 'src/**'
-              - 'include/**'
-              - 'tests/**'
-              - 'config/**'
-              - '.github/workflows/test-xmake.yml'
+
+  conventional-commit:
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check conventional commit format
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          pattern='^(feat|fix|refactor|chore|build|ci|docs|test|perf|style|revert)(\(.+\))?: .+'
+          if [[ "$IS_PR" == "true" ]]; then
+            subject="$PR_TITLE"
+            label="PR title"
+          else
+            subject=$(echo "$COMMIT_MSG" | head -n1)
+            label="Commit message"
+          fi
+          if [[ ! "$subject" =~ $pattern ]]; then
+            echo "::error::$label must follow conventional commit format: type(scope)?: description"
+            echo "  Valid types: feat, fix, refactor, chore, build, ci, docs, test, perf, style, revert"
+            echo "  Got: '$subject'"
+            exit 1
+          fi
 
   format:
     needs: changes
@@ -82,11 +100,6 @@ jobs:
     if: ${{ needs.changes.outputs.cmake == 'true' }}
     uses: ./.github/workflows/test-cmake.yml
 
-  # xmake:
-  #   needs: changes
-  #   if: ${{ needs.changes.outputs.xmake == 'true' }}
-  #   uses: ./.github/workflows/test-xmake.yml
-
   release-clice:
     permissions:
       contents: write
@@ -104,16 +117,17 @@ jobs:
   checks-passed:
     if: ${{ always() && !startsWith(github.ref, 'refs/tags/') }}
     needs:
+      - conventional-commit
       - format
       - deploy
       # - clice
       - vscode
       - cmake
-      # - xmake
+
     runs-on: ubuntu-latest
     steps:
       - name: Check results
         uses: re-actors/alls-green@release/v1
         with:
-          allowed-skips: format,deploy,clice,vscode,cmake,xmake
+          allowed-skips: conventional-commit,format,deploy,clice,vscode,cmake
           jobs: ${{ toJSON(needs) }}
