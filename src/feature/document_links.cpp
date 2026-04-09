@@ -23,49 +23,59 @@ auto document_links(CompilationUnitRef unit, PositionEncoding encoding)
     PositionMapper converter(content, encoding);
     auto& directives = directives_it->second;
 
-    links.reserve(directives.includes.size() + directives.has_includes.size());
+    // Scan forward from offset to find a quoted/angled filename range.
+    auto find_filename_range = [&](std::uint32_t offset) -> std::optional<LocalSourceRange> {
+        auto tail = content.substr(offset);
+        auto quote_pos = tail.find_first_of("<\"");
+        if(quote_pos == llvm::StringRef::npos) {
+            return std::nullopt;
+        }
+        char open = tail[quote_pos];
+        char close = open == '<' ? '>' : '"';
+        auto close_pos = tail.find(close, quote_pos + 1);
+        if(close_pos == llvm::StringRef::npos) {
+            return std::nullopt;
+        }
+        return LocalSourceRange(offset + static_cast<std::uint32_t>(quote_pos),
+                                offset + static_cast<std::uint32_t>(close_pos + 1));
+    };
+
+    auto add_link_by_location = [&](clang::SourceLocation loc, llvm::StringRef target) {
+        auto [fid, offset] = unit.decompose_location(loc);
+        if(fid != interested || offset >= content.size()) {
+            return;
+        }
+        auto range = find_filename_range(offset);
+        if(!range) {
+            return;
+        }
+        protocol::DocumentLink link{.range = to_range(converter, *range)};
+        link.target = target.str();
+        links.push_back(std::move(link));
+    };
 
     for(const auto& include: directives.includes) {
-        auto [fid, range] = unit.decompose_range(include.filename_range);
-        if(fid != interested || !range.valid()) {
-            continue;
+        if(include.fid.isValid()) {
+            add_link_by_location(include.location, unit.file_path(include.fid));
         }
-
-        protocol::DocumentLink link{
-            .range = to_range(converter, range),
-        };
-        link.target = std::string(unit.file_path(include.fid));
-        links.push_back(std::move(link));
     }
 
     for(const auto& has_include: directives.has_includes) {
-        if(has_include.fid.isInvalid()) {
-            continue;
+        if(has_include.fid.isValid()) {
+            add_link_by_location(has_include.location, unit.file_path(has_include.fid));
         }
+    }
 
-        auto [fid, offset] = unit.decompose_location(has_include.location);
-        if(fid != interested || offset >= content.size()) {
-            continue;
+    for(const auto& embed: directives.embeds) {
+        if(embed.file) {
+            add_link_by_location(embed.loc, embed.file->getName());
         }
+    }
 
-        auto tail = content.substr(offset);
-        char open = tail.front();
-        if(open != '<' && open != '"') {
-            continue;
+    for(const auto& has_embed: directives.has_embeds) {
+        if(has_embed.file) {
+            add_link_by_location(has_embed.loc, has_embed.file->getName());
         }
-
-        char close = open == '<' ? '>' : '"';
-        auto close_index = tail.find(close, 1);
-        if(close_index == llvm::StringRef::npos) {
-            continue;
-        }
-
-        LocalSourceRange range(offset, offset + static_cast<std::uint32_t>(close_index + 1));
-        protocol::DocumentLink link{
-            .range = to_range(converter, range),
-        };
-        link.target = std::string(unit.file_path(has_include.fid));
-        links.push_back(std::move(link));
     }
 
     return links;
