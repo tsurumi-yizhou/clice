@@ -12,6 +12,7 @@
 
 #include "clang/AST/Attr.h"
 #include "clang/Basic/IdentifierTable.h"
+#include "clang/Basic/Module.h"
 
 namespace clice::feature {
 
@@ -168,6 +169,7 @@ public:
     auto collect() -> std::vector<RawToken> {
         highlight_lexical(unit.interested_file());
         run();
+        highlight_modules();
         merge_tokens();
         return std::move(tokens);
     }
@@ -291,6 +293,58 @@ private:
         });
     }
 
+    void highlight_modules() {
+        auto interested = unit.interested_file();
+
+        auto directives_it = unit.directives().find(interested);
+        if(directives_it != unit.directives().end()) {
+            for(const auto& import: directives_it->second.imports) {
+                add_token(import.location, SymbolKind::Keyword, 0);
+                for(auto loc: import.name_locations) {
+                    add_token(loc, SymbolKind::Module, 0);
+                }
+            }
+        }
+
+        auto* mod = unit.context().getCurrentNamedModule();
+        if(!mod) {
+            return;
+        }
+
+        auto def_loc = mod->DefinitionLoc;
+        if(!def_loc.isValid() || !def_loc.isFileID()) {
+            return;
+        }
+
+        auto [fid, offset] = unit.decompose_location(def_loc);
+        if(fid != interested) {
+            return;
+        }
+
+        auto content = unit.file_content(fid);
+        auto& lang_opts = unit.lang_options();
+        Lexer lexer(content.substr(offset), false, &lang_opts);
+
+        auto module_token = lexer.advance();
+        if(module_token.is_identifier()) {
+            auto range = LocalSourceRange(offset + module_token.range.begin,
+                                          offset + module_token.range.end);
+            tokens.push_back({.range = range, .kind = SymbolKind::Keyword, .modifiers = 0});
+        }
+
+        // Scan for identifiers (module name parts) until semicolon/eof.
+        while(true) {
+            auto token = lexer.advance();
+            if(token.is_eof() || token.kind == clang::tok::semi) {
+                break;
+            }
+            if(token.is_identifier()) {
+                auto range = LocalSourceRange(offset + token.range.begin, offset + token.range.end);
+                tokens.push_back({.range = range, .kind = SymbolKind::Module, .modifiers = 0});
+            }
+        }
+    }
+
     void highlight_lexical(clang::FileID fid) {
         auto content = unit.file_content(fid);
         auto& lang_opts = unit.lang_options();
@@ -345,8 +399,15 @@ private:
     }
 
     static void resolve_conflict(RawToken& last, const RawToken& current) {
-        (void)current;
         if(last.kind == SymbolKind::Conflict) {
+            return;
+        }
+        // Directive is a low-priority lexical kind; semantic tokens override it.
+        if(last.kind == SymbolKind::Directive) {
+            last = current;
+            return;
+        }
+        if(current.kind == SymbolKind::Directive) {
             return;
         }
         last.kind = SymbolKind::Conflict;
