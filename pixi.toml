@@ -14,17 +14,24 @@ readme = "README.md"
 documentation = "https://docs.clice.io/clice/"
 repository = "https://github.com/clice-io/clice"
 channels = ["conda-forge"]
-platforms = ["win-64", "linux-64", "osx-arm64"]
+platforms = ["win-64", "linux-64", "osx-arm64", "osx-64", "linux-aarch64", "win-arm64"]
 
 [environments]
 default = ["build", "test"]
 package = ["build", "test", "package"]
+cross-macos-x64 = ["build", "package", "cross-macos-x64"]
+cross-linux-aarch64 = ["build", "package", "cross-linux-aarch64"]
+cross-windows-arm64 = ["build", "package", "cross-windows-arm64"]
 node = ["node"]
 format = ["format"]
+test-run = ["test"]
 
 # ============================================================================== #
 #                                  DEPENDENCIES                                  #
 # ============================================================================== #
+[feature.build]
+platforms = ["win-64", "linux-64", "osx-arm64", "osx-64", "linux-aarch64"]
+
 [feature.build.dependencies]
 python = ">=3.13"
 cmake = ">=3.30"
@@ -35,6 +42,7 @@ lld = "==20.1.8"
 llvm-tools = "==20.1.8"
 clang-tools = "==20.1.8"
 compiler-rt = "==20.1.8"
+flatbuffers = "==25.9.23"
 
 [feature.build.target.win-64.dependencies]
 sccache = "*"
@@ -54,6 +62,43 @@ scripts = ["scripts/activate_linux.sh"]
 [feature.build.target.win-64.activation]
 scripts = ["scripts/activate_asan.bat"]
 
+# macOS x64 (from arm64): clang natively supports cross-arch, no extra deps.
+[feature.cross-macos-x64.target.osx-arm64.dependencies]
+
+[feature.cross-macos-x64.target.osx-arm64.activation]
+scripts = ["scripts/activate_cross_macos.sh"]
+
+# Linux aarch64 (from x64): needs aarch64 sysroot and cross gcc for libstdc++.
+[feature.cross-linux-aarch64.target.linux-64.dependencies]
+sysroot_linux-aarch64 = "==2.17"
+gcc_linux-aarch64 = "==14.2.0"
+gxx_linux-aarch64 = "==14.2.0"
+
+[feature.cross-linux-aarch64.target.linux-64.activation]
+scripts = ["scripts/activate_cross_linux.sh"]
+
+# Windows arm64 (from x64): Windows SDK on CI already includes ARM64 libs.
+[feature.cross-windows-arm64.target.win-64.dependencies]
+
+[feature.cross-windows-arm64.target.win-64.activation]
+scripts = ["scripts/activate_cross_windows.bat"]
+
+[feature.test.dependencies]
+python = ">=3.13"
+
+# On macOS, the system Apple clang emits vendor-specific flags that upstream
+# LLVM cannot parse.  Providing upstream clang + lld in PATH prevents
+# fallback to /usr/bin/clang++ and satisfies toolchain.cmake's -fuse-ld=lld.
+[feature.test.target.osx-64.dependencies]
+clang = "==20.1.8"
+clangxx = "==20.1.8"
+lld = "==20.1.8"
+
+[feature.test.target.osx-arm64.dependencies]
+clang = "==20.1.8"
+clangxx = "==20.1.8"
+lld = "==20.1.8"
+
 [feature.test.pypi-dependencies]
 pytest = "*"
 pytest-asyncio = ">=1.1.0"
@@ -63,14 +108,21 @@ lsprotocol = ">=2024.0.0"
 [feature.package.dependencies]
 xz = ">=5.8.1,<6"
 
-[feature.package.tasks.package]
+[feature.package.tasks.package-config]
+args = [{ arg = "type", default = "RelWithDebInfo" }]
 cmd = """
-cmake -B build/RelWithDebInfo -G Ninja \
-    -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+cmake -B build/{{ type }} -G Ninja \
+    -DCMAKE_BUILD_TYPE={{ type }} \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake \
-    -DCLICE_RELEASE=ON && \
-cmake --build build/RelWithDebInfo
+    -DCLICE_RELEASE=ON
 """
+
+[feature.package.tasks.package]
+args = [{ arg = "type", default = "RelWithDebInfo" }]
+depends-on = [
+    { task = "package-config", args = ["{{ type }}"] },
+    { task = "cmake-build", args = ["{{ type }}"] },
+]
 
 # ============================================================================== #
 #                                   CMAKE                                        #
@@ -79,14 +131,13 @@ cmake --build build/RelWithDebInfo
 args = [
     { arg = "type", default = "RelWithDebInfo" },
     { arg = "ci", default = "OFF" },
-    { arg = "extra", default = "" },
 ]
 cmd = """
 cmake -B build/{{ type }} -G Ninja \
     -DCMAKE_BUILD_TYPE={{ type }} \
     -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain.cmake \
     -DCLICE_ENABLE_TEST=ON \
-    -DCLICE_CI_ENVIRONMENT={{ ci }} {{extra}} \
+    -DCLICE_CI_ENVIRONMENT={{ ci }}
 """
 
 [feature.build.tasks.cmake-build]
@@ -97,10 +148,9 @@ cmd = "cmake --build build/{{ type }}"
 args = [
     { arg = "type", default = "RelWithDebInfo" },
     { arg = "ci", default = "OFF" },
-    { arg = "extra", default = "" },
 ]
 depends-on = [
-    { task = "cmake-config", args = ["{{ type }}", "{{ ci }}", "{{extra}}"] },
+    { task = "cmake-config", args = ["{{ type }}", "{{ ci }}"] },
     { task = "cmake-build", args = ["{{ type }}"] },
 ]
 
@@ -108,7 +158,7 @@ depends-on = [
 args = [{ arg = "type", default = "RelWithDebInfo" }]
 depends-on = [{ task = "lint-cpp", args = ["{{ type }}"] }]
 
-[feature.build.tasks.unit-test]
+[feature.test.tasks.unit-test]
 args = [{ arg = "type", default = "RelWithDebInfo" }]
 cmd = './build/{{ type }}/bin/unit_tests --test-dir="./tests/data"'
 
@@ -131,6 +181,7 @@ args = [{ arg = "type", default = "RelWithDebInfo" }]
 depends-on = [
     { task = "unit-test", args = ["{{ type }}"] },
     { task = "integration-test", args = ["{{ type }}"] },
+    { task = "smoke-test", args = ["{{ type }}"] },
 ]
 
 # ============================================================================== #
@@ -152,9 +203,14 @@ gh workflow run upload-llvm.yml \
 args = ["file_name"]
 cmd = ["scripts/delete-artifacts.bash", "{{ file_name }}"]
 
+[dependencies]
+
 # ============================================================================== #
 #                             DOCS & VSCODE EXTENSION                            #
 # ============================================================================== #
+[feature.node]
+platforms = ["win-64", "linux-64", "osx-arm64", "osx-64", "linux-aarch64"]
+
 [feature.node.dependencies]
 nodejs = ">=20"
 pnpm = "*"
@@ -180,6 +236,9 @@ outputs = ["editors/vscode/node_modules/.modules.yaml"]
 # ============================================================================== #
 #                                    FORMAT                                      #
 # ============================================================================== #
+[feature.format]
+platforms = ["win-64", "linux-64", "osx-arm64", "osx-64", "linux-aarch64"]
+
 [feature.format.dependencies]
 ruff = "*"
 tombi = "*"

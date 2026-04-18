@@ -25,6 +25,22 @@ function(setup_llvm LLVM_VERSION)
         list(APPEND LLVM_SETUP_ARGS "--offline")
     endif()
 
+    if(DEFINED CLICE_TARGET_TRIPLE)
+        if(CLICE_TARGET_TRIPLE MATCHES "linux")
+            list(APPEND LLVM_SETUP_ARGS "--target-platform" "Linux")
+        elseif(CLICE_TARGET_TRIPLE MATCHES "darwin")
+            list(APPEND LLVM_SETUP_ARGS "--target-platform" "macosx")
+        elseif(CLICE_TARGET_TRIPLE MATCHES "windows")
+            list(APPEND LLVM_SETUP_ARGS "--target-platform" "Windows")
+        endif()
+
+        if(CLICE_TARGET_TRIPLE MATCHES "^aarch64")
+            list(APPEND LLVM_SETUP_ARGS "--target-arch" "arm64")
+        elseif(CLICE_TARGET_TRIPLE MATCHES "^x86_64")
+            list(APPEND LLVM_SETUP_ARGS "--target-arch" "x64")
+        endif()
+    endif()
+
     execute_process(
         COMMAND "${Python3_EXECUTABLE}" "${LLVM_SETUP_SCRIPT}" ${LLVM_SETUP_ARGS}
         RESULT_VARIABLE LLVM_SETUP_RESULT
