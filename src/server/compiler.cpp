@@ -47,8 +47,13 @@ void Compiler::init_compile_graph() {
     // Lazy dependency resolver: scans a module file on demand to discover imports.
     auto resolve = [this](std::uint32_t path_id) -> llvm::SmallVector<std::uint32_t> {
         auto file_path = workspace.path_pool.resolve(path_id);
-        auto results =
-            workspace.cdb.lookup(file_path, {.query_toolchain = true, .suppress_logging = true});
+        std::vector<std::string> rule_append, rule_remove;
+        workspace.config.match_rules(file_path, rule_append, rule_remove);
+        auto results = workspace.cdb.lookup(file_path,
+                                            {.query_toolchain = true,
+                                             .suppress_logging = true,
+                                             .remove = rule_remove,
+                                             .append = rule_append});
         if(results.empty())
             return {};
 
@@ -97,7 +102,8 @@ void Compiler::init_compile_graph() {
         }
         auto args_hash = llvm::xxh3_64bits(llvm::StringRef(hash_input));
         auto pcm_filename = std::format("{}-{:016x}.pcm", safe_module_name, args_hash);
-        auto pcm_path = path::join(workspace.config.cache_dir, "cache", "pcm", pcm_filename);
+        auto pcm_path =
+            path::join(workspace.config.project.cache_dir, "cache", "pcm", pcm_filename);
 
         // Check if cached PCM is still valid.
         if(auto pcm_it = workspace.pcm_cache.find(path_id); pcm_it != workspace.pcm_cache.end()) {
@@ -156,7 +162,11 @@ bool Compiler::fill_compile_args(llvm::StringRef path,
     }
 
     // 2. Normal CDB lookup for the file itself.
-    auto results = workspace.cdb.lookup(path, {.query_toolchain = true});
+    //    Apply rules from config (append/remove flags based on file patterns).
+    std::vector<std::string> rule_append, rule_remove;
+    workspace.config.match_rules(path, rule_append, rule_remove);
+    CommandOptions opts{.query_toolchain = true, .remove = rule_remove, .append = rule_append};
+    auto results = workspace.cdb.lookup(path, opts);
     if(!results.empty()) {
         auto& cmd = results.front();
         directory = cmd.resolved.directory.str();
@@ -205,7 +215,13 @@ bool Compiler::fill_header_context_args(llvm::StringRef path,
     }
 
     auto host_path = workspace.path_pool.resolve(ctx_ptr->host_path_id);
-    auto host_results = workspace.cdb.lookup(host_path, {.query_toolchain = true});
+    // Apply rules matching the HEADER path (what the user is editing) on top of
+    // the host's command — rules are expected to apply uniformly to every file.
+    std::vector<std::string> rule_append, rule_remove;
+    workspace.config.match_rules(path, rule_append, rule_remove);
+    auto host_results = workspace.cdb.lookup(
+        host_path,
+        {.query_toolchain = true, .remove = rule_remove, .append = rule_append});
     if(host_results.empty()) {
         LOG_WARN("fill_header_context_args: host {} has no CDB entry", host_path);
         return false;
@@ -355,7 +371,7 @@ std::optional<HeaderFileContext> Compiler::resolve_header_context(std::uint32_t 
     // Hash the preamble and write to cache directory.
     auto preamble_hash = llvm::xxh3_64bits(llvm::StringRef(preamble));
     auto preamble_filename = std::format("{:016x}.h", preamble_hash);
-    auto preamble_dir = path::join(workspace.config.cache_dir, "header_context");
+    auto preamble_dir = path::join(workspace.config.project.cache_dir, "header_context");
     auto preamble_path = path::join(preamble_dir, preamble_filename);
 
     if(!llvm::sys::fs::exists(preamble_path)) {
@@ -438,7 +454,7 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
     auto preamble_hash = llvm::xxh3_64bits(preamble_text);
 
     // Deterministic content-addressed PCH path.
-    auto pch_path = path::join(workspace.config.cache_dir,
+    auto pch_path = path::join(workspace.config.project.cache_dir,
                                "cache",
                                "pch",
                                std::format("{:016x}.pch", preamble_hash));

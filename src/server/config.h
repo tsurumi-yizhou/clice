@@ -3,44 +3,77 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
+
+#include "support/glob_pattern.h"
+
+#include "kota/meta/annotation.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace clice {
 
-/// Configuration for the clice LSP server, loadable from clice.toml.
-struct CliceConfig {
-    // Worker configuration (0 = auto-detect from system resources)
-    std::uint32_t stateful_worker_count = 0;
-    std::uint32_t stateless_worker_count = 0;
-    std::uint64_t worker_memory_limit = 0;  // bytes; 0 = auto
+using kota::meta::defaulted;
 
-    // Compilation database path (empty = auto-detect)
-    std::string compile_commands_path;
+/// A file-pattern rule that appends/removes compilation flags.
+/// Corresponds to `[[rules]]` in clice.toml.
+struct ConfigRule {
+    defaulted<std::vector<std::string>> patterns;
+    defaulted<std::vector<std::string>> append;
+    defaulted<std::vector<std::string>> remove;
+};
 
-    // Cache directory (empty = default: <workspace>/.clice/)
-    std::string cache_dir;
+/// Corresponds to the `[project]` section in clice.toml.
+struct ProjectConfig {
+    defaulted<bool> clang_tidy = {};
+    defaulted<int> max_active_file = {};
 
-    // Index storage directory (default: <cache_dir>/index/)
-    std::string index_dir;
+    defaulted<std::string> cache_dir;
+    defaulted<std::string> index_dir;
+    defaulted<std::string> logging_dir;
 
-    // Logging directory (default: <cache_dir>/logs/)
-    std::string logging_dir;
+    defaulted<std::vector<std::string>> compile_commands_paths;
 
-    // Background indexing
-    bool enable_indexing = true;
-    int idle_timeout_ms = 3000;
+    std::optional<bool> enable_indexing;
+    std::optional<int> idle_timeout_ms;
+
+    defaulted<std::uint32_t> stateful_worker_count = {};
+    defaulted<std::uint32_t> stateless_worker_count = {};
+    defaulted<std::uint64_t> worker_memory_limit = {};
+};
+
+struct CompiledRule {
+    std::vector<GlobPattern> patterns;
+    std::vector<std::string> append;
+    std::vector<std::string> remove;
+};
+
+/// Configuration for the clice LSP server, loadable from clice.toml
+/// or passed via LSP initializationOptions.
+struct Config {
+    defaulted<ProjectConfig> project;
+
+    defaulted<std::vector<ConfigRule>> rules;
+
+    kota::meta::annotation<std::vector<CompiledRule>, kota::meta::attrs::skip> compiled_rules;
 
     /// Compute default values for any field left at its zero/empty sentinel.
-    void apply_defaults(const std::string& workspace_root);
+    void apply_defaults(llvm::StringRef workspace_root);
+
+    /// Collect append/remove flags from all rules whose patterns match `path`.
+    void match_rules(llvm::StringRef path,
+                     std::vector<std::string>& append,
+                     std::vector<std::string>& remove) const;
 
     /// Try to load configuration from a TOML file.
-    /// Performs ${workspace} variable substitution in string fields.
-    /// Returns std::nullopt if the file does not exist or cannot be parsed.
-    static std::optional<CliceConfig> load(const std::string& path,
-                                           const std::string& workspace_root);
+    static std::optional<Config> load(llvm::StringRef path, llvm::StringRef workspace_root);
+
+    /// Try to load configuration from a JSON string (e.g. initializationOptions).
+    static std::optional<Config> load_from_json(llvm::StringRef json,
+                                                llvm::StringRef workspace_root);
 
     /// Load config from the workspace, trying standard locations.
     /// Returns a default config (with apply_defaults) if no file is found.
-    static CliceConfig load_from_workspace(const std::string& workspace_root);
+    static Config load_from_workspace(llvm::StringRef workspace_root);
 };
 
 }  // namespace clice
