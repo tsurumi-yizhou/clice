@@ -15,6 +15,22 @@
 
 namespace clice {
 
+/// RAII guard that lowers the current process's scheduling priority and
+/// restores it on destruction.
+struct ScopedNice {
+    int saved;
+
+    explicit ScopedNice(int increment = 10) {
+        auto p = kota::sys::priority();
+        saved = p ? *p : 0;
+        kota::sys::set_priority(saved + increment);
+    }
+
+    ~ScopedNice() {
+        kota::sys::set_priority(saved);
+    }
+};
+
 using kota::ipc::RequestResult;
 using RequestContext = kota::ipc::BincodePeer::RequestContext;
 
@@ -283,7 +299,10 @@ int run_stateless_worker_mode(const std::string& worker_name, const std::string&
             switch(params.kind) {
                 case K::BuildPCH: return handle_build_pch(params);
                 case K::BuildPCM: return handle_build_pcm(params);
-                case K::Index: return handle_index(params);
+                case K::Index: {
+                    ScopedNice guard;
+                    return handle_index(params);
+                }
                 case K::Completion: return handle_completion(params);
                 case K::SignatureHelp: return handle_signature_help(params);
             }

@@ -12,7 +12,9 @@
 #include "server/workspace.h"
 
 #include "kota/async/async.h"
+#include "kota/ipc/codec/json.h"
 #include "kota/ipc/lsp/position.h"
+#include "kota/ipc/lsp/progress.h"
 #include "kota/ipc/lsp/protocol.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -61,6 +63,47 @@ public:
             std::function<bool(std::uint32_t)> is_file_open = {}) :
         loop(loop), workspace(workspace), sessions(sessions), pool(pool), compiler(compiler),
         is_file_open(std::move(is_file_open)) {}
+
+    /// Set the LSP peer for progress reporting.  Must be called before
+    /// schedule() if progress notifications are desired.
+    void set_peer(kota::ipc::JsonPeer* p) {
+        peer = p;
+    }
+
+    /// Temporarily pause background indexing to give priority to user
+    /// requests.  Indexing tasks already dispatched to workers continue,
+    /// but no new tasks will be sent until resume_indexing() is called.
+    void pause_indexing();
+
+    /// Resume background indexing after a pause.
+    void resume_indexing();
+
+    /// RAII guard that pauses indexing for its lifetime.
+    struct [[nodiscard]] ScopedPause {
+        Indexer& indexer;
+
+        explicit ScopedPause(Indexer& idx) : indexer(idx) {
+            indexer.pause_indexing();
+        }
+
+        ~ScopedPause() {
+            indexer.resume_indexing();
+        }
+
+        ScopedPause(const ScopedPause&) = delete;
+        ScopedPause& operator=(const ScopedPause&) = delete;
+    };
+
+    ScopedPause scoped_pause() {
+        return ScopedPause{*this};
+    }
+
+    /// Set the maximum number of concurrent index tasks.
+    /// Also sets the baseline that dynamic adjustment will restore to.
+    void set_max_concurrency(std::size_t n) {
+        max_concurrent = std::max<std::size_t>(n, 1);
+        baseline_concurrent = max_concurrent;
+    }
 
     /// Add a file to the background indexing queue.
     void enqueue(std::uint32_t server_path_id);
@@ -175,6 +218,9 @@ private:
     /// server-path-id-keyed sessions map to project-level path_ids.
     std::function<bool(std::uint32_t)> is_file_open;
 
+    /// LSP peer for progress reporting (optional, not owned).
+    kota::ipc::JsonPeer* peer = nullptr;
+
     /// Background indexing queue and scheduling state.
     std::vector<std::uint32_t> index_queue;
     std::size_t index_queue_pos = 0;
@@ -182,7 +228,30 @@ private:
     bool indexing_scheduled = false;
     std::shared_ptr<kota::timer> index_idle_timer;
 
+    /// Concurrency control for background indexing.
+    std::size_t max_concurrent = 2;
+    std::size_t baseline_concurrent = 2;
+    std::size_t inflight = 0;
+    std::size_t finished = 0;  ///< Incremented by each completed dispatch task.
+
+    /// Pause/resume: when paused, new index tasks wait on this event.
+    /// Uses a counter so nested pause/resume pairs work correctly.
+    std::size_t pause_depth = 0;
+    kota::event resume_event{true};
+
+    /// Completion event — signalled by each finished dispatch task so the
+    /// main loop can wake up.  Must be a member (not local to the coroutine)
+    /// because inflight tasks capture it by reference and may outlive the
+    /// coroutine frame during server shutdown.
+    kota::event completion_event;
+
+    /// Generation counter — incremented each run so a stale monitor_resources
+    /// coroutine can detect that its owning run has ended.
+    std::uint32_t monitor_generation = 0;
+
     kota::task<> run_background_indexing();
+    kota::task<> index_one(std::uint32_t server_path_id);
+    kota::task<> monitor_resources(std::uint32_t generation);
 };
 
 }  // namespace clice

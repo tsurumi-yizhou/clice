@@ -110,7 +110,11 @@ async def client(
 
     if workspace is not None:
         init_options_marker = request.node.get_closest_marker("init_options")
-        init_options = init_options_marker.args[0] if init_options_marker else None
+        init_options = dict(init_options_marker.args[0]) if init_options_marker else {}
+        # Force cache_dir into the workspace so .clice/ cleanup prevents stale PCH.
+        project = dict(init_options.get("project", {}))
+        project.setdefault("cache_dir", str(workspace / ".clice"))
+        init_options["project"] = project
         await c.initialize(workspace, initialization_options=init_options)
 
     yield c
@@ -165,12 +169,17 @@ async def _shutdown_client(c: CliceClient) -> None:
 
     try:
         server = getattr(c, "_server", None)
-        if server and server.stderr:
-            stderr_data = await asyncio.wait_for(server.stderr.read(), timeout=2.0)
-            if stderr_data:
-                for line in stderr_data.decode("utf-8", errors="replace").splitlines():
-                    if "[warn]" in line or "[error]" in line:
-                        print(f"[server] {line}", flush=True)
+        if server:
+            if server.returncode is not None:
+                print(f"[server] exit code: {server.returncode}", flush=True)
+            if server.stderr:
+                stderr_data = await asyncio.wait_for(server.stderr.read(), timeout=2.0)
+                if stderr_data:
+                    for line in stderr_data.decode(
+                        "utf-8", errors="replace"
+                    ).splitlines():
+                        if "[warn]" in line or "[error]" in line or "Sanitizer" in line:
+                            print(f"[server] {line}", flush=True)
     except Exception:
         pass
 

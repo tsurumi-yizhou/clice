@@ -64,6 +64,8 @@ private:
         kota::process proc;
         std::unique_ptr<kota::ipc::BincodePeer> peer;
         std::size_t owned_documents = 0;
+        bool alive = true;
+        unsigned restart_count = 0;
     };
 
     kota::event_loop& loop;
@@ -80,8 +82,19 @@ private:
     void clear_owner(std::size_t worker_index);
     std::size_t pick_least_loaded();
 
+    bool shutting_down_ = false;
+    std::size_t alive_count_ = 0;
+    kota::event all_exited_{true};  // Signalled when alive_count_ reaches 0.
+    WorkerPoolOptions options_;
     std::string log_dir_;
+
+    /// Peers moved here during respawn so their coroutines can finish
+    /// before the object is destroyed.
+    llvm::SmallVector<std::unique_ptr<kota::ipc::BincodePeer>> retired_peers;
+
     bool spawn_worker(const std::string& self_path, bool stateful, std::uint64_t memory_limit);
+    bool respawn_worker(std::size_t index, bool stateful);
+    kota::task<> monitor_worker(std::size_t index, bool stateful);
 };
 
 template <typename Params>
@@ -91,11 +104,10 @@ RequestResult<Params> WorkerPool::send_stateful(std::uint32_t path_id,
     if(stateful_workers.empty()) {
         co_return kota::outcome_error(kota::ipc::Error{"No stateful workers available"});
     }
-    // No timeout: compile tasks run as detached tasks (loop.schedule) that
-    // are immune to LSP $/cancelRequest.  Adding a timeout here would use
-    // kotatsu's with_token/when_any which has a spurious-cancellation bug
-    // that kills requests within milliseconds instead of the configured period.
     auto idx = assign_worker(path_id);
+    if(!stateful_workers[idx].alive) {
+        co_return kota::outcome_error(kota::ipc::Error{"Assigned stateful worker is down"});
+    }
     co_return co_await stateful_workers[idx].peer->send_request(params, opts);
 }
 
@@ -105,15 +117,24 @@ RequestResult<Params> WorkerPool::send_stateless(const Params& params,
     if(stateless_workers.empty()) {
         co_return kota::outcome_error(kota::ipc::Error{"No stateless workers available"});
     }
-    auto idx = next_stateless;
-    next_stateless = (next_stateless + 1) % stateless_workers.size();
-    co_return co_await stateless_workers[idx].peer->send_request(params, opts);
+    // Round-robin, skipping dead workers.
+    auto start = next_stateless;
+    for(std::size_t i = 0; i < stateless_workers.size(); ++i) {
+        auto idx = (start + i) % stateless_workers.size();
+        if(stateless_workers[idx].alive) {
+            next_stateless = (idx + 1) % stateless_workers.size();
+            co_return co_await stateless_workers[idx].peer->send_request(params, opts);
+        }
+    }
+    co_return kota::outcome_error(kota::ipc::Error{"All stateless workers are down"});
 }
 
 template <typename Params>
 void WorkerPool::notify_stateful(std::uint32_t path_id, const Params& params) {
     auto it = owner.find(path_id);
     if(it == owner.end())
+        return;
+    if(!stateful_workers[it->second].alive)
         return;
     stateful_workers[it->second].peer->send_notification(params);
 }
