@@ -61,8 +61,8 @@ public:
             WorkerPool& pool,
             Compiler& compiler,
             std::function<bool(std::uint32_t)> is_file_open = {}) :
-        loop(loop), workspace(workspace), sessions(sessions), pool(pool), compiler(compiler),
-        is_file_open(std::move(is_file_open)) {}
+        loop(loop), bg_tasks(loop), workspace(workspace), sessions(sessions), pool(pool),
+        compiler(compiler), is_file_open(std::move(is_file_open)) {}
 
     /// Set the LSP peer for progress reporting.  Must be called before
     /// schedule() if progress notifications are desired.
@@ -167,6 +167,43 @@ public:
     std::vector<protocol::SymbolInformation> search_symbols(llvm::StringRef query,
                                                             std::size_t max_results = 100);
 
+    struct DefinitionText {
+        std::string file;
+        int start_line;
+        int end_line;
+        std::string text;
+    };
+
+    /// Get full definition text for a symbol, using stored index ranges and content.
+    std::optional<DefinitionText> get_definition_text(index::SymbolHash hash);
+
+    struct ReferenceWithContext {
+        std::string file;
+        int line;
+        std::string context;
+    };
+
+    /// Collect references (or definitions) with context lines from stored content.
+    std::vector<ReferenceWithContext> collect_references(index::SymbolHash hash, RelationKind kind);
+
+    /// Cancel background indexing and wait for all tasks to settle.
+    kota::task<> stop();
+
+    /// Whether background indexing is currently idle (no active or queued work).
+    bool is_idle() const {
+        return !indexing_active && index_queue_pos >= index_queue.size();
+    }
+
+    /// Number of files remaining in the indexing queue.
+    std::size_t pending_files() const {
+        return index_queue_pos < index_queue.size() ? index_queue.size() - index_queue_pos : 0;
+    }
+
+    /// Total files that were enqueued in the current (or last) indexing round.
+    std::size_t total_queued() const {
+        return index_queue.size();
+    }
+
     /// Convert internal SymbolKind to LSP SymbolKind.
     static protocol::SymbolKind to_lsp_symbol_kind(SymbolKind kind);
 
@@ -208,6 +245,7 @@ private:
 
 private:
     kota::event_loop& loop;
+    kota::task_group<> bg_tasks;
     Workspace& workspace;
     llvm::DenseMap<std::uint32_t, Session>& sessions;
     WorkerPool& pool;

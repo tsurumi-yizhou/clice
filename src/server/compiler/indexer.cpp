@@ -447,6 +447,152 @@ std::optional<SymbolInfo> Indexer::resolve_symbol(index::SymbolHash hash) {
     return SymbolInfo{hash, std::move(name), kind, def_loc->uri, def_loc->range};
 }
 
+static std::string extract_line(llvm::StringRef content, std::uint32_t offset) {
+    if(content.empty() || offset >= content.size())
+        return {};
+    std::size_t line_start = 0;
+    if(offset > 0) {
+        auto pos = content.rfind('\n', offset - 1);
+        if(pos != llvm::StringRef::npos)
+            line_start = pos + 1;
+    }
+    auto line_end = content.find('\n', offset);
+    if(line_end == llvm::StringRef::npos)
+        line_end = content.size();
+    return content.slice(line_start, line_end).str();
+}
+
+std::optional<Indexer::DefinitionText> Indexer::get_definition_text(index::SymbolHash hash) {
+    for(auto& [id, sess]: sessions) {
+        if(!sess.file_index || !sess.file_index->mapper)
+            continue;
+        auto it = sess.file_index->file_index.relations.find(hash);
+        if(it == sess.file_index->file_index.relations.end())
+            continue;
+        for(auto& rel: it->second) {
+            if(rel.kind.value() != RelationKind::Definition)
+                continue;
+            auto def_range = std::bit_cast<LocalSourceRange>(rel.target_symbol);
+            if(def_range.begin >= def_range.end)
+                continue;
+            llvm::StringRef content = sess.file_index->content;
+            if(def_range.end > content.size())
+                continue;
+            auto start = sess.file_index->mapper->to_position(def_range.begin);
+            auto end = sess.file_index->mapper->to_position(def_range.end);
+            if(!start || !end)
+                continue;
+            return DefinitionText{
+                .file = std::string(workspace.path_pool.resolve(id)),
+                .start_line = static_cast<int>(start->line) + 1,
+                .end_line = static_cast<int>(end->line) + 1,
+                .text =
+                    std::string(content.substr(def_range.begin, def_range.end - def_range.begin)),
+            };
+        }
+    }
+
+    auto sym_it = workspace.project_index.symbols.find(hash);
+    if(sym_it == workspace.project_index.symbols.end())
+        return std::nullopt;
+
+    for(auto file_id: sym_it->second.reference_files) {
+        if(is_proj_path_open(file_id))
+            continue;
+        auto shard_it = workspace.merged_indices.find(file_id);
+        if(shard_it == workspace.merged_indices.end())
+            continue;
+        auto* m = shard_it->second.mapper();
+        if(!m)
+            continue;
+        auto content = shard_it->second.index.content();
+
+        std::optional<DefinitionText> result;
+        shard_it->second.index.lookup(
+            hash,
+            RelationKind::Definition,
+            [&](const index::Relation& r) {
+                auto def_range = std::bit_cast<LocalSourceRange>(r.target_symbol);
+                if(def_range.begin >= def_range.end || def_range.end > content.size())
+                    return true;
+                auto start = m->to_position(def_range.begin);
+                auto end = m->to_position(def_range.end);
+                if(!start || !end)
+                    return true;
+                result = DefinitionText{
+                    .file = workspace.project_index.path_pool.path(file_id).str(),
+                    .start_line = static_cast<int>(start->line) + 1,
+                    .end_line = static_cast<int>(end->line) + 1,
+                    .text = std::string(
+                        content.substr(def_range.begin, def_range.end - def_range.begin)),
+                };
+                return false;
+            });
+        if(result)
+            return result;
+    }
+
+    return std::nullopt;
+}
+
+std::vector<Indexer::ReferenceWithContext> Indexer::collect_references(index::SymbolHash hash,
+                                                                       RelationKind kind) {
+    std::vector<ReferenceWithContext> results;
+
+    auto sym_it = workspace.project_index.symbols.find(hash);
+    if(sym_it != workspace.project_index.symbols.end()) {
+        for(auto file_id: sym_it->second.reference_files) {
+            if(is_proj_path_open(file_id))
+                continue;
+            auto shard_it = workspace.merged_indices.find(file_id);
+            if(shard_it == workspace.merged_indices.end())
+                continue;
+            auto* m = shard_it->second.mapper();
+            if(!m)
+                continue;
+            auto content = shard_it->second.index.content();
+            auto file_path = workspace.project_index.path_pool.path(file_id);
+
+            shard_it->second.index.lookup(hash, kind, [&](const index::Relation& r) {
+                auto start = m->to_position(r.range.begin);
+                if(!start)
+                    return true;
+                results.push_back(ReferenceWithContext{
+                    .file = file_path.str(),
+                    .line = static_cast<int>(start->line) + 1,
+                    .context = extract_line(content, r.range.begin),
+                });
+                return true;
+            });
+        }
+    }
+
+    for(auto& [id, sess]: sessions) {
+        if(!sess.file_index || !sess.file_index->mapper)
+            continue;
+        auto it = sess.file_index->file_index.relations.find(hash);
+        if(it == sess.file_index->file_index.relations.end())
+            continue;
+        auto file_path = workspace.path_pool.resolve(id);
+        llvm::StringRef content = sess.file_index->content;
+
+        for(auto& rel: it->second) {
+            if(rel.kind != kind)
+                continue;
+            auto start = sess.file_index->mapper->to_position(rel.range.begin);
+            if(!start)
+                continue;
+            results.push_back(ReferenceWithContext{
+                .file = file_path.str(),
+                .line = static_cast<int>(start->line) + 1,
+                .context = extract_line(content, rel.range.begin),
+            });
+        }
+    }
+
+    return results;
+}
+
 std::vector<protocol::CallHierarchyIncomingCall>
     Indexer::find_incoming_calls(index::SymbolHash hash) {
     llvm::DenseMap<index::SymbolHash, std::vector<protocol::Range>> caller_ranges;
@@ -642,6 +788,11 @@ void Indexer::resume_indexing() {
     }
 }
 
+kota::task<> Indexer::stop() {
+    bg_tasks.cancel();
+    co_await bg_tasks.join();
+}
+
 void Indexer::schedule() {
     if(!*workspace.config.project.enable_indexing || indexing_active || indexing_scheduled)
         return;
@@ -651,7 +802,11 @@ void Indexer::schedule() {
         index_idle_timer = std::make_shared<kota::timer>(kota::timer::create(loop));
     }
     index_idle_timer->start(std::chrono::milliseconds(*workspace.config.project.idle_timeout_ms));
-    loop.schedule(run_background_indexing());
+
+    if(!bg_tasks.spawn(run_background_indexing())) {
+        indexing_scheduled = false;
+        LOG_WARN("Failed to spawn background indexing task (task group stopped)");
+    }
 }
 
 kota::task<> Indexer::index_one(std::uint32_t server_path_id) {
@@ -734,81 +889,69 @@ kota::task<> Indexer::run_background_indexing() {
     indexing_active = true;
 
     kota::cancellation_source monitor_cancel;
-    kota::task_group<> index_group(loop);
-    index_group.spawn(kota::with_token(monitor_resources(), monitor_cancel.token()));
+    bg_tasks.spawn(kota::with_token(monitor_resources(), monitor_cancel.token()));
 
     std::stable_partition(
         index_queue.begin() + index_queue_pos,
         index_queue.end(),
         [this](std::uint32_t id) { return workspace.path_to_module.contains(id); });
 
-    auto batch = index_queue.size() - index_queue_pos;
-    std::size_t inflight = 0;
+    auto total = index_queue.size() - index_queue_pos;
     std::size_t dispatched = 0;
     std::size_t completed = 0;
-    std::size_t finished = 0;
-    kota::event completion_event;
 
     std::optional<lsp::ProgressReporter<kota::ipc::JsonPeer>> progress;
     if(peer) {
         progress.emplace(*peer, protocol::ProgressToken(std::string("clice/backgroundIndex")));
         auto create_result = co_await progress->create();
         if(!create_result.has_error()) {
-            progress->begin("Indexing", std::format("0/{} files", batch), 0);
+            progress->begin("Indexing", std::format("0/{} files", total), 0);
         } else {
             progress.reset();
         }
     }
 
-    while(index_queue_pos < index_queue.size() || inflight > 0) {
-        while(index_queue_pos < index_queue.size() && inflight < max_concurrent) {
-            if(pause_depth > 0) {
-                co_await resume_event.wait();
-            }
+    kota::task_group<> workers(loop);
+    std::size_t in_flight = 0;
+    kota::event slot_available;
 
-            auto server_path_id = index_queue[index_queue_pos++];
+    while(index_queue_pos < index_queue.size()) {
+        if(pause_depth > 0)
+            co_await resume_event.wait();
 
-            auto file_path = std::string(workspace.path_pool.resolve(server_path_id));
-            if(sessions.contains(server_path_id) || !need_update(file_path)) {
-                ++completed;
-                continue;
-            }
-
-            ++inflight;
-            ++dispatched;
-
-            index_group.spawn([](Indexer* self,
-                                 std::uint32_t id,
-                                 std::size_t& inflight_ref,
-                                 std::size_t& finished_ref,
-                                 kota::event& done) -> kota::task<> {
-                co_await self->index_one(id);
-                --inflight_ref;
-                ++finished_ref;
-                done.set();
-            }(this, server_path_id, inflight, finished, completion_event));
+        auto server_path_id = index_queue[index_queue_pos++];
+        auto file_path = std::string(workspace.path_pool.resolve(server_path_id));
+        if(sessions.contains(server_path_id) || !need_update(file_path)) {
+            ++completed;
+            continue;
         }
 
-        if(inflight == 0)
-            break;
-
-        co_await completion_event.wait();
-        completion_event.reset();
-
-        completed += std::exchange(finished, 0);
-
-        if(progress) {
-            auto pct = batch > 0 ? static_cast<std::uint32_t>(completed * 100 / batch) : 100;
-            progress->report(std::format("{}/{} files", completed, batch), pct);
+        while(in_flight >= max_concurrent) {
+            slot_available.reset();
+            co_await slot_available.wait();
         }
+
+        ++in_flight;
+        ++dispatched;
+        workers.spawn([&, server_path_id]() -> kota::task<> {
+            co_await index_one(server_path_id);
+            --in_flight;
+            ++completed;
+            if(progress) {
+                auto pct = total > 0 ? static_cast<std::uint32_t>(completed * 100 / total) : 100;
+                progress->report(std::format("{}/{} files", completed, total), pct);
+            }
+            slot_available.set();
+        }());
     }
+
+    co_await workers.join();
 
     if(progress) {
         progress->end(std::format("Indexed {} files", dispatched));
     }
 
     monitor_cancel.cancel();
-    co_await index_group.join();
 
     indexing_active = false;
     LOG_INFO("Background indexing complete: {} files dispatched", dispatched);

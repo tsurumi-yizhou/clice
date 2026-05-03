@@ -37,6 +37,9 @@ public:
     ~MasterServer();
 
     void initialize();
+    void initialize(llvm::StringRef root);
+
+    void start_file_watcher();
 
     Session* find_session(std::uint32_t path_id);
     Session& open_session(std::uint32_t path_id);
@@ -46,7 +49,12 @@ public:
 
     void schedule_shutdown();
 
+    kota::event& get_shutdown_event() {
+        return shutdown_event;
+    }
+
 private:
+    kota::event shutdown_event;
     void load_workspace();
 
     kota::event_loop& loop;
@@ -73,5 +81,13 @@ struct ServerOptions {
 };
 
 int run_server_mode(const ServerOptions& opts);
+
+struct DaemonOptions {
+    std::string socket_path;
+    std::string workspace;
+    std::string self_path;
+};
+
+int run_daemon_mode(const DaemonOptions& opts);
 
 }  // namespace clice
