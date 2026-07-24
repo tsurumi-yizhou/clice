@@ -26,11 +26,6 @@ if(NOT MSVC)
     add_compile_options(-ffunction-sections -fdata-sections)
 endif()
 
-if(APPLE)
-    # https://conda-forge.org/docs/maintainer/knowledge_base/#newer-c-features-with-old-sdk
-    add_compile_definitions(_LIBCPP_DISABLE_AVAILABILITY=1)
-endif()
-
 # Keyed on the target OS, not the compiler frontend: CI links Windows with
 # GNU-driver clang++ + lld-link, where the frontend variant is "GNU" but the
 # linker still speaks MSVC-style /OPT flags (see the Debug /OPT:NOICF below).

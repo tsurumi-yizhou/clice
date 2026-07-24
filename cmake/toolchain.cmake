@@ -41,6 +41,20 @@ if(LLVM_RANLIB_PATH)
     set(CMAKE_CXX_COMPILER_RANLIB "${LLVM_RANLIB_PATH}" CACHE FILEPATH "")
 endif()
 
+# On macOS, CMake's Ninja generator uses libtool instead of ar for static
+# libraries. Apple's libtool cannot read bitcode from newer LLVM versions
+# (e.g. attribute kind 102 from LLVM 22), breaking LTO builds. Use LLVM's
+# llvm-libtool-darwin if available; otherwise suppress CMAKE_LIBTOOL so
+# CMake falls back to CMAKE_AR (llvm-ar handles bitcode correctly).
+if(APPLE)
+    find_program(LLVM_LIBTOOL_PATH "llvm-libtool-darwin")
+    if(LLVM_LIBTOOL_PATH)
+        set(CMAKE_LIBTOOL "${LLVM_LIBTOOL_PATH}" CACHE FILEPATH "")
+    else()
+        set(CMAKE_LIBTOOL "CMAKE_LIBTOOL-NOTFOUND" CACHE FILEPATH "")
+    endif()
+endif()
+
 find_program(LLVM_NM_PATH "llvm-nm")
 if(LLVM_NM_PATH)
     set(CMAKE_NM "${LLVM_NM_PATH}" CACHE FILEPATH "")
@@ -70,4 +84,28 @@ else()
     set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld")
     set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld")
     set(CMAKE_MODULE_LINKER_FLAGS_INIT "-fuse-ld=lld")
+endif()
+
+if(APPLE)
+    # conda-forge clang 22's bundled config files (<triple>-clang++.cfg)
+    # inject -L/-rpath pointing into the conda env at link time, binding
+    # binaries to conda's @rpath libc++ — they then fail to load outside
+    # the build machine. Disable config files: libc++ headers are still
+    # found relative to the driver, and links fall back to the SDK's
+    # system libc++ (safe thanks to availability annotations).
+    string(APPEND CMAKE_C_FLAGS_INIT " --no-default-config")
+    string(APPEND CMAKE_CXX_FLAGS_INIT " --no-default-config")
+    string(APPEND CMAKE_EXE_LINKER_FLAGS_INIT " --no-default-config")
+    string(APPEND CMAKE_SHARED_LINKER_FLAGS_INIT " --no-default-config")
+    string(APPEND CMAKE_MODULE_LINKER_FLAGS_INIT " --no-default-config")
+
+    # Debug links the prebuilt LLVM ASan dylibs, which reference conda's
+    # @rpath libc++ with rpaths baked for the machine that built them.
+    # Debug binaries are CI-internal, so resolve libc++ from the build
+    # env instead. Remove once the prebuilt is respun (its dylibs will
+    # then link the system libc++ via --no-default-config above).
+    if(DEFINED ENV{CONDA_PREFIX})
+        string(APPEND CMAKE_EXE_LINKER_FLAGS_DEBUG_INIT " -Wl,-rpath,$ENV{CONDA_PREFIX}/lib")
+        string(APPEND CMAKE_SHARED_LINKER_FLAGS_DEBUG_INIT " -Wl,-rpath,$ENV{CONDA_PREFIX}/lib")
+    endif()
 endif()

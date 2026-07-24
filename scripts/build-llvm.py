@@ -27,6 +27,8 @@ def build_native_tools(project_root: Path, build_dir: Path) -> Path:
     native_dir.mkdir(exist_ok=True)
     source_dir = project_root / "llvm"
 
+    cxx_flags = "-w"
+
     cmake_args = [
         "-G",
         "Ninja",
@@ -35,7 +37,7 @@ def build_native_tools(project_root: Path, build_dir: Path) -> Path:
         "-DLLVM_TARGETS_TO_BUILD=Native",
         "-DLLVM_DISABLE_ASSEMBLY_FILES=ON",
         "-DCMAKE_C_FLAGS=-w",
-        "-DCMAKE_CXX_FLAGS=-w",
+        f"-DCMAKE_CXX_FLAGS={cxx_flags}",
     ]
 
     if sys.platform == "win32":
@@ -171,8 +173,6 @@ def main():
     ]
 
     if sys.platform == "win32":
-        # Use clang-cl (MSVC driver) on Windows so that LLVM's CMake
-        # generates correct MSVC-style linker flags for LTO, etc.
         c_flags = "-w"
         if args.target_triple:
             c_flags += f" --target={args.target_triple}"
@@ -184,14 +184,16 @@ def main():
             "-DLLVM_USE_LINKER=lld-link",
         ]
     else:
+        cxx_flags = "-w"
         cmake_args += [
             f"-DCMAKE_TOOLCHAIN_FILE={toolchain_file.as_posix()}",
             "-DCMAKE_C_FLAGS=-w",
-            "-DCMAKE_CXX_FLAGS=-w",
+            f"-DCMAKE_CXX_FLAGS={cxx_flags}",
             "-DLLVM_USE_LINKER=lld",
         ]
 
     cmake_args += [
+        "-DLLVM_ENABLE_DIA_SDK=OFF",
         "-DLLVM_ENABLE_ZLIB=OFF",
         "-DLLVM_ENABLE_ZSTD=OFF",
         "-DLLVM_ENABLE_LIBXML2=OFF",
