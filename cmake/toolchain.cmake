@@ -71,6 +71,10 @@ if(WIN32)
         set(CMAKE_C_COMPILER_LAUNCHER "${SCCACHE_PATH}" CACHE FILEPATH "")
         set(CMAKE_CXX_COMPILER_LAUNCHER "${SCCACHE_PATH}" CACHE FILEPATH "")
     endif()
+    # TODO(prebuilt-respin): switch to "MultiThreaded" (/MT). /MD makes the exe
+    # import MSVCP140.dll and VCRUNTIME140.dll, which come from the Visual C++
+    # redistributable rather than from Windows. The CRT is baked into every
+    # object, so the prebuilt LLVM must be respun to /MT in the same change.
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreadedDLL" CACHE STRING "")
     set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld-link")
     set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld-link")
@@ -87,6 +91,11 @@ else()
 endif()
 
 if(APPLE)
+    # TODO(prebuilt-respin): set an explicit CMAKE_OSX_DEPLOYMENT_TARGET. With
+    # none it follows the build machine, so the artifact is stamped minos 15.0
+    # and will not launch on macOS 14 or older. Lowering it needs the prebuilt
+    # built against the same target.
+
     # conda-forge clang 22's bundled config files (<triple>-clang++.cfg)
     # inject -L/-rpath pointing into the conda env at link time, binding
     # binaries to conda's @rpath libc++ — they then fail to load outside
@@ -102,8 +111,8 @@ if(APPLE)
     # Debug links the prebuilt LLVM ASan dylibs, which reference conda's
     # @rpath libc++ with rpaths baked for the machine that built them.
     # Debug binaries are CI-internal, so resolve libc++ from the build
-    # env instead. Remove once the prebuilt is respun (its dylibs will
-    # then link the system libc++ via --no-default-config above).
+    # env instead. TODO(prebuilt-respin): remove once the prebuilt is
+    # respun — its dylibs will then link the system libc++ above.
     if(DEFINED ENV{CONDA_PREFIX})
         string(APPEND CMAKE_EXE_LINKER_FLAGS_DEBUG_INIT " -Wl,-rpath,$ENV{CONDA_PREFIX}/lib")
         string(APPEND CMAKE_SHARED_LINKER_FLAGS_DEBUG_INIT " -Wl,-rpath,$ENV{CONDA_PREFIX}/lib")

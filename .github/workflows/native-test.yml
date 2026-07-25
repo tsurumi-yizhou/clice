@@ -105,6 +105,11 @@ jobs:
         shell: bash
         run: pixi run -- cmake --build build/${{ matrix.build_type }} --target clice-pack clice-pack-symbol
 
+      - name: Check artifact dependencies
+        if: ${{ matrix.asset_name && !contains(matrix.os, 'windows') }}
+        shell: bash
+        run: pixi run -- python scripts/check_artifact_deps.py build/${{ matrix.build_type }}/pack/clice/bin/clice
+
       - name: Upload package artifacts
         if: ${{ matrix.asset_name }}
         uses: actions/upload-artifact@v7

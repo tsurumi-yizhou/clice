@@ -27,21 +27,10 @@ FetchContent_Declare(
 set(ENABLE_ROARING_TESTS OFF CACHE INTERNAL "" FORCE)
 set(ENABLE_ROARING_MICROBENCHMARKS OFF CACHE INTERNAL "" FORCE)
 
-# flatbuffers
-FetchContent_Declare(
-    flatbuffers
-    GIT_REPOSITORY https://github.com/google/flatbuffers.git
-    GIT_TAG v25.9.23
-    GIT_SHALLOW TRUE
-)
-set(FLATBUFFERS_BUILD_GRPC OFF CACHE BOOL "" FORCE)
-set(FLATBUFFERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(FLATBUFFERS_BUILD_FLATHASH OFF CACHE BOOL "" FORCE)
-
 FetchContent_Declare(
     kotatsu
     GIT_REPOSITORY https://github.com/clice-io/kotatsu
-    GIT_TAG f2cdf65
+    GIT_TAG c516e3ae0ca3c7d7fb35fdcfdc7c6a111adef764
 )
 
 set(KOTA_ENABLE_ZEST ON)
@@ -49,33 +38,12 @@ set(KOTA_ENABLE_TEST OFF)
 set(KOTA_CODEC_ENABLE_SIMDJSON ON)
 set(KOTA_CODEC_ENABLE_YYJSON ON)
 set(KOTA_CODEC_ENABLE_TOML ON)
+# kotatsu already fetches flatbuffers (v25.2.10) for its own codec and links the
+# runtime lib into anything that uses kota::codec, so clice rides on that copy
+# instead of fetching a second one. kotatsu does not build flatc, though, so the
+# schema compiler comes from pixi instead (see CMakeLists.txt).
+set(KOTA_CODEC_ENABLE_FLATBUFFERS ON)
 set(KOTA_ENABLE_EXCEPTIONS OFF)
 set(KOTA_ENABLE_RTTI OFF)
 
-FetchContent_MakeAvailable(kotatsu spdlog croaring flatbuffers)
-
-# kotatsu adds -D_LIBCPP_DISABLE_AVAILABILITY globally; on macOS with
-# libc++ >= 21 that makes the headers emit references to dylib-only symbols
-# (__hash_memory, llvm-project#77653) that the system libc++ lacks, breaking
-# the x64 cross link and poisoning shipped binaries. Directory COMPILE_OPTIONS
-# are copied into each target at creation time, so walk targets (not the
-# directory property) and strip the flag from every kotatsu target. Temporary
-# until the flag is removed upstream in kotatsu.
-function(clice_strip_disable_availability dir)
-    get_directory_property(targets DIRECTORY "${dir}" BUILDSYSTEM_TARGETS)
-    foreach(target IN LISTS targets)
-        get_target_property(target_type ${target} TYPE)
-        if(NOT target_type STREQUAL "INTERFACE_LIBRARY")
-            get_target_property(options ${target} COMPILE_OPTIONS)
-            if(options)
-                list(REMOVE_ITEM options "-D_LIBCPP_DISABLE_AVAILABILITY")
-                set_target_properties(${target} PROPERTIES COMPILE_OPTIONS "${options}")
-            endif()
-        endif()
-    endforeach()
-    get_directory_property(subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
-    foreach(subdir IN LISTS subdirs)
-        clice_strip_disable_availability("${subdir}")
-    endforeach()
-endfunction()
-clice_strip_disable_availability("${kotatsu_SOURCE_DIR}")
+FetchContent_MakeAvailable(kotatsu spdlog croaring)

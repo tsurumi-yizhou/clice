@@ -155,17 +155,16 @@ endif()
 set(FBS_SCHEMA_FILE "${PROJECT_SOURCE_DIR}/src/index/schema.fbs")
 set(GENERATED_HEADER "${PROJECT_BINARY_DIR}/generated/schema_generated.h")
 
-if(CMAKE_CROSSCOMPILING)
-    find_program(FLATC_EXECUTABLE flatc REQUIRED)
-    set(FLATC_CMD "${FLATC_EXECUTABLE}")
-else()
-    set(FLATC_CMD "$<TARGET_FILE:flatc>")
-endif()
+# kotatsu builds the flatbuffers runtime but not its schema compiler, so flatc
+# comes from the pixi environment (conda-forge flatbuffers). Its version must
+# match the headers kotatsu fetches — the generated header static_asserts on
+# that, so a mismatch surfaces as a compile error in schema_generated.h.
+find_program(FLATC_EXECUTABLE flatc REQUIRED)
 
 add_custom_command(
     OUTPUT "${GENERATED_HEADER}"
-    COMMAND ${FLATC_CMD} --cpp -o "${PROJECT_BINARY_DIR}/generated" "${FBS_SCHEMA_FILE}"
-    DEPENDS "${FBS_SCHEMA_FILE}"
+    COMMAND ${FLATC_EXECUTABLE} --cpp -o "${PROJECT_BINARY_DIR}/generated" "${FBS_SCHEMA_FILE}"
+    DEPENDS "${FBS_SCHEMA_FILE}" "${FLATC_EXECUTABLE}"
     COMMENT "Generating C++ header from ${FBS_SCHEMA_FILE}"
 )
 
@@ -221,7 +220,7 @@ target_link_libraries(clice-core PUBLIC
     llvm-libs
     spdlog::spdlog
     roaring::roaring
-    flatbuffers
+    kota::codec::flatbuffers
     kota::ipc::lsp
     kota::codec::toml
     kota::option
