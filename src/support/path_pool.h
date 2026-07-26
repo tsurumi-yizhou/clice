@@ -1,9 +1,10 @@
 #pragma once
 
-#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <optional>
+
+#include "support/filesystem.h"
 
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -15,15 +16,15 @@ namespace clice {
 
 /// Intern pool that maps file paths to compact uint32_t IDs.
 ///
-/// Paths are opaque byte strings; the only normalization applied is
-/// backslash-to-slash replacement.
+/// Paths are opaque byte strings interned in the canonical spelling of
+/// path::canonical, so on Windows the URI form VS Code sends
+/// ("file:///f%3A/...") and the "F:/..." form the CDB and clang report
+/// intern to one ID — without that, every CDB lookup missed and compiles
+/// fell back to guessed commands. POSIX paths are never rewritten.
 ///
-/// FIXME: character case is not normalized, so case-variant
-/// spellings of one file on a case-insensitive filesystem intern to
-/// different IDs. The practical instance is the drive letter: VS Code
-/// sends lowercase ("file:///f%3A/...") while the CDB and clang report
-/// "F:/...", so the same file can receive two IDs when both sources feed
-/// one pool.
+/// FIXME: non-drive components keep their case, so case-variant
+/// spellings of one file on a case-insensitive filesystem can still
+/// intern to different IDs.
 ///
 /// FIXME: paths are assumed to be valid UTF-8. POSIX filenames
 /// are raw bytes; a non-UTF-8 path survives interning but breaks
@@ -35,16 +36,8 @@ struct PathPool {
     llvm::StringMap<std::uint32_t> cache;
 
     std::uint32_t intern(llvm::StringRef path) {
-        // Normalize backslashes to forward slashes so that paths from different
-        // sources (URI decoding, CDB, include resolution) compare equal on
-        // Windows where native separators are backslashes.
-        llvm::SmallString<256> normalized;
-        bool needs_normalize = path.contains('\\');
-        if(needs_normalize) {
-            normalized = path;
-            std::replace(normalized.begin(), normalized.end(), '\\', '/');
-            path = normalized;
-        }
+        llvm::SmallString<256> storage;
+        path = path::canonical(path, storage);
 
         auto [it, inserted] = cache.try_emplace(path, paths.size());
         if(inserted) {
@@ -64,14 +57,11 @@ struct PathPool {
         return paths[id];
     }
 
-    /// Look up a path without interning it, normalizing backslashes first.
+    /// Look up a path without interning it, applying the same
+    /// normalization as intern().
     std::optional<std::uint32_t> find(llvm::StringRef path) const {
-        llvm::SmallString<256> normalized;
-        if(path.contains('\\')) {
-            normalized = path;
-            std::replace(normalized.begin(), normalized.end(), '\\', '/');
-            path = normalized;
-        }
+        llvm::SmallString<256> storage;
+        path = path::canonical(path, storage);
         auto it = cache.find(path);
         if(it == cache.end()) {
             return std::nullopt;

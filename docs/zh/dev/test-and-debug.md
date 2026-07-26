@@ -4,7 +4,7 @@
 
 clice 有三种测试：单元测试、集成测试和冒烟测试。
 
-所有测试依赖（pytest、pygls 等）由 pixi 管理，无需单独安装。
+所有测试依赖（集成套件与工具的 node/npm、scripts/ 的 python）由 pixi 管理，无需单独安装。
 
 ### 单元测试
 
@@ -18,7 +18,7 @@ pixi run unit-test Debug    # debug 构建
 ```bash
 ./build/RelWithDebInfo/bin/unit_tests \
     --test-dir="./tests/data" \
-    --snapshot-dir="./tests/snapshots" \
+    --snapshot-dir="./tests/snapshots/unit" \
     --verbose
 ```
 
@@ -31,11 +31,20 @@ pixi run integration-test          # 默认 RelWithDebInfo
 pixi run integration-test Debug    # debug 构建
 ```
 
-等价于：
+集成套件是基于 vitest 的 TypeScript（`tests/`），通过官方
+vscode-languageserver-protocol 栈与 server 通信。等价于：
 
 ```bash
-pytest -s --log-cli-level=INFO --timeout=300 --timeout-method=thread \
-    tests/integration --executable=./build/RelWithDebInfo/bin/clice
+cd tests
+npm run check   # 类型检查（tsc strict）+ lint（ESLint）
+CLICE_EXECUTABLE=../build/RelWithDebInfo/bin/clice npm test
+```
+
+常用变体：
+
+```bash
+npx vitest run integration/features/document_links.test.ts   # 单文件
+UPDATE_SNAPSHOTS=1 npm test    # 接受 wire 快照变更
 ```
 
 ### 冒烟测试
@@ -50,7 +59,7 @@ pixi run smoke-test Debug    # debug 构建
 等价于：
 
 ```bash
-python tests/tools/replay.py tests/smoke/*.jsonl \
+node tools/replay.ts tests/smoke/*.jsonl \
     --clice=./build/RelWithDebInfo/bin/clice
 ```
 

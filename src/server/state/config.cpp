@@ -107,6 +107,11 @@ void Config::apply_defaults(llvm::StringRef workspace_root) {
     // Variable substitution on string fields.
     substitute_workspace(p.cache_dir, workspace_root);
     substitute_workspace(p.logging_dir, workspace_root);
+    // Client-supplied dirs arrive in native spelling (backslashes, any
+    // drive case); canonicalize so artifact-prefix checks against
+    // pool-resolved paths hold.
+    path::canonicalize(p.cache_dir);
+    path::canonicalize(p.logging_dir);
     for(auto& entry: p.compile_commands_paths)
         substitute_workspace(entry, workspace_root);
 

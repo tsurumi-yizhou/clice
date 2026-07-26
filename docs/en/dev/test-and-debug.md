@@ -4,7 +4,7 @@
 
 clice has three types of tests: unit tests, integration tests, and smoke tests.
 
-All test dependencies (pytest, pygls, etc.) are managed by pixi — no separate installation needed.
+All test dependencies (node/npm for the integration suite and tools, python for scripts/) are managed by pixi — no separate installation needed.
 
 ### Unit Tests
 
@@ -18,7 +18,7 @@ Equivalent to:
 ```bash
 ./build/RelWithDebInfo/bin/unit_tests \
     --test-dir="./tests/data" \
-    --snapshot-dir="./tests/snapshots" \
+    --snapshot-dir="./tests/snapshots/unit" \
     --verbose
 ```
 
@@ -31,11 +31,20 @@ pixi run integration-test          # default RelWithDebInfo
 pixi run integration-test Debug    # debug build
 ```
 
-Equivalent to:
+The suite is TypeScript on vitest (`tests/`), speaking LSP through the
+official vscode-languageserver-protocol stack. Equivalent to:
 
 ```bash
-pytest -s --log-cli-level=INFO --timeout=300 --timeout-method=thread \
-    tests/integration --executable=./build/RelWithDebInfo/bin/clice
+cd tests
+npm run check   # typecheck (tsc strict) + lint (ESLint)
+CLICE_EXECUTABLE=../build/RelWithDebInfo/bin/clice npm test
+```
+
+Useful variants:
+
+```bash
+npx vitest run integration/features/document_links.test.ts   # one file
+UPDATE_SNAPSHOTS=1 npm test    # accept wire-snapshot changes
 ```
 
 ### Smoke Tests
@@ -50,7 +59,7 @@ pixi run smoke-test Debug    # debug build
 Equivalent to:
 
 ```bash
-python tests/tools/replay.py tests/smoke/*.jsonl \
+node tools/replay.ts tests/smoke/*.jsonl \
     --clice=./build/RelWithDebInfo/bin/clice
 ```
 

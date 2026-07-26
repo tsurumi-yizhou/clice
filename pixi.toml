@@ -80,8 +80,15 @@ scripts = ["scripts/activate_cross_linux.sh"]
 [feature.cross-windows-arm64.target.win-64.activation]
 scripts = ["scripts/activate_cross_windows.bat"]
 
+# nodejs bundles npm on every platform including win-arm64 (where
+# cross-test runs this env and conda has no pnpm). Floor 24: the tools
+# run as bare .ts (type stripping, default since node 23.6) and the
+# cache tests use JSON.rawJSON (21+). python remains only for
+# scripts/symbolize.py; the scripts/ tools are not part of the TS
+# migration.
 [feature.test.dependencies]
 python = ">=3.13"
+nodejs = ">=24"
 
 # ToolchainTests.GCC queries the g++ found in PATH and compiles C++23
 # (<print>), so the test env must provide the same pinned gcc the build
@@ -122,14 +129,6 @@ scripts = ["scripts/activate_asan_macos.sh"]
 
 [feature.test.target.osx-arm64.activation]
 scripts = ["scripts/activate_asan_macos.sh"]
-
-[feature.test.pypi-dependencies]
-pytest = "*"
-pytest-asyncio = ">=1.1.0"
-pytest-timeout = "*"
-pytest-xdist = "*"
-pygls = ">=2.0.0"
-lsprotocol = ">=2024.0.0"
 
 # Packaging reuses the standard build: the shipped binary is the tested one.
 [feature.package.tasks.package]
@@ -173,19 +172,34 @@ depends-on = [{ task = "lint-cpp", args = ["{{ type }}"] }]
 
 [feature.test.tasks.unit-test]
 args = [{ arg = "type", default = "RelWithDebInfo" }]
-cmd = './build/{{ type }}/bin/unit_tests --test-dir="./tests/data" --snapshot-dir="./tests/snapshots" --verbose && python tests/tools/feature_docs.py check'
+cmd = './build/{{ type }}/bin/unit_tests --test-dir="./tests/data" --snapshot-dir="./tests/snapshots/unit" --verbose && node tools/feature_docs.ts check'
 
+# npm workspaces: install runs at the repo root and covers tools/ + tests/.
+[feature.test.tasks.install-tests]
+cmd = "npm install"
+inputs = [
+    "package.json",
+    "package-lock.json",
+    "tools/package.json",
+    "tests/package.json",
+]
+outputs = ["node_modules/.package-lock.json"]
+
+# npm run check (tsc strict + ESLint) gates every run, then vitest: files
+# run in parallel worker processes (one per file, like xdist -n auto);
+# tests within a file are sequential.
 [feature.test.tasks.integration-test]
 args = [{ arg = "type", default = "RelWithDebInfo" }]
 cmd = """
-pytest -n auto --dist loadgroup --timeout=300 --timeout-method=thread \
-    tests/integration --executable=./build/{{ type }}/bin/clice
+npm run check && \
+CLICE_EXECUTABLE=$PIXI_PROJECT_ROOT/build/{{ type }}/bin/clice npm test --workspace tests
 """
+depends-on = ["install-tests"]
 
 [feature.test.tasks.smoke-test]
 args = [{ arg = "type", default = "RelWithDebInfo" }]
 cmd = """
-python tests/tools/replay.py tests/smoke/*.jsonl \
+node tools/replay.ts tests/smoke/*.jsonl \
     --clice=./build/{{ type }}/bin/clice
 """
 
@@ -204,9 +218,6 @@ depends-on = [
 [feature.editor]
 platforms = ["linux-64", "osx-arm64", "osx-64", "linux-aarch64"]
 
-[feature.editor.dependencies]
-python = ">=3.13"
-
 # Same mitigation as feature.test: editor-prepare configures fixtures with
 # toolchain.cmake's -fuse-ld=lld, which Apple system clang rejects.
 [feature.editor.target.osx-arm64.dependencies]
@@ -223,7 +234,7 @@ compiler-rt = "==22.1.8"
 
 # Fixture list kept in sync with editors/vscode/.vscode-test.mjs.
 [feature.editor.tasks.editor-prepare]
-cmd = "python tests/tools/prepare.py hello_world modules/hover_on_imported_symbol header_context"
+cmd = "node tools/prepare.ts hello_world modules/hover_on_imported_symbol header_context"
 
 # Requires nvim (stable) on PATH.
 [feature.editor.tasks.nvim-e2e]
