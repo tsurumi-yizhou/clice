@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 export const REPO_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 export const TESTS_DIR = path.join(REPO_ROOT, "tests");
 export const DATA_DIR = path.join(TESTS_DIR, "data");
+export const SNAP_DIR = path.join(TESTS_DIR, "snap");
 export const SNAPSHOTS_DIR = path.join(TESTS_DIR, "snapshots");
 
 interface CDBEntry {
@@ -121,12 +122,12 @@ export function generateTestDataCDBs(dataDir: string = DATA_DIR): void {
         }
     }
 
-    // Snapshot fixture corpora, shared with the unit snapshot glob tests.
+    // Legacy snapshot corpora still living under tests/data (consumed by
+    // the unit snapshot glob and the snap suite's legacy wire driver).
     // -std matches the unit side's compile_file default (c++20) so both
-    // layers compile each fixture identically. Keep in sync with FEATURES
-    // in tests/integration/features/snapshots.test.ts (document_links has
-    // its own block above).
-    for (const corpus of ["document_symbol", "folding_range", "inlay_hint", "semantic_tokens"]) {
+    // layers compile each fixture identically. Migrated corpora live in
+    // tests/snap with their own generator (tools/snap/standalone.ts).
+    for (const corpus of ["document_symbol", "inlay_hint"]) {
         const corpusDir = path.join(dataDir, corpus);
         const sources = sourcesIn(corpusDir, true);
         if (sources.length > 0) {

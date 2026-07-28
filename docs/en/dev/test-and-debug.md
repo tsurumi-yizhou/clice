@@ -2,7 +2,7 @@
 
 ## Run Tests
 
-clice has three types of tests: unit tests, integration tests, and smoke tests.
+clice has four types of tests: unit tests, integration tests, smoke tests, and snap tests.
 
 All test dependencies (node/npm for the integration suite and tools, python for scripts/) are managed by pixi — no separate installation needed.
 
@@ -43,8 +43,7 @@ CLICE_EXECUTABLE=../build/RelWithDebInfo/bin/clice npm test
 Useful variants:
 
 ```bash
-npx vitest run integration/features/document_links.test.ts   # one file
-UPDATE_SNAPSHOTS=1 npm test    # accept wire-snapshot changes
+npx vitest run --config integration/vitest.config.ts integration/server/memory_ownership.test.ts   # one file
 ```
 
 ### Smoke Tests
@@ -63,10 +62,30 @@ node tools/replay.ts tests/smoke/*.jsonl \
     --clice=./build/RelWithDebInfo/bin/clice
 ```
 
+### Snap Tests
+
+Feature snapshot corpora under `tests/snap/<feature>/`, with sources and snapshots side by side. The snap suite (`tests/snap.test.ts`, domain logic in `tools/snap/`) pins every fixture from both paths: standalone (one `clice inspect` process per fixture, no server involved) and wire (replayed through a real server). The integration suite plays no part in snapshots.
+
+```bash
+pixi run snap-test          # default RelWithDebInfo
+pixi run snap-test Debug    # debug build
+```
+
+Equivalent to:
+
+```bash
+cd tests
+CLICE_EXECUTABLE=../build/RelWithDebInfo/bin/clice npm run snap
+```
+
+By default a fixture is `snap: shared`: the standalone and wire results must render byte-identically and are pinned by one `<name>.snap.yml`. A fixture whose two paths legitimately differ declares `- snap: separate` in its `///` doc header (with a `// snap:` comment explaining why) and the wire reply is pinned in its own `<name>.wire.snap.yml`. A known-wrong divergence is declared as `- snap: skip`: both suites skip the fixture and it keeps no snapshot until the two paths agree.
+
+`UPDATE_SNAPSHOTS=1` updates everything in one run: standalone tests run first and own shared snapshot bodies; the wire side can only update `.wire.snap.yml` variants. A shared snapshot mismatch on the wire side is a real divergence between the server pipeline and the direct feature call — investigate it instead of regenerating over it.
+
 ### Run All Tests
 
 ```bash
-pixi run test                # runs unit + integration + smoke
+pixi run test                # runs unit + integration + smoke + snap
 pixi run test Debug          # all tests with debug build
 ```
 
