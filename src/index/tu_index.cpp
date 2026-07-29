@@ -3,9 +3,10 @@
 #include <algorithm>
 #include <tuple>
 
+#include "compile/compilation_unit.h"
 #include "index/serialization.h"
 #include "semantic/ast_utility.h"
-#include "semantic/semantic_visitor.h"
+#include "semantic/semantics.h"
 #include "syntax/lexer.h"
 
 #include "llvm/Support/SHA256.h"
@@ -25,10 +26,12 @@ SymbolScope classify_scope(const clang::NamedDecl* decl) {
     return SymbolScope::External;
 }
 
-class Builder : public SemanticVisitor<Builder> {
+/// Projects the unit's semantic map into TUIndex rows: occurrences and
+/// relations from the resolve facts, macros from the preprocessor directives.
+class Projector {
 public:
-    Builder(TUIndex& result, CompilationUnitRef unit, bool interested_only) :
-        SemanticVisitor<Builder>(unit, interested_only), result(result) {}
+    Projector(TUIndex& result, CompilationUnitRef unit, bool interested_only) :
+        result(result), unit(unit), interested_only(interested_only) {}
 
     /// The only gate through which rows enter `file_indices`. With
     /// interested_only, the index covers just the interested file — yet
@@ -43,9 +46,9 @@ public:
         return &result.file_indices[fid];
     }
 
-    void handleDeclOccurrence(const clang::NamedDecl* decl,
-                              RelationKind kind,
-                              clang::SourceLocation location) {
+    void add_occurrence(const clang::NamedDecl* decl,
+                        RelationKind kind,
+                        clang::SourceLocation location) {
         decl = ast::normalize(decl);
 
         if(location.isMacroID()) {
@@ -79,9 +82,7 @@ public:
         index->occurrences.emplace_back(range, symbol_id.hash);
     }
 
-    void handleMacroOccurrence(const clang::MacroInfo* def,
-                               RelationKind kind,
-                               clang::SourceLocation location) {
+    void add_macro(const clang::MacroInfo* def, RelationKind kind, clang::SourceLocation location) {
         /// FIXME: Figure out when location is MacroID.
         if(location.isMacroID()) {
             return;
@@ -127,44 +128,76 @@ public:
         index->relations[symbol_id.hash].emplace_back(relation);
     }
 
-    void handleRelation(const clang::NamedDecl* decl,
-                        RelationKind kind,
-                        const clang::NamedDecl* target,
-                        clang::SourceRange range) {
+    /// A Definition/Declaration/Reference row mirroring an occurrence: it
+    /// lands at the name's expansion location, and decl/def rows also carry
+    /// the declaration's full extent for definition-text consumers.
+    void add_self_relation(const clang::NamedDecl* decl,
+                           RelationKind kind,
+                           clang::SourceLocation location) {
+        auto [fid, range] = unit.decompose_expansion_range(location);
+        auto* index = file_index(fid);
+        if(!index) {
+            return;
+        }
+
+        Relation relation{.kind = kind, .range = range, .target_symbol = 0};
+
+        if(kind.isDeclOrDef()) {
+            /// FIXME: why definition or declaration has invalid source range? implicit node?
+            auto source_range = decl->getSourceRange();
+            if(source_range.isValid()) {
+                auto [def_fid, definition_range] = unit.decompose_expansion_range(source_range);
+                /// A declaration can begin in another file, e.g. when a
+                /// header-defined macro spells its leading tokens. Such a
+                /// range is meaningless in this file's coordinates; leave
+                /// the definition range empty instead of storing it.
+                if(fid == def_fid) {
+                    relation.set_definition_range(definition_range);
+                }
+            }
+        }
+
+        index->relations[unit.getSymbolID(ast::normalize(decl)).hash].emplace_back(relation);
+    }
+
+    /// A symbol-to-symbol row (type-of, inheritance, overrides, ctor/dtor
+    /// ownership); `anchor` decides which file's index receives it.
+    void add_pair_relation(const clang::NamedDecl* decl,
+                           RelationKind kind,
+                           const clang::NamedDecl* target,
+                           clang::SourceRange anchor) {
+        /// The anchor only routes the row to a file's index; symbol pairs
+        /// carry no range of their own.
+        auto fid = unit.decompose_expansion_range(anchor).first;
+        auto* index = file_index(fid);
+        if(!index) {
+            return;
+        }
+
+        Relation relation{
+            .kind = kind,
+            .target_symbol = unit.getSymbolID(ast::normalize(target)).hash,
+        };
+        index->relations[unit.getSymbolID(ast::normalize(decl)).hash].emplace_back(relation);
+    }
+
+    /// A call edge, landing at the call expression's location.
+    void add_call_relation(const clang::NamedDecl* decl,
+                           RelationKind kind,
+                           const clang::NamedDecl* target,
+                           clang::SourceRange range) {
         auto [fid, relation_range] = unit.decompose_expansion_range(range);
         auto* index = file_index(fid);
         if(!index) {
             return;
         }
 
-        Relation relation{.kind = kind};
-
-        if(kind.isDeclOrDef()) {
-            relation.range = relation_range;
-            /// FIXME: why definition or declaration has invalid source range? implicit node?
-            auto source_range = decl->getSourceRange();
-            if(source_range.isValid()) {
-                auto [fid2, definition_range] =
-                    unit.decompose_expansion_range(decl->getSourceRange());
-                assert(fid == fid2 && "Invalid definition location");
-                relation.set_definition_range(definition_range);
-            }
-        } else if(kind.isReference()) {
-            relation.range = relation_range;
-            relation.target_symbol = 0;
-        } else if(kind.isBetweenSymbol()) {
-            auto symbol_id = unit.getSymbolID(ast::normalize(target));
-            relation.target_symbol = symbol_id.hash;
-        } else if(kind.isCall()) {
-            auto symbol_id = unit.getSymbolID(ast::normalize(target));
-            relation.range = relation_range;
-            relation.target_symbol = symbol_id.hash;
-        } else {
-            std::unreachable();
-        }
-
-        auto symbol_id = unit.getSymbolID(ast::normalize(decl));
-        index->relations[symbol_id.hash].emplace_back(relation);
+        Relation relation{
+            .kind = kind,
+            .range = relation_range,
+            .target_symbol = unit.getSymbolID(ast::normalize(target)).hash,
+        };
+        index->relations[unit.getSymbolID(ast::normalize(decl)).hash].emplace_back(relation);
     }
 
     /// Module names are indexed like macro names: an occurrence plus a
@@ -297,8 +330,234 @@ public:
         }
     }
 
+    /// The nearest enclosing function of node `index`, for call edges. Methods
+    /// count as callers too (the previous traversal-stack implementation
+    /// missed them: methods take a different RAV path than TraverseFunctionDecl).
+    ///
+    /// Memoized with path compression: calls nested under a deep expression
+    /// chain would otherwise each rescan thousands of the same ancestors.
+    const clang::NamedDecl* enclosing_function(const Semantics& semantics, std::uint32_t index) {
+        llvm::SmallVector<std::uint32_t> path;
+        const clang::NamedDecl* result = nullptr;
+
+        for(auto p = semantics.node(index).parent; p != Semantics::invalid;
+            p = semantics.node(p).parent) {
+            if(auto it = enclosing_cache.find(p); it != enclosing_cache.end()) {
+                result = it->second;
+                break;
+            }
+            if(auto* decl = semantics.node(p).node.get<clang::FunctionDecl>()) {
+                result = decl;
+                break;
+            }
+            path.push_back(p);
+        }
+
+        for(auto p: path) {
+            enclosing_cache.try_emplace(p, result);
+        }
+        return result;
+    }
+
+    /// Decl-pair relation facts: type definitions, inheritance, overrides,
+    /// constructor/destructor ownership and call edges. Only the index
+    /// consumes these, so they live here rather than in the semantic layer.
+    void project_relations(const Semantics& semantics, std::uint32_t index) {
+        const SemanticNode& node = semantics.node(index).node;
+
+        if(auto* CE = node.get<clang::CallExpr>()) {
+            const clang::NamedDecl* caller = enclosing_function(semantics, index);
+            const clang::NamedDecl* callee =
+                llvm::dyn_cast_if_present<clang::NamedDecl>(CE->getCalleeDecl());
+            if(caller && callee) {
+                add_call_relation(caller, RelationKind::Callee, callee, CE->getSourceRange());
+                add_call_relation(callee, RelationKind::Caller, caller, CE->getSourceRange());
+            }
+            return;
+        }
+
+        auto* D = node.get<clang::Decl>();
+        if(!D) {
+            return;
+        }
+
+        /// The type of a value declaration, for go-to-type-definition.
+        if(llvm::isa<clang::FieldDecl,
+                     clang::BindingDecl,
+                     clang::NonTypeTemplateParmDecl,
+                     clang::VarDecl>(D)) {
+            if(auto* VTSD = llvm::dyn_cast<clang::VarTemplateSpecializationDecl>(D)) {
+                switch(VTSD->getSpecializationKind()) {
+                    case clang::TSK_ImplicitInstantiation:
+                    case clang::TSK_ExplicitInstantiationDeclaration:
+                    case clang::TSK_ExplicitInstantiationDefinition: {
+                        return;
+                    }
+
+                    case clang::TSK_Undeclared:
+                    case clang::TSK_ExplicitSpecialization: {
+                        break;
+                    }
+                }
+            }
+
+            auto* VD = llvm::cast<clang::ValueDecl>(D);
+            if(auto target = ast::decl_of(VD->getType())) {
+                add_pair_relation(VD, RelationKind::TypeDefinition, target, VD->getLocation());
+            }
+            return;
+        }
+
+        if(auto* ECD = llvm::dyn_cast<clang::EnumConstantDecl>(D)) {
+            add_pair_relation(ECD,
+                              RelationKind::TypeDefinition,
+                              llvm::cast<clang::NamedDecl>(ECD->getDeclContext()),
+                              ECD->getLocation());
+            return;
+        }
+
+        if(auto* TND = llvm::dyn_cast<clang::TypedefNameDecl>(D)) {
+            if(auto target = ast::decl_of(TND->getUnderlyingType())) {
+                add_pair_relation(TND, RelationKind::TypeDefinition, target, TND->getLocation());
+            }
+            return;
+        }
+
+        /// Base/derived edges, recorded at the defining declaration.
+        if(auto* TD = llvm::dyn_cast<clang::TagDecl>(D)) {
+            if(auto* CTSD = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(TD)) {
+                switch(CTSD->getSpecializationKind()) {
+                    case clang::TSK_Undeclared:
+                    case clang::TSK_ImplicitInstantiation:
+                    case clang::TSK_ExplicitInstantiationDeclaration:
+                    case clang::TSK_ExplicitInstantiationDefinition: {
+                        return;
+                    }
+
+                    case clang::TSK_ExplicitSpecialization: {
+                        break;
+                    }
+                }
+            }
+
+            if(auto* CRD = llvm::dyn_cast<clang::CXXRecordDecl>(TD)) {
+                if(auto* def = CRD->getDefinition()) {
+                    for(auto& base: CRD->bases()) {
+                        /// FIXME: Handle dependent base class.
+                        if(auto target = ast::decl_of(base.getType())) {
+                            add_pair_relation(def,
+                                              RelationKind::Base,
+                                              target,
+                                              base.getSourceRange());
+                            add_pair_relation(target,
+                                              RelationKind::Derived,
+                                              def,
+                                              base.getSourceRange());
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        if(auto* FD = llvm::dyn_cast<clang::FunctionDecl>(D)) {
+            switch(FD->getTemplateSpecializationKind()) {
+                case clang::TSK_ImplicitInstantiation:
+                case clang::TSK_ExplicitInstantiationDeclaration:
+                case clang::TSK_ExplicitInstantiationDefinition: {
+                    return;
+                }
+
+                case clang::TSK_Undeclared:
+                case clang::TSK_ExplicitSpecialization: {
+                    break;
+                }
+            }
+
+            if(auto* method = llvm::dyn_cast<clang::CXXMethodDecl>(FD)) {
+                for(auto* base: method->overridden_methods()) {
+                    add_pair_relation(method, RelationKind::Interface, base, FD->getLocation());
+                    add_pair_relation(base,
+                                      RelationKind::Implementation,
+                                      method,
+                                      FD->getLocation());
+                }
+
+                if(auto* ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method)) {
+                    add_pair_relation(ctor,
+                                      RelationKind::TypeDefinition,
+                                      ctor->getParent(),
+                                      FD->getLocation());
+                    add_pair_relation(ctor->getParent(),
+                                      RelationKind::Constructor,
+                                      ctor,
+                                      FD->getLocation());
+                }
+
+                if(auto* dtor = llvm::dyn_cast<clang::CXXDestructorDecl>(method)) {
+                    add_pair_relation(dtor,
+                                      RelationKind::TypeDefinition,
+                                      dtor->getParent(),
+                                      FD->getLocation());
+                    add_pair_relation(dtor->getParent(),
+                                      RelationKind::Destructor,
+                                      dtor,
+                                      FD->getLocation());
+                }
+            }
+            return;
+        }
+    }
+
+    void project_semantics() {
+        /// The interested-only shape is the one features share, cached on the
+        /// unit; the whole-TU shape is transient — projected and dropped.
+        std::optional<Semantics> full;
+        if(!interested_only) {
+            full.emplace(Semantics::build(unit, false));
+        }
+        const Semantics& semantics = interested_only ? unit.semantics() : *full;
+        auto entries = semantics.node_entries();
+
+        for(std::uint32_t i = 0; i < entries.size(); i++) {
+            const SemanticNode& node = entries[i].node;
+            /// Macros are projected from the directives below; includes and
+            /// imports have their own pipelines.
+            if(!node.is_ast()) {
+                continue;
+            }
+
+            for(auto& occurrence: resolve_occurrences(node)) {
+                add_occurrence(occurrence.decl, occurrence.kind, occurrence.location);
+
+                /// Every occurrence is mirrored as a self-relation, so
+                /// find-references on the occurring decl finds this row.
+                add_self_relation(occurrence.decl, occurrence.kind, occurrence.location);
+            }
+
+            project_relations(semantics, i);
+        }
+
+        for(auto& [fid, directive]: unit.directives()) {
+            for(auto& macro: directive.macros) {
+                switch(macro.kind) {
+                    case MacroRef::Kind::Def: {
+                        add_macro(macro.macro, RelationKind::Definition, macro.loc);
+                        break;
+                    }
+
+                    case MacroRef::Kind::Ref:
+                    case MacroRef::Kind::Undef: {
+                        add_macro(macro.macro, RelationKind::Reference, macro.loc);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     void build() {
-        run();
+        project_semantics();
 
         index_modules();
 
@@ -353,6 +612,9 @@ public:
 
 private:
     TUIndex& result;
+    CompilationUnitRef unit;
+    bool interested_only;
+    llvm::DenseMap<std::uint32_t, const clang::NamedDecl*> enclosing_cache;
 };
 
 }  // namespace
@@ -416,8 +678,8 @@ TUIndex TUIndex::build(CompilationUnitRef unit, bool interested_only) {
     TUIndex index;
     index.built_at = unit.build_at();
 
-    Builder builder(index, unit, interested_only);
-    builder.build();
+    Projector projector(index, unit, interested_only);
+    projector.build();
 
     return index;
 }

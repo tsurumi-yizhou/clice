@@ -222,6 +222,49 @@ TEST_CASE(LegacyIncludeForms) {
     EXPECT_TOKEN("h2", SymbolKind::Header);
 }
 
+TEST_CASE(AngledInclude) {
+    add_main("main.cpp", R"cpp(
+§(d0)⟦#include⟧ §(h0)⟦<stddef.h>⟧
+)cpp");
+    ASSERT_TRUE(compile_driver());
+    tokens = feature::semantic_tokens(*unit, feature::PositionEncoding::UTF8);
+    decoded = decode_utf8_tokens(unit->interested_content(), tokens);
+
+    EXPECT_TOKEN("d0", SymbolKind::Directive);
+    // The `<`, `stddef.h`, `>` pieces merge into one Header token.
+    EXPECT_TOKEN("h0", SymbolKind::Header);
+}
+
+TEST_CASE(ConditionalDirectives) {
+    run_utf8(R"cpp(
+int x = 1;
+#define FOO
+§(d0)⟦#ifdef⟧ §(m0)⟦FOO⟧
+§(d1)⟦#endif⟧
+§(d2)⟦#pragma⟧ §(d3)⟦once⟧
+)cpp");
+
+    EXPECT_TOKEN("d0", SymbolKind::Directive);
+    EXPECT_TOKEN("m0", SymbolKind::Macro);
+    EXPECT_TOKEN("d1", SymbolKind::Directive);
+    EXPECT_TOKEN("d2", SymbolKind::Directive);
+    // The pragma's argument is a plain identifier, not part of the
+    // directive name.
+    EXPECT_NO_TOKEN("d3");
+}
+
+TEST_CASE(MacroArgumentTokens) {
+    run_utf8(R"cpp(
+int value = 1;
+#define ID(x) x
+int §(use)⟦y⟧ = ID(§(arg)⟦value⟧);
+)cpp");
+
+    // A name written as a macro argument keeps its semantic classification.
+    EXPECT_TOKEN("use", SymbolKind::Variable, modifier_mask({SymbolModifiers::Definition}));
+    EXPECT_TOKEN("arg", SymbolKind::Variable);
+}
+
 TEST_CASE(LegacyComment) {
     run_utf8(R"cpp(
 §(line)⟦/// line comment⟧
@@ -249,6 +292,21 @@ TEST_CASE(LegacyMacro) {
 
     EXPECT_TOKEN("directive", SymbolKind::Directive);
     EXPECT_TOKEN("macro", SymbolKind::Macro);
+}
+
+TEST_CASE(MacroBodyTokens) {
+    run_utf8(R"cpp(
+void foo();
+#define §(name)⟦CALL⟧ §(body)⟦foo⟧()
+void bar() { §(use)⟦CALL⟧; }
+)cpp");
+
+    // The definition name and every expansion site are macros; tokens inside
+    // the macro body keep lexical kinds only — semantic highlighting of the
+    // expansion belongs to the future expansion-preview feature.
+    EXPECT_TOKEN("name", SymbolKind::Macro, modifier_mask({SymbolModifiers::Definition}));
+    EXPECT_TOKEN("use", SymbolKind::Macro);
+    EXPECT_NO_TOKEN("body");
 }
 
 TEST_CASE(LegacyFinalAndOverride) {

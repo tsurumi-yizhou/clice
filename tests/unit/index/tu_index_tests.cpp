@@ -7,6 +7,7 @@
 #include "feature/feature.h"
 #include "feature/inactive_regions.h"
 #include "index/tu_index.h"
+#include "semantic/selection.h"
 
 #include "kota/meta/enum.h"
 #include "llvm/Support/thread.h"
@@ -281,45 +282,38 @@ TEST_CASE(Reference) {
 
 TEST_CASE(BaseAndDerived) {
     build_index(R"(
-            struct Base {
+            struct §(base)⟦§(base)Base⟧ {
                 virtual void foo() {}
             };
 
-            struct Derived : public Base {
+            struct §(derived)⟦§(derived)Derived⟧ : public Base {
                 void foo() override {}
             };
         )");
 
-    // Verify that between-symbol relations exist.
-    // Note: Base/Derived relations require the semantic visitor to process
-    // CXXRecordDecl base specifiers. Collect all relation kinds to verify.
-    std::set<std::uint32_t> found_kinds;
+    auto& index = tu_index.main_file_index;
+    auto base_occs = select("base");
+    auto derived_occs = select("derived");
+    ASSERT_FALSE(base_occs.empty());
+    ASSERT_FALSE(derived_occs.empty());
+    auto base_hash = base_occs.front().target;
+    auto derived_hash = derived_occs.front().target;
 
-    auto collect_kinds = [&](index::FileIndex& idx) {
-        for(auto& [hash, rels]: idx.relations) {
-            for(auto& r: rels) {
-                found_kinds.insert(r.kind.value());
+    auto has_pair = [&](index::SymbolHash source, RelationKind kind, index::SymbolHash target) {
+        auto it = index.relations.find(source);
+        if(it == index.relations.end()) {
+            return false;
+        }
+        for(auto& r: it->second) {
+            if(r.kind.value() == static_cast<std::uint32_t>(kind) && r.target_symbol == target) {
+                return true;
             }
         }
+        return false;
     };
 
-    collect_kinds(tu_index.main_file_index);
-    for(auto& [fid, idx]: tu_index.file_indices) {
-        collect_kinds(idx);
-    }
-
-    // At minimum, Definition should exist for both structs.
-    ASSERT_TRUE(found_kinds.contains(RelationKind::Definition));
-
-    // If the indexer produces Base/Derived, great. But this may be a known
-    // limitation if the semantic visitor doesn't visit base specifiers for
-    // some code patterns. We still validate the relation infrastructure works.
-    // The following check is soft — it tests the ideal behavior.
-    if(!found_kinds.contains(RelationKind::Base)) {
-        // FIXME: Base/Derived relations not produced — needs investigation.
-        // This may be related to how the SemanticVisitor dispatches
-        // handleRelation via CRTP for TagDecl base specifier traversal.
-    }
+    ASSERT_TRUE(has_pair(derived_hash, RelationKind::Base, base_hash));
+    ASSERT_TRUE(has_pair(base_hash, RelationKind::Derived, derived_hash));
 }
 
 TEST_CASE(CallerAndCallee) {
@@ -366,6 +360,224 @@ TEST_CASE(CallerAndCallee) {
         }
     }
     ASSERT_TRUE(found_caller);
+}
+
+TEST_CASE(MethodCallerCallee) {
+    build_index(R"(
+            void §(callee_def)callee() {}
+
+            struct S {
+                void §(method_def)method() {
+                    §(call_site)callee();
+                }
+            };
+        )");
+
+    auto& index = tu_index.main_file_index;
+
+    // Calls inside a method body produce call edges, with the method as
+    // the caller.
+    auto method_occs = select("method_def");
+    ASSERT_FALSE(method_occs.empty());
+    auto method_hash = method_occs.front().target;
+
+    auto callee_occs = select("callee_def");
+    ASSERT_FALSE(callee_occs.empty());
+    auto callee_hash = callee_occs.front().target;
+
+    auto method_it = index.relations.find(method_hash);
+    ASSERT_TRUE(method_it != index.relations.end());
+
+    bool found_callee = false;
+    for(auto& r: method_it->second) {
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Callee) &&
+           r.target_symbol == callee_hash) {
+            found_callee = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_callee);
+
+    auto callee_it = index.relations.find(callee_hash);
+    ASSERT_TRUE(callee_it != index.relations.end());
+
+    bool found_caller = false;
+    for(auto& r: callee_it->second) {
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Caller) &&
+           r.target_symbol == method_hash) {
+            found_caller = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_caller);
+}
+
+TEST_CASE(UsingRelationKey) {
+    build_index(R"(
+            namespace ns { void §(target)foo(); }
+            using ns::§(use)⟦§(use)foo⟧;
+        )");
+
+    auto& index = tu_index.main_file_index;
+
+    // The relation row of a using declaration is keyed by the same symbol
+    // its occurrence references, so looking the occurrence's symbol up in
+    // the relations always finds the using site.
+    auto use_occs = select("use");
+    ASSERT_FALSE(use_occs.empty());
+    auto hash = use_occs.front().target;
+
+    auto it = index.relations.find(hash);
+    ASSERT_TRUE(it != index.relations.end());
+
+    bool found_use = false;
+    for(auto& r: it->second) {
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::WeakReference) &&
+           r.range == range("use")) {
+            found_use = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found_use);
+}
+
+TEST_CASE(TypeDefinitionRelations) {
+    build_index(R"(
+            struct §(s)⟦§(s)S⟧ {};
+
+            struct Holder {
+                S §(field)⟦§(field)field⟧;
+            };
+
+            using §(alias)⟦§(alias)Alias⟧ = S;
+
+            enum §(e)⟦§(e)E⟧ { §(ec)⟦§(ec)A⟧ };
+        )");
+
+    auto& index = tu_index.main_file_index;
+
+    auto has_type_definition = [&](llvm::StringRef source, llvm::StringRef target) {
+        auto source_occs = select(source);
+        auto target_occs = select(target);
+        if(source_occs.empty() || target_occs.empty()) {
+            return false;
+        }
+        auto source_hash = source_occs.front().target;
+        auto target_hash = target_occs.front().target;
+        auto it = index.relations.find(source_hash);
+        if(it == index.relations.end()) {
+            return false;
+        }
+        for(auto& r: it->second) {
+            if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::TypeDefinition) &&
+               r.target_symbol == target_hash) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    ASSERT_TRUE(has_type_definition("field", "s"));
+    ASSERT_TRUE(has_type_definition("alias", "s"));
+    ASSERT_TRUE(has_type_definition("ec", "e"));
+}
+
+TEST_CASE(ConstructorDestructorRelations) {
+    build_index(R"(
+            struct §(s)⟦§(s)S⟧ {
+                §(ctor)S();
+                ~S();
+            };
+        )");
+
+    auto& index = tu_index.main_file_index;
+    auto class_occs = select("s");
+    auto ctor_occs = select("ctor");
+    ASSERT_FALSE(class_occs.empty());
+    ASSERT_FALSE(ctor_occs.empty());
+    auto class_hash = class_occs.front().target;
+    auto ctor_hash = ctor_occs.front().target;
+
+    auto it = index.relations.find(class_hash);
+    ASSERT_TRUE(it != index.relations.end());
+
+    bool found_ctor = false;
+    bool found_dtor = false;
+    for(auto& r: it->second) {
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Constructor) &&
+           r.target_symbol == ctor_hash) {
+            found_ctor = true;
+        }
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Destructor)) {
+            found_dtor = true;
+        }
+    }
+    ASSERT_TRUE(found_ctor);
+    ASSERT_TRUE(found_dtor);
+
+    // The constructor points back at its class for go-to-type-definition.
+    auto ctor_it = index.relations.find(ctor_hash);
+    ASSERT_TRUE(ctor_it != index.relations.end());
+
+    bool found_type = false;
+    for(auto& r: ctor_it->second) {
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::TypeDefinition) &&
+           r.target_symbol == class_hash) {
+            found_type = true;
+        }
+    }
+    ASSERT_TRUE(found_type);
+}
+
+TEST_CASE(MacroRelations) {
+    build_index(R"(
+            #define §(def)⟦§(def)FOO⟧ 1
+            int x = §(use)⟦§(use)FOO⟧;
+        )");
+
+    auto& index = tu_index.main_file_index;
+    auto def_occs = select("def");
+    auto use_occs = select("use");
+    ASSERT_FALSE(def_occs.empty());
+    ASSERT_FALSE(use_occs.empty());
+    ASSERT_EQ(def_occs.front().target, use_occs.front().target);
+
+    auto it = index.relations.find(def_occs.front().target);
+    ASSERT_TRUE(it != index.relations.end());
+
+    bool found_definition = false;
+    bool found_reference = false;
+    for(auto& r: it->second) {
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Definition) &&
+           r.range == range("def")) {
+            found_definition = true;
+        }
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Reference) &&
+           r.range == range("use")) {
+            found_reference = true;
+        }
+    }
+    ASSERT_TRUE(found_definition);
+    ASSERT_TRUE(found_reference);
+}
+
+TEST_CASE(ModuleName) {
+    build_index(R"(export module §(m)⟦§(m)foo⟧;)");
+
+    auto& index = tu_index.main_file_index;
+    auto occs = select("m");
+    ASSERT_FALSE(occs.empty());
+
+    auto it = index.relations.find(occs.front().target);
+    ASSERT_TRUE(it != index.relations.end());
+
+    bool found_definition = false;
+    for(auto& r: it->second) {
+        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Definition)) {
+            found_definition = true;
+        }
+    }
+    ASSERT_TRUE(found_definition);
 }
 
 TEST_CASE(OverrideRelation) {
@@ -860,6 +1072,14 @@ TEST_CASE(DeepExpressionChain) {
         // Mirror the stateful worker's post-compile sequence.
         scan = feature::inactive_regions(*unit);
         tu_index = index::TUIndex::build(*unit, true);
+
+        // The semantic map must also serve token classification and a
+        // selection at the giant expansion's invocation on this stack:
+        // per-token ancestor walks and recursive tree materialization
+        // both used to degrade on chains this deep.
+        feature::semantic_tokens(*unit);
+        auto use_offset = static_cast<std::uint32_t>(code.rfind("A14"));
+        SelectionTree::create_right(*unit, LocalSourceRange(use_offset, use_offset));
     });
     index_thread.join();
 
