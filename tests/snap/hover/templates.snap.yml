@@ -227,3 +227,176 @@ Type: `m_int[Size] (aka int[Size])`
 // In Test<Size>
 public: m_int arr[Size]
 ```
+
+21_dependent_type: { range: "166:20-166:24" }
+### type `type`  
+
+---
+Type: `T`  
+
+---
+```cpp
+// In Base<T>
+public: using type = T
+```
+
+22_dependent_value: { range: "167:36-167:41" }
+### variable `value`  
+
+---
+Type: `const int`  
+Value = `1`  
+
+---
+```cpp
+// In Base<T>
+public: static constexpr int value = 1
+```
+
+23_using_typename: { range: "168:26-168:30" }
+### type `type`  
+
+---
+Type: `T`  
+
+---
+```cpp
+// In Base<T>
+public: using type = T
+```
+
+24_using_value: { range: "169:17-169:22" }
+### variable `value`  
+
+---
+Type: `const int`  
+Value = `1`  
+
+---
+```cpp
+// In Base<T>
+public: static constexpr int value = 1
+```
+
+25_template_template_arg: { range: "177:6-177:7" }
+### `X`  
+
+---
+```cpp
+// In namespace template_template_arg
+template <typename> struct X {}
+```
+
+26_ctad: { range: "183:0-183:3" }
+### struct `Box`  
+
+---
+```cpp
+// In namespace ctad
+template <typename T> struct Box {}
+```
+
+27_unresolved_member: { range: "192:43-192:44" }
+### method `f`  
+
+---
+→ `void`  
+Parameters:  
+- `int`
+
+---
+```cpp
+// In A
+public: void f(int)
+```
+
+28_sizeof_pack: { range: "197:52-197:54" }
+### type `Ts`  
+
+---
+Type: `class`  
+
+---
+```cpp
+// In namespace sizeof_pack
+public: class... Ts
+```
+
+29_injected_class_name: { range: "203:2-203:6" }
+### struct `Node`  
+
+---
+```cpp
+// In namespace injected_class_name
+template <class T> struct Node {}
+```
+
+30_dependent_method: { range: "214:19-214:25" }
+### method `method`  
+
+---
+→ `void`  
+
+---
+```cpp
+// In Base<T>
+public: void method()
+```
+
+31_dependent_field: { range: "215:25-215:30" }
+### field `field`  
+
+---
+Type: `int`  
+
+---
+```cpp
+// In Base<T>
+public: int field
+```
+
+32_fixed_base: { range: "223:45-223:49" }
+### type `type`  
+
+---
+Type: `int`  
+
+---
+```cpp
+// In Fixed
+public: using type = int
+```
+
+33_partial_order: { range: "231:47-231:52" }
+### variable `value`  
+
+---
+Type: `const int`  
+Value = `2`  
+
+---
+```cpp
+// In X<A *, A *>
+public: static constexpr int value = 2
+```
+
+34_arrow_chain: { range: "238:41-238:47" }
+### method `method`  
+
+---
+→ `void`  
+
+---
+```cpp
+// In Node<T>
+public: void method()
+```
+
+35_unresolved_using_use: { range: "246:2-246:6" }
+### `type`  
+
+---
+```cpp
+// In D2<T>
+public: using typename B2<T>::type
+```

@@ -69,15 +69,33 @@ void visit_template_decl_contexts(clang::Decl* decl, const Callback& callback) {
 }
 
 /// Resugar canonical TemplateTypeParmType with original parameter declarations.
+/// TreeTransform's TransformType(QualType) materializes a trivial
+/// TypeSourceInfo at getBaseLocation(). That location must be valid:
+/// keyword-carrying dependent types (e.g. `typename T::type`) otherwise
+/// produce a TypeLoc whose keyword is set but whose KeywordLoc is invalid,
+/// tripping Sema::CheckTypenameType's assertion (and reading garbage
+/// location data in release builds).
+inline clang::SourceLocation transform_base_location(clang::Sema& sema) {
+    auto& SM = sema.getSourceManager();
+    return SM.getLocForStartOfFile(SM.getMainFileID());
+}
+
 class ResugarOnly : public clang::TreeTransform<ResugarOnly> {
 public:
     ResugarOnly(clang::Sema& sema, clang::Decl* decl) :
-        TreeTransform(sema), context(sema.getASTContext()) {
+        TreeTransform(sema), context(sema.getASTContext()),
+        base_location(transform_base_location(sema)) {
         visit_template_decl_contexts(decl,
                                      [&](clang::Decl* decl, clang::TemplateParameterList* params) {
                                          lists.push_back(params);
                                      });
         std::ranges::reverse(lists);
+    }
+
+    /// TreeTransform's setBase is a no-op; the CRTP contract is to override
+    /// getBaseLocation. See transform_base_location for why it must be valid.
+    clang::SourceLocation getBaseLocation() {
+        return base_location;
     }
 
     clang::QualType TransformTemplateTypeParmType(clang::TypeLocBuilder& TLB,
@@ -88,18 +106,23 @@ public:
         if(!TTPT->getDecl()) {
             auto depth = TTPT->getDepth();
             if(depth >= lists.size()) {
-                return TLB.push<clang::TemplateTypeParmTypeLoc>(type).getType();
+                auto NewTL = TLB.push<clang::TemplateTypeParmTypeLoc>(type);
+                NewTL.setNameLoc(getBaseLocation());
+                return NewTL.getType();
             }
             auto index = TTPT->getIndex();
             auto isPack = TTPT->isParameterPack();
             auto param = llvm::cast<clang::TemplateTypeParmDecl>(lists[depth]->getParam(index));
             type = context.getTemplateTypeParmType(depth, index, isPack, param);
         }
-        return TLB.push<clang::TemplateTypeParmTypeLoc>(type).getType();
+        auto NewTL = TLB.push<clang::TemplateTypeParmTypeLoc>(type);
+        NewTL.setNameLoc(getBaseLocation());
+        return NewTL.getType();
     }
 
 private:
     clang::ASTContext& context;
+    clang::SourceLocation base_location;
     llvm::SmallVector<clang::TemplateParameterList*> lists;
 };
 
@@ -186,7 +209,12 @@ class SubstituteOnly : public clang::TreeTransform<SubstituteOnly> {
 
 public:
     SubstituteOnly(clang::Sema& sema, InstantiationStack& stack) :
-        Base(sema), context(sema.getASTContext()), stack(stack) {}
+        Base(sema), context(sema.getASTContext()), stack(stack),
+        base_location(transform_base_location(sema)) {}
+
+    clang::SourceLocation getBaseLocation() {
+        return base_location;
+    }
 
     using Base::TransformType;
 
@@ -213,7 +241,7 @@ public:
                     if(auto ET = llvm::dyn_cast<clang::ElaboratedType>(type)) {
                         type = ET->getNamedType();
                     }
-                    TLB.pushTrivial(context, type, {});
+                    TLB.pushTrivial(context, type, getBaseLocation());
                     return type;
                 }
             }
@@ -227,7 +255,7 @@ public:
         if(type.isNull()) {
             return Base::TransformElaboratedType(TLB, TL);
         }
-        TLB.pushTrivial(context, type, {});
+        TLB.pushTrivial(context, type, getBaseLocation());
         return type;
     }
 
@@ -238,7 +266,7 @@ public:
         if(type.isNull()) {
             return Base::TransformInjectedClassNameType(TLB, TL);
         }
-        TLB.pushTrivial(context, type, {});
+        TLB.pushTrivial(context, type, getBaseLocation());
         return type;
     }
 
@@ -249,7 +277,7 @@ public:
         if(TL.getTypePtr()->isTypeAlias()) {
             clang::QualType type = TransformType(TL.getTypePtr()->desugar());
             if(!type.isNull()) {
-                TLB.pushTrivial(context, type, {});
+                TLB.pushTrivial(context, type, getBaseLocation());
                 return type;
             }
         }
@@ -284,7 +312,7 @@ public:
         }
 
         // No substitution: return original type unchanged.
-        TLB.push<clang::TemplateTypeParmTypeLoc>(TL.getType());
+        TLB.push<clang::TemplateTypeParmTypeLoc>(TL.getType()).setNameLoc(TL.getNameLoc());
         return TL.getType();
     }
 
@@ -294,6 +322,7 @@ public:
 
 private:
     clang::ASTContext& context;
+    clang::SourceLocation base_location;
     InstantiationStack& stack;
     unsigned depth = 0;
 };
@@ -322,7 +351,11 @@ public:
                        llvm::DenseMap<const void*, clang::QualType>& resolved,
                        unsigned parent_indent = 0) :
         Base(sema), sema(sema), context(sema.getASTContext()), resolved(resolved),
-        indent(parent_indent) {}
+        indent(parent_indent), base_location(transform_base_location(sema)) {}
+
+    clang::SourceLocation getBaseLocation() {
+        return base_location;
+    }
 
 public:
     /// Use SubstituteOnly to expand typedefs and substitute parameters without doing lookup.
@@ -595,7 +628,8 @@ public:
         }
 
         for(auto base: CRD->bases()) {
-            if(auto type = base.getType(); type->isDependentType()) {
+            auto type = base.getType();
+            if(type->isDependentType()) {
                 auto stack_size = stack.data.size();
                 auto resolved_type = substitute(type);
                 if(!resolved_type.isNull()) {
@@ -610,6 +644,15 @@ public:
                 }
                 while(stack.data.size() > stack_size) {
                     stack.pop();
+                }
+            } else if(auto* record = type->getAsCXXRecordDecl()) {
+                /// A dependent derived class may still inherit a fixed base;
+                /// plain lookup suffices there.
+                if(auto members = record->lookup(name); !members.empty()) {
+                    return members;
+                }
+                if(auto members = lookup_in_bases(record, name); !members.empty()) {
+                    return members;
                 }
             }
         }
@@ -653,23 +696,37 @@ public:
             CTD->getNameAsString(),
             partials.size());
         ++indent;
+        /// Deduction alone may match several overlapping partials; pick the
+        /// most specialized one, as real instantiation would.
+        clang::ClassTemplatePartialSpecializationDecl* best = nullptr;
         for(auto partial: partials) {
             if(deduce_template_arguments(partial, arguments)) {
-                LOG_DEBUG("{}" "matched partial '{}'", pad(), partial->getNameAsString());
-                if(auto members = partial->lookup(name); !members.empty()) {
-                    LOG_DEBUG("{}" "found in 'partial'", pad());
-                    --indent;
-                    return members;
-                }
-
-                if(auto members = lookup_in_bases(partial, name); !members.empty()) {
-                    LOG_DEBUG("{}" "found in 'base'", pad());
-                    --indent;
-                    return members;
-                }
-
                 stack.pop();
+                if(!best) {
+                    best = partial;
+                } else if(auto* winner = sema.getMoreSpecializedPartialSpecialization(
+                              partial,
+                              best,
+                              clang::SourceLocation())) {
+                    best = winner;
+                }
             }
+        }
+        if(best && deduce_template_arguments(best, arguments)) {
+            LOG_DEBUG("{}" "matched partial '{}'", pad(), best->getNameAsString());
+            if(auto members = best->lookup(name); !members.empty()) {
+                LOG_DEBUG("{}" "found in 'partial'", pad());
+                --indent;
+                return members;
+            }
+
+            if(auto members = lookup_in_bases(best, name); !members.empty()) {
+                LOG_DEBUG("{}" "found in 'base'", pad());
+                --indent;
+                return members;
+            }
+
+            stack.pop();
         }
 
         if(deduce_template_arguments(CTD, arguments)) {
@@ -751,9 +808,12 @@ public:
                 prefix = clang::NestedNameSpecifier::Create(context, prefix, DTST.getTypePtr());
 
                 auto other = sema.getPreprocessor().getIdentifierInfo("other");
-                auto DNT = context.getDependentNameType(clang::ElaboratedTypeKeyword::Typename,
-                                                        prefix,
-                                                        other);
+                /// Keyword must stay None: the synthesized type is transformed
+                /// through a trivial TypeSourceInfo whose KeywordLoc is invalid,
+                /// and Sema::CheckTypenameType asserts (Keyword != None) ==
+                /// KeywordLoc.isValid().
+                auto DNT =
+                    context.getDependentNameType(clang::ElaboratedTypeKeyword::None, prefix, other);
 
                 auto result = PseudoInstantiator(sema, resolved, indent).TransformType(DNT);
                 if(!result.isNull() && !result->isDependentType()) {
@@ -832,7 +892,7 @@ public:
                 return type;
             }
 
-            TLB.push<clang::TemplateTypeParmTypeLoc>(TL.getType());
+            TLB.push<clang::TemplateTypeParmTypeLoc>(TL.getType()).setNameLoc(TL.getNameLoc());
             return TL.getType();
         }
 
@@ -846,14 +906,14 @@ public:
                 if(argument.getKind() == clang::TemplateArgument::Type) {
                     clang::QualType type = TransformType(argument.getAsType());
                     if(!type.isNull()) {
-                        TLB.pushTrivial(context, type, clang::SourceLocation());
+                        TLB.pushTrivial(context, type, getBaseLocation());
                         return type;
                     }
                 }
             }
         }
 
-        TLB.push<clang::TemplateTypeParmTypeLoc>(TL.getType());
+        TLB.push<clang::TemplateTypeParmTypeLoc>(TL.getType()).setNameLoc(TL.getNameLoc());
         return TL.getType();
     }
 
@@ -868,7 +928,7 @@ public:
         if(auto iter = resolved.find(DNT); iter != resolved.end()) {
             LOG_DEBUG("{}" "→ '{}' (cached)", pad(), iter->second.getAsString());
             --indent;
-            TLB.pushTrivial(context, iter->second, {});
+            TLB.pushTrivial(context, iter->second, getBaseLocation());
             return iter->second;
         }
 
@@ -949,7 +1009,7 @@ public:
             LOG_DEBUG("{}" "→ '{}'", pad(), result.getAsString());
             --indent;
             resolved.try_emplace(DNT, result);
-            TLB.pushTrivial(context, result, {});
+            TLB.pushTrivial(context, result, getBaseLocation());
             return result;
         }
 
@@ -968,8 +1028,13 @@ public:
     clang::QualType rebuild_dtst(clang::TypeLocBuilder& TLB,
                                  clang::DependentTemplateSpecializationTypeLoc TL) {
         auto* DTST = TL.getTypePtr();
-        return TLB.push<clang::DependentTemplateSpecializationTypeLoc>(clang::QualType(DTST, 0))
-            .getType();
+        /// push() returns an uninitialized record; the qualifier slot is a
+        /// pointer, so leaving it garbage crashes any later getSourceRange
+        /// (e.g. Sema::CheckTemplateArgument on a transformed argument).
+        auto NewTL =
+            TLB.push<clang::DependentTemplateSpecializationTypeLoc>(clang::QualType(DTST, 0));
+        NewTL.initializeLocal(context, getBaseLocation());
+        return NewTL.getType();
     }
 
     clang::QualType TransformDependentTemplateSpecializationType(
@@ -981,7 +1046,7 @@ public:
 
         if(auto iter = resolved.find(DTST); iter != resolved.end()) {
             --indent;
-            TLB.pushTrivial(context, iter->second, {});
+            TLB.pushTrivial(context, iter->second, getBaseLocation());
             return iter->second;
         }
 
@@ -1018,7 +1083,7 @@ public:
             LOG_DEBUG("{}" "hole: '{}' → '{}'", pad(), name->getName().str(), result.getAsString());
             --indent;
             resolved.try_emplace(DTST, result);
-            TLB.pushTrivial(context, result, {});
+            TLB.pushTrivial(context, result, getBaseLocation());
             return result;
         }
 
@@ -1038,7 +1103,7 @@ public:
                         LOG_DEBUG("{}" "→ '{}' (alias)", pad(), type.getAsString());
                         --indent;
                         resolved.try_emplace(DTST, type);
-                        TLB.pushTrivial(context, type, {});
+                        TLB.pushTrivial(context, type, getBaseLocation());
                         return type;
                     }
                 }
@@ -1057,7 +1122,7 @@ public:
                 LOG_DEBUG("{}" "→ TST '{}' (class)", pad(), result.getAsString());
                 --indent;
                 resolved.try_emplace(DTST, result);
-                TLB.pushTrivial(context, result, {});
+                TLB.pushTrivial(context, result, getBaseLocation());
                 return result;
             }
         }
@@ -1085,7 +1150,7 @@ public:
                     if(auto ET = llvm::dyn_cast<clang::ElaboratedType>(type)) {
                         type = ET->getNamedType();
                     }
-                    TLB.pushTrivial(context, type, {});
+                    TLB.pushTrivial(context, type, getBaseLocation());
                     return type;
                 }
             }
@@ -1102,7 +1167,7 @@ public:
             if(auto decl = DRE->getDecl(); llvm::isa<clang::VarDecl>(decl)) {
                 auto type = TransformType(decl->getType());
                 if(!type.isNull()) {
-                    TLB.pushTrivial(context, type, {});
+                    TLB.pushTrivial(context, type, getBaseLocation());
                     return type;
                 }
             }
@@ -1120,28 +1185,111 @@ private:
     llvm::DenseSet<std::pair<const void*, void*>> active_ctd_lookups;
     unsigned depth = 0;
     unsigned indent = 0;
+    clang::SourceLocation base_location;
 
     std::string pad() const {
         return std::string(indent * 2, ' ');
     }
 };
 
+/// Pseudo-instantiation drives Sema on speculative inputs, so its failures
+/// are expected and must not leak error-level diagnostics into the unit.
+/// Only the consumer is swapped out: error counting stays untouched because
+/// Sema's error limit is what stops runaway instantiations.
+class DiagnosticSilencer {
+public:
+    explicit DiagnosticSilencer(clang::Sema& sema) : engine(sema.getDiagnostics()) {
+        client = engine.getClient();
+        owned = engine.takeClient();
+        engine.setClient(&ignoring, false);
+    }
+
+    ~DiagnosticSilencer() {
+        /// Deliberate trade-off: error counting is left to accumulate across
+        /// lookups. Once the engine's error limit trips, later speculative
+        /// lookups on this unit degrade (Sema bails out of instantiations) —
+        /// but resetting the counters per lookup hands every pathological
+        /// instantiation chain a fresh budget, which measures as minutes of
+        /// resolver time on STL-heavy TUs. Until the resolver carries its
+        /// own work budget, the shared limit is both the brake and the cap.
+        if(owned) {
+            engine.setClient(owned.release(), true);
+        } else {
+            engine.setClient(client, false);
+        }
+    }
+
+private:
+    clang::DiagnosticsEngine& engine;
+    clang::DiagnosticConsumer* client;
+    std::unique_ptr<clang::DiagnosticConsumer> owned;
+    clang::IgnoringDiagConsumer ignoring;
+};
+
 }  // namespace
 
 clang::QualType TemplateResolver::resolve(clang::QualType type) {
+    DiagnosticSilencer silencer(sema);
     PseudoInstantiator instantiator(sema, resolved);
     return instantiator.TransformType(type);
 }
 
 clang::QualType TemplateResolver::resugar(clang::QualType type, clang::Decl* decl) {
+    DiagnosticSilencer silencer(sema);
     ResugarOnly resugar(sema, decl);
     return resugar.TransformType(type);
 }
 
 TemplateResolver::lookup_result TemplateResolver::lookup(const clang::NestedNameSpecifier* NNS,
                                                          clang::DeclarationName name) {
+    DiagnosticSilencer silencer(sema);
     PseudoInstantiator instantiator(sema, resolved);
     return instantiator.lookup(NNS, name);
+}
+
+TemplateResolver::lookup_result
+    TemplateResolver::lookup(const clang::CXXDependentScopeMemberExpr* expr) {
+    auto type = expr->getBaseType();
+    if(type.isNull()) {
+        return {};
+    }
+
+    DiagnosticSilencer silencer(sema);
+    if(expr->isArrow()) {
+        /// Follow overloaded operator-> chains (smart pointers) until a raw
+        /// pointer appears; bounded, cycles just stop resolving.
+        auto arrow = sema.getASTContext().DeclarationNames.getCXXOperatorName(clang::OO_Arrow);
+        for(unsigned hop = 0; hop < 8; hop++) {
+            if(auto* PT = type->getAs<clang::PointerType>()) {
+                type = PT->getPointeeType();
+                break;
+            }
+            PseudoInstantiator instantiator(sema, resolved);
+            const clang::CXXMethodDecl* method = nullptr;
+            for(auto* candidate: instantiator.lookup(type, arrow)) {
+                if((method = llvm::dyn_cast<clang::CXXMethodDecl>(candidate))) {
+                    break;
+                }
+            }
+            if(!method) {
+                break;
+            }
+            type = method->getReturnType();
+            if(type.isNull()) {
+                return {};
+            }
+        }
+    }
+
+    /// Inside the class's own definition `this` is the injected class name;
+    /// unwrap it to the equivalent template specialization the lookup
+    /// understands.
+    if(auto* ICNT = type->getAs<clang::InjectedClassNameType>()) {
+        type = ICNT->getInjectedSpecializationType();
+    }
+
+    PseudoInstantiator instantiator(sema, resolved);
+    return instantiator.lookup(type, expr->getMemberNameInfo().getName());
 }
 
 }  // namespace clice

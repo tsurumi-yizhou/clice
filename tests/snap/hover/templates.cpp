@@ -155,3 +155,95 @@ struct Test {
   m_int §(20_dependent_size_array)arr[Size];
 };
 }
+
+// Dependent names resolved through the template resolver.
+namespace dependent_names {
+template <typename T> struct Base {
+  using type = T;
+  static constexpr int value = 1;
+};
+
+template <typename T> struct Derived : Base<T> {
+  typename Base<T>::§(21_dependent_type)type x;
+  static constexpr int y = Base<T>::§(22_dependent_value)value;
+  using typename Base<T>::§(23_using_typename)type;
+  using Base<T>::§(24_using_value)value;
+};
+}
+
+// Template-template argument.
+namespace template_template_arg {
+template <typename> struct X {};
+template <template <typename> class TT> struct Apply {};
+Apply<§(25_template_template_arg)X> a;
+}
+
+// CTAD placeholder.
+namespace ctad {
+template <typename T> struct Box { Box(T); };
+§(26_ctad)Box b(1);
+}
+
+// Unresolved member overload set with dependent argument.
+namespace unresolved_member {
+struct A {
+  void f(int);
+  void f(char);
+};
+template <typename T> void g(A a, T t) { a.§(27_unresolved_member)f(t); }
+}
+
+// sizeof...(pack).
+namespace sizeof_pack {
+template <class... Ts> constexpr auto n = sizeof...(§(28_sizeof_pack)Ts);
+}
+
+// Injected class name.
+namespace injected_class_name {
+template <class T> struct Node {
+  §(29_injected_class_name)Node *next;
+};
+}
+
+// Dependent member access through the current instantiation.
+namespace dependent_member {
+template <typename T> struct Base {
+  void method();
+  int field;
+};
+template <typename T> struct Derived : Base<T> {
+  void f() { this->§(30_dependent_method)method(); }
+  int g() { return this->§(31_dependent_field)field; }
+};
+}
+
+// Dependent lookup through a nondependent base.
+namespace fixed_base {
+struct Fixed { using type = int; };
+template <class T> struct FixedDerived : Fixed {};
+template <class T> typename FixedDerived<T>::§(32_fixed_base)type h();
+}
+
+// Most specialized partial wins.
+namespace partial_order {
+template <class A, class B> struct X { static constexpr int value = 0; };
+template <class A, class B> struct X<A*, B> { static constexpr int value = 1; };
+template <class A> struct X<A*, A*> { static constexpr int value = 2; };
+template <class T> int g() { return X<T*, T*>::§(33_partial_order)value; }
+}
+
+// Overloaded arrow chain.
+namespace arrow_chain {
+template <class T> struct Node { void method(); };
+template <class T> struct Ptr { Node<T> *operator->(); };
+template <class T> void f(Ptr<T> p) { p->§(34_arrow_chain)method(); }
+}
+
+// Use site of a dependent using-typename.
+namespace unresolved_using_use {
+template <class T> struct B2 { using type = T; };
+template <class T> struct D2 : B2<T> {
+  using typename B2<T>::type;
+  §(35_unresolved_using_use)type x;
+};
+}

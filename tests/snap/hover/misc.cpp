@@ -23,3 +23,42 @@ auto fwd_baz = (Fwd§(01_forward_struct_value)Foo*)&fwd_bar;
 #define A(x) x, x, x, x
 #define B(x) A(A(A(A(x))))
 int a§(03_big_initializer)rr[] = {B(0)};
+
+// Labels.
+namespace labels {
+inline int f(int x) {
+  if (x) goto §(04_goto_label)done;
+  x += 1;
+§(05_label_def)done:
+  return x;
+}
+}
+
+// Class-provided allocation functions.
+namespace class_new_delete {
+struct Pool {
+  static void *operator new(unsigned long n);
+  static void operator delete(void *p);
+};
+Pool *p = §(06_operator_new)new Pool;
+inline void f() { §(07_operator_delete)delete p; }
+}
+
+// Globally qualified allocation and construction punctuation.
+namespace global_alloc {
+struct Pool {
+  static void *operator new(unsigned long n);
+  Pool(int);
+};
+Pool *p = ::§(08_global_new)new Pool(0);
+Pool value§(09_ctor_paren)(1);
+}
+
+// Overloaded call and subscript punctuation.
+namespace op_punct {
+struct F {
+  int operator()(int);
+  int operator[](int);
+};
+int u(F f) { return f§(10_op_call)(1) + f§(11_op_subscript)[2]; }
+}
