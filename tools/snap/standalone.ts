@@ -13,16 +13,18 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { SNAP_DIR } from "../compile_commands.ts";
-import { parseAnnotations } from "./annotation.ts";
+import { parseAnnotations, type AnnotatedSource } from "./annotation.ts";
 import {
+    focusSemanticTokens,
     OffsetConverter,
     parseFixtureMeta,
+    rawSemanticTokenPieces,
     renderRawDocumentLinks,
     renderRawDocumentSymbols,
     renderRawFoldingRanges,
     renderRawInlayHints,
-    renderRawSemanticTokens,
     runInspectAsync,
+    semanticTokenFocusOffsets,
     sha256,
     sortedMarkers,
     type FixtureMeta,
@@ -42,6 +44,13 @@ import { SnapshotContext } from "./snapshot.ts";
 const CORPUS_FLAGS: Record<string, (corpus: string) => string[]> = {
     document_links: (corpus) => [`-I${posix(corpus)}`, "-std=c++23"],
     hover: () => ["-std=c++20", "--target=x86_64-unknown-linux-gnu"],
+    // inc/ backs angled-include fixtures; sys/ simulates a system header so
+    // the DefaultLibrary modifier pins deterministically on every host.
+    semantic_tokens: (corpus) => [
+        `-I${posix(corpus)}/inc`,
+        `-isystem${posix(corpus)}/sys`,
+        "-std=c++20",
+    ],
 };
 
 function posix(p: string): string {
@@ -85,8 +94,15 @@ export function generateSnapCDBs(snapDir: string = SNAP_DIR): void {
 }
 
 /// Renders one inspect file entry into snapshot lines. Whole-document
-/// features read `entry.result`; marker features read `entry.markers`.
-type EntryRenderer = (entry: InspectFileEntry, stripped: Buffer, corpus: string) => string[];
+/// features read `entry.result`; marker features read `entry.markers`;
+/// semantic_tokens reads the fixture's own §-markers from `source` (the
+/// C++ side only strips them) to focus its snapshot.
+type EntryRenderer = (
+    entry: InspectFileEntry,
+    stripped: Buffer,
+    corpus: string,
+    source: AnnotatedSource,
+) => string[];
 
 function markerSections(
     entry: InspectFileEntry,
@@ -131,7 +147,14 @@ const RENDERERS: Record<string, EntryRenderer> = {
         entry.markers != null
             ? markerSections(entry, (value) => renderRawInlayHints(value, stripped))
             : renderRawInlayHints(entry.result, stripped),
-    semantic_tokens: (entry, stripped) => renderRawSemanticTokens(entry.result, stripped),
+    semantic_tokens: (entry, stripped, _corpus, source) => {
+        const pieces = rawSemanticTokenPieces(entry.result, stripped);
+        const offsets = semanticTokenFocusOffsets(source);
+        if (offsets.length > 0) {
+            return focusSemanticTokens(pieces, offsets, stripped);
+        }
+        return pieces.map((piece) => piece.rendered);
+    },
 };
 
 export interface SnapFixture {
@@ -178,6 +201,25 @@ export function snapCorpora(): SnapCorpus[] {
     return corpora;
 }
 
+/// Whether the fixture's leading comment block carries the `error-ok`
+/// opt-out. Only the comment lines before the first code line count, so
+/// nothing inside the code (raw strings included) can spell it.
+function errorOkDirective(content: string): boolean {
+    for (const raw of content.split("\n")) {
+        const line = raw.trim();
+        if (line === "") {
+            continue;
+        }
+        if (!line.startsWith("//")) {
+            return false;
+        }
+        if (/^\/\/+\s*error-ok\b/.test(line)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Run one fixture end to end: spawn `clice inspect`, verify the C++/TS
 /// stripper twins via the content hash, render, and compare against the
 /// colocated snapshot. Throws on any failure (including a snapshot
@@ -219,8 +261,22 @@ export async function checkSnapFixture(
         );
     }
 
+    // The AST builds even for broken sources, so a compile that "succeeds"
+    // may still carry error diagnostics — e.g. a mistyped annotation that
+    // swallowed real code. Never pin such a fixture. A fixture that tests
+    // behavior on broken code opts out with a `// error-ok` comment (the
+    // clangd convention the ported corpora already carry) in its leading
+    // comment block — scanning the code body would also match raw-string
+    // contents that merely spell the directive.
+    if (entry.diagnostics?.length && !errorOkDirective(fixture.content)) {
+        throw new Error(
+            `${feature}/${fixture.rel}: fixture does not compile cleanly:\n  ` +
+                entry.diagnostics.join("\n  "),
+        );
+    }
+
     const snapshots = new SnapshotContext(corpus, { colocated: true });
-    snapshots.check(fixture.rel, render(entry, stripped, corpus).join("\n"));
+    snapshots.check(fixture.rel, render(entry, stripped, corpus, source).join("\n"));
 }
 
 /// Snapshots follow their sources: a stale `.snap.yml` whose fixture was

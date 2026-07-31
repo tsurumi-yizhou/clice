@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -414,35 +415,69 @@ private:
     void precompute_semantics() {
         auto spelled = semantics.spelled_tokens();
 
+        /// The spelled token written at `location`, or none. Macro locations
+        /// resolve to their spelling: names written as macro arguments
+        /// classify the argument token itself.
+        auto spelled_index = [&](clang::SourceLocation location) -> std::optional<std::uint32_t> {
+            if(location.isInvalid()) {
+                return std::nullopt;
+            }
+            if(location.isMacroID()) {
+                location = unit.spelling_location(location);
+            }
+
+            auto it = std::partition_point(
+                spelled.begin(),
+                spelled.end(),
+                [&](const clang::syntax::Token& token) { return token.location() < location; });
+            if(it == spelled.end() || it->location() != location) {
+                return std::nullopt;
+            }
+            return static_cast<std::uint32_t>(it - spelled.begin());
+        };
+
         /// Anchor a candidate at the spelled token written at `location`.
-        /// Macro locations resolve to their spelling: names written as macro
-        /// arguments classify the argument token itself. With allow_ignored,
-        /// tokens preprocessed away (directive regions) still classify —
-        /// preprocessor names live there; declaration names never do, which
-        /// keeps macro definition bodies lexical.
+        /// With allow_ignored, tokens preprocessed away (directive regions)
+        /// still classify — preprocessor names live there; declaration names
+        /// never do, which keeps macro definition bodies lexical.
         auto anchor =
             [&](clang::SourceLocation location, Classified candidate, bool allow_ignored) {
-                if(location.isInvalid() || candidate.kind == SymbolKind::Invalid) {
+                if(candidate.kind == SymbolKind::Invalid) {
                     return;
                 }
-                if(location.isMacroID()) {
-                    location = unit.spelling_location(location);
-                }
-
-                auto it = std::partition_point(
-                    spelled.begin(),
-                    spelled.end(),
-                    [&](const clang::syntax::Token& token) { return token.location() < location; });
-                if(it == spelled.end() || it->location() != location) {
+                auto index = spelled_index(location);
+                if(!index) {
                     return;
                 }
-
-                auto index = static_cast<std::uint32_t>(it - spelled.begin());
-                if(!allow_ignored && semantics.token_preprocessed_away(index)) {
+                if(!allow_ignored && semantics.token_preprocessed_away(*index)) {
                     return;
                 }
-                combine(token_semantics[index], candidate);
+                combine(token_semantics[*index], candidate);
             };
+
+        /// Anchor a declaration-name candidate. A written name can only be
+        /// spelled as an identifier or a destructor's `~`; an occurrence
+        /// resolving to any other token names nothing written — an anonymous
+        /// parameter's trailing `)`, the `[` of a structured binding, the
+        /// `(` of a constructor call written as the type name, an operator
+        /// declaration's `operator` keyword — and must not paint it.
+        auto anchor_name = [&](clang::SourceLocation location, Classified candidate) {
+            if(candidate.kind == SymbolKind::Invalid) {
+                return;
+            }
+            auto index = spelled_index(location);
+            if(!index) {
+                return;
+            }
+            auto kind = spelled[*index].kind();
+            if(kind != clang::tok::identifier && kind != clang::tok::tilde) {
+                return;
+            }
+            if(semantics.token_preprocessed_away(*index)) {
+                return;
+            }
+            combine(token_semantics[*index], candidate);
+        };
 
         for(auto [entry_index, entry]: llvm::enumerate(semantics.node_entries())) {
             const SemanticNode& node = entry.node;
@@ -470,7 +505,20 @@ private:
                     auto* import = node.get<Import>();
                     anchor(import->location, {SymbolKind::Keyword, 0}, true);
                     for(auto location: import->name_locations) {
-                        anchor(location, {SymbolKind::Module, 0}, true);
+                        auto index = spelled_index(location);
+                        if(!index) {
+                            continue;
+                        }
+                        /// A partition import (`import :part;`) reports the
+                        /// component location at its leading colon; the
+                        /// written name is the next spelled token. The colon
+                        /// itself stays unpainted, matching the module
+                        /// declaration side.
+                        if(spelled[*index].kind() == clang::tok::colon &&
+                           *index + 1 < spelled.size()) {
+                            *index += 1;
+                        }
+                        combine(token_semantics[*index], {SymbolKind::Module, 0});
                     }
                     break;
                 }
@@ -490,9 +538,8 @@ private:
                         resolve_occurrences(semantics,
                                             static_cast<std::uint32_t>(entry_index),
                                             &unit.resolver())) {
-                        anchor(occurrence.location,
-                               classify_decl(occurrence.decl, occurrence.kind),
-                               false);
+                        anchor_name(occurrence.location,
+                                    classify_decl(occurrence.decl, occurrence.kind));
                     }
                     break;
                 }
@@ -517,6 +564,28 @@ private:
                 auto offset = semantics.token_offset(0);
                 if(content.substr(offset, spelled.front().length()) == "module") {
                     module_tokens[0] = SymbolKind::Keyword;
+                }
+            }
+        }
+
+        /// `module :private;` — the private fragment's contextual `module`
+        /// also lexes as a plain identifier. The identifier-colon-`private`
+        /// token sequence is not valid C++ anywhere else, so locate it
+        /// lexically like the global module fragment above. Tokens
+        /// preprocessed away (a disabled branch, a macro body) spell no
+        /// fragment and keep their lexical handling.
+        {
+            auto spelled = semantics.spelled_tokens();
+            for(std::uint32_t i = 0; i + 2 < spelled.size(); i += 1) {
+                if(spelled[i].kind() != clang::tok::identifier ||
+                   spelled[i + 1].kind() != clang::tok::colon ||
+                   spelled[i + 2].kind() != clang::tok::kw_private ||
+                   semantics.token_preprocessed_away(i)) {
+                    continue;
+                }
+                auto offset = semantics.token_offset(i);
+                if(content.substr(offset, spelled[i].length()) == "module") {
+                    module_tokens[i] = SymbolKind::Keyword;
                 }
             }
         }
@@ -603,7 +672,7 @@ private:
     void emit(LocalSourceRange range, SymbolKind kind, std::uint32_t modifiers) {
         if(!tokens.empty()) {
             auto& last = tokens.back();
-            if(last.range.end == range.begin && last.kind == kind) {
+            if(last.range.end == range.begin && last.kind == kind && last.modifiers == modifiers) {
                 last.range.end = range.end;
                 return;
             }
