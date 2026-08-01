@@ -377,8 +377,26 @@ public:
             }
         }
 
-        return traverse_node(SemanticNode(static_cast<const clang::Decl*>(X)),
-                             [&] { return Base::TraverseDecl(X); });
+        // An instantiation subtree reuses the pattern's source locations, so
+        // nothing under it is written here. An explicit instantiation
+        // directive's own decl is the exception: the directive is written,
+        // and the traversal visits only its written template arguments (the
+        // instantiated members arrive as separate top-level decls, carrying
+        // the directive's specialization kind but written nowhere — flag
+        // their whole subtrees like any implicit instantiation).
+        bool head = decls::is_instantiation(X);
+        bool written_head = head &&
+                            !decls::is_implicit_instantiation(llvm::cast<clang::NamedDecl>(X)) &&
+                            !decls::is_member_specialization(X);
+        if(head && !written_head) {
+            instantiation_depth += 1;
+        }
+        bool ret = traverse_node(SemanticNode(static_cast<const clang::Decl*>(X)),
+                                 [&] { return Base::TraverseDecl(X); });
+        if(head && !written_head) {
+            instantiation_depth -= 1;
+        }
+        return ret;
     }
 
     bool TraverseTypeLoc(clang::TypeLoc X) {
@@ -570,6 +588,7 @@ private:
         clang::SourceRange early = early_source_range(node);
         auto self = static_cast<std::uint32_t>(semantics.nodes.size());
         semantics.nodes.push_back({std::move(node), stack.back()});
+        semantics.nodes.back().flags.in_instantiation = instantiation_depth > 0;
         stack.push_back(self);
         claim_range(early, self);
     }
@@ -945,6 +964,10 @@ private:
     IntervalSet unclaimed_expanded_tokens;
     llvm::SmallVector<std::uint32_t, 64> stack;
 
+    /// Depth of enclosing instantiation subtrees; nodes pushed while it is
+    /// non-zero are flagged in_instantiation.
+    std::uint32_t instantiation_depth = 0;
+
     /// (spelled token index, owning node index) pairs, sorted in finalize().
     std::vector<std::pair<std::uint32_t, std::uint32_t>> entries;
 };
@@ -1117,8 +1140,10 @@ void decl_occurrences(const clang::Decl* D, Occurrences& out, types::TemplateRes
     if(auto* FD = llvm::dyn_cast<clang::FunctionDecl>(D)) {
         switch(FD->getTemplateSpecializationKind()) {
             case clang::TSK_ImplicitInstantiation:
-            /// FIXME: Clang currently doesn't record source location of explicit
-            /// instantiation of function template correctly. Skip it temporarily.
+            /// FIXME(explicit-instantiation): clang doesn't record the written
+            /// location of a function template's explicit instantiation until
+            /// clang 23's ExplicitInstantiationDecl (llvm/llvm-project#191658).
+            /// Skip it temporarily.
             case clang::TSK_ExplicitInstantiationDeclaration:
             case clang::TSK_ExplicitInstantiationDefinition: {
                 return;
@@ -1149,8 +1174,10 @@ void decl_occurrences(const clang::Decl* D, Occurrences& out, types::TemplateRes
         if(auto* VTSD = llvm::dyn_cast<clang::VarTemplateSpecializationDecl>(VD)) {
             switch(VTSD->getSpecializationKind()) {
                 case clang::TSK_ImplicitInstantiation:
-                /// FIXME: Clang currently doesn't record source location of explicit
-                /// instantiation of variable template correctly. Skip it temporarily.
+                /// FIXME(explicit-instantiation): clang doesn't record the
+                /// written location of a variable template's explicit
+                /// instantiation until clang 23's ExplicitInstantiationDecl
+                /// (llvm/llvm-project#191658). Skip it temporarily.
                 case clang::TSK_ExplicitInstantiationDeclaration:
                 case clang::TSK_ExplicitInstantiationDefinition: {
                     return;

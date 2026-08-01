@@ -367,7 +367,7 @@ clice renders inline annotations for the information the code leaves implicit: p
   }
   ```
 
-- [x] Explicit instantiation — an explicit instantiation definition adds no duplicate hints ([clangd#1034](https://github.com/clangd/clangd/issues/1034))
+- [x] Explicit instantiation — an explicit instantiation definition adds no duplicate hints, while its written template arguments hint normally ([clangd#1034](https://github.com/clangd/clangd/issues/1034))
 
   ```cpp
   template <typename T>
@@ -378,6 +378,13 @@ clice renders inline annotations for the information the code leaves implicit: p
   void use() {
       apply(42);
   }
+
+  int measure(int amount);
+
+  template <typename T>
+  struct Box {};
+
+  template struct Box<decltype(measure(7))>;
   ```
 
 - [ ] Sloppy name matching — `aParam` does not yet suppress an argument spelled `param` _(partial)_ ([clangd#2248](https://github.com/clangd/clangd/issues/2248))
@@ -745,6 +752,34 @@ clice renders inline annotations for the information the code leaves implicit: p
   auto [x, y] = make();
   ```
 
+- [ ] Instantiated templates — instantiated bodies repeat no hints at the pattern; dependent `auto` could reveal the deduced type while exactly one instantiation exists _(partial)_ ([clangd#2275](https://github.com/clangd/clangd/issues/2275))
+
+  ```cpp
+  void take(int first, int second);
+
+  template <typename T>
+  struct Single {
+      void reset() {
+          take(1, 2);
+          // Deducible from the only instantiation, but not yet deduced.
+          auto copy = T();
+      }
+  };
+
+  template struct Single<char>;
+
+  template <typename T>
+  struct Twice {
+      void reset() {
+          // No hint: two instantiations deduce contradicting types.
+          auto copy = T();
+      }
+  };
+
+  template struct Twice<char>;
+  template struct Twice<int>;
+  ```
+
 <!-- END GENERATED ITEMS -->
 
 ## Designator Hints
@@ -968,7 +1003,8 @@ The `[inlay_hints]` section of `clice.toml` (or the same keys via `initializatio
 
 ## Changelog
 
-| Date       | Change                                                                                                  | PR  |
-| ---------- | ------------------------------------------------------------------------------------------------------- | --- |
-| —          | Parameter name hints, type hints, range-scoped queries                                                  | —   |
-| 2026-07-31 | Designator hints, dependent-call parameter hints, `[inlay_hints]` configuration, fixture-generated docs | —   |
+| Date       | Change                                                                                                  | PR                                                 |
+| ---------- | ------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| —          | Parameter name hints, type hints, range-scoped queries                                                  | —                                                  |
+| 2026-07-31 | Designator hints, dependent-call parameter hints, `[inlay_hints]` configuration, fixture-generated docs | —                                                  |
+| 2026-08-01 | Instantiation-subtree skip: no duplicate or contradictory hints from instantiated bodies                | [#571](https://github.com/clice-io/clice/pull/571) |
