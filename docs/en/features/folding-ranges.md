@@ -42,17 +42,36 @@
   };
 
   }  // namespace geometry
+
+  namespace spaced
+  {
+
+  struct Placeholder {
+      int filler;
+  };
+
+  }  // namespace spaced
   ```
 
-- [ ] Nested compound-statement folding — `if`/`for`/`while` bodies inside functions
+- [x] Nested compound-statement folding — `if`/`for`/`while` bodies inside functions
 
   ```cpp
   void process(int count) {
-      if (count > 0) {                       // ┐
-          for (int i = 0; i < count; ++i) {  // │ nested blocks that could
-              // ... work ...                // │ fold independently of
-          }                                  // │ the enclosing function
-      }                                      // ┘
+      if (count > 0) {
+          for (int i = 0; i < count; i += 1) {
+              count -= 1;
+          }
+      }
+
+      while (count > 0) {
+          count -= 1;
+      }
+
+      // A bare scope block folds too.
+      {
+          int scratch = count;
+          count = scratch + 1;
+      }
   }
   ```
 
@@ -86,7 +105,43 @@
       ] {
           return first + second;
       };
+
+      auto scale = [](
+          int base,    // ┐ foldable lambda
+          int factor   // ┘ parameter list
+      ) {
+          return base * factor;
+      };
+
+      result += sum() + scale(result, 2);
   }
+
+  int accumulate(
+      int start,  // ┐
+      int step,   // │ foldable parameter list
+      int count   // ┘ on a definition
+  ) {
+      return start + step * count;
+  }
+
+  void log_all(
+      const char* format,  // ┐ variadic parameter
+      ...                  // ┘ list still folds
+  );
+
+  struct Rect {
+      Rect(int w, int h);
+  };
+
+  Rect area(
+      10,  // ┐ foldable constructor
+      20   // ┘ arguments
+  );
+
+  Rect brace_area{
+      30,
+      40
+  };
   ```
 
 - [x] Access-specifier section folding — `public:` / `protected:` / `private:` regions within a class ([clangd#1455](https://github.com/clangd/clangd/issues/1455))
@@ -187,6 +242,160 @@
   class SortedMap { };
   ```
 
+- [x] Template specializations and instantiations — written specializations and their members fold; instantiated declarations reuse the pattern's source locations and must not fold it again
+
+  ```cpp
+  template <typename T>
+  struct Box {
+      T value;
+
+      void reset() {
+          value = T();
+      }
+  };
+
+  template <>
+  struct Box<void> {
+      void reset() {
+          // nothing stored
+      }
+  };
+
+  template <typename T>
+  struct Box<T*> {
+      T* pointee;
+  };
+
+  // Neither the implicit instantiation Box<int> nor the explicit instantiation
+  // Box<char> re-folds the primary's braces or the reset() body.
+  Box<int> implicit_use;
+  template struct Box<char>;
+  ```
+
+- [x] Abbreviated function templates — bodies of functions with `auto` or constrained `auto` parameters fold like any other function
+
+  ```cpp
+  template <typename T>
+  concept Small = sizeof(T) <= 8;
+
+  void consume(Small auto x) {
+      auto copy = x;
+      copy += 1;
+  }
+
+  void forward(auto value) {
+      consume(value);
+  }
+  ```
+
+- [x] Macro-generated folding — braces and access specifiers spelled through macros fold at the invocation site
+
+  ```cpp
+  #define NS_BEGIN namespace ns {
+  #define NS_END }
+  #define PUBLIC public:
+  #define PRIVATE private:
+
+  NS_BEGIN
+
+  class Widget {
+  PUBLIC
+      void draw();
+      void resize();
+  PRIVATE
+      int width;
+      int height;
+  };
+
+  NS_END
+  ```
+
+- [x] Coroutine bodies — the written block folds exactly once and the coroutine transformation wrapper adds no duplicate fold; a coroutine lambda keeps its body fold
+
+  ```cpp
+  namespace std {
+
+  template <typename Ret, typename...>
+  struct coroutine_traits {
+      using promise_type = typename Ret::promise_type;
+  };
+
+  template <typename = void>
+  struct coroutine_handle {
+      coroutine_handle() = default;
+
+      template <typename Promise>
+      coroutine_handle(coroutine_handle<Promise>) noexcept;
+
+      static coroutine_handle from_address(void*) noexcept;
+  };
+
+  struct suspend_never {
+      bool await_ready() const noexcept;
+      void await_suspend(coroutine_handle<>) const noexcept;
+      void await_resume() const noexcept;
+  };
+
+  }  // namespace std
+
+  struct Task {
+      struct promise_type {
+          Task get_return_object();
+          std::suspend_never initial_suspend();
+          std::suspend_never final_suspend() noexcept;
+          void return_void();
+          void unhandled_exception();
+      };
+  };
+
+  Task work() {
+      int steps = 0;
+      if (steps == 0) {
+          steps += 1;
+      }
+      co_return;
+  }
+
+  void host() {
+      auto nested = []() -> Task {
+          int steps = 0;
+          steps += 1;
+          co_return;
+      };
+  }
+  ```
+
+- [x] Initializer-list constructions — the constructor's braces and the nested initializer list share delimiters and fold once; a parenthesized list argument keeps both folds
+
+  ```cpp
+  namespace std {
+
+  template <typename T>
+  class initializer_list {
+  public:
+      using size_type = decltype(sizeof(0));
+
+      const T* ptr = nullptr;
+      size_type len = 0;
+  };
+
+  }  // namespace std
+
+  struct Bag {
+      Bag(std::initializer_list<int> values);
+  };
+
+  Bag braces{
+      1,
+      2
+  };
+
+  Bag nested({
+      3,
+      4
+  });
+  ```
+
 <!-- END GENERATED ITEMS -->
 
 ## Refinements
@@ -258,10 +467,29 @@
   #endif
   ```
 
+- [x] Single-line constructs stay unfolded — a fold that hides nothing is noise
+
+  ```cpp
+  namespace tiny { }
+
+  struct Empty {};
+
+  enum Flags { A, B };
+
+  void noop() {}
+
+  int values[] = {1, 2, 3};
+
+  auto lambda = [](int x) { return x; };
+
+  int result = lambda(42);
+  ```
+
 <!-- END GENERATED ITEMS -->
 
 ## Changelog
 
-| Date | Change                                                               | PR  |
-| ---- | -------------------------------------------------------------------- | --- |
-| —    | Block folding, list folding, access specifiers, preprocessor regions | —   |
+| Date       | Change                                                                                                                     | PR                                                 |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| 2026-08-01 | Nested compound statements, abbreviated function templates and coroutine bodies; instantiation dedup; semantics-table walk | [#568](https://github.com/clice-io/clice/pull/568) |
+| —          | Block folding, list folding, access specifiers, preprocessor regions                                                       | —                                                  |
