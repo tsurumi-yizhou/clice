@@ -59,6 +59,18 @@ struct InlayHintsConfig {
     std::optional<std::uint32_t> type_name_limit;
 };
 
+/// Corresponds to the `[code_completion]` section in clice.toml. Mirrors
+/// feature::CodeCompletionOptions field by field; unset fields take that
+/// struct's defaults in apply_defaults(), so the two never disagree.
+struct CodeCompletionConfig {
+    std::optional<bool> enable_keyword_snippet;
+    std::optional<bool> enable_function_arguments_snippet;
+    std::optional<bool> enable_template_arguments_snippet;
+    std::optional<bool> insert_paren_in_function_call;
+    std::optional<bool> bundle_overloads;
+    std::optional<std::uint32_t> limit;
+};
+
 /// Corresponds to the `[tracker]` section in clice.toml: the stat-polling
 /// file tracker's intervals. 0 disables the loop (integration tests drive
 /// ticks through the clice/internal/poll hook instead).
@@ -103,12 +115,19 @@ struct Config {
 
     defaulted<InlayHintsConfig> inlay_hints;
 
+    defaulted<CodeCompletionConfig> code_completion;
+
     defaulted<std::vector<ConfigRule>> rules;
 
     kota::meta::annotation<std::vector<CompiledRule>, kota::meta::attrs::skip> compiled_rules;
 
     /// Compute default values for any field left at its zero/empty sentinel.
     void apply_defaults(llvm::StringRef workspace_root);
+
+    /// A fresh config with apply_defaults() already run (no workspace
+    /// root): the state every live config must reach before its option
+    /// fields are read through operator*.
+    static Config with_defaults();
 
     /// Collect append/remove flags from all rules whose patterns match `path`.
     void match_rules(llvm::StringRef path,
