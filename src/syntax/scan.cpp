@@ -19,7 +19,7 @@
 
 namespace clice {
 
-ScanResult scan(llvm::StringRef content) {
+ScanResult scan_quick(llvm::StringRef content) {
     namespace dds = clang::dependency_directives_scan;
 
     ScanResult result;
