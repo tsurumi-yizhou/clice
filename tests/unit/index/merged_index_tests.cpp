@@ -1,11 +1,16 @@
+#include <algorithm>
 #include <filesystem>
+#include <optional>
+#include <tuple>
 
-#include "schema_generated.h"
 #include "test/temp_dir.h"
 #include "test/test.h"
 #include "test/tester.h"
 #include "index/merged_index.h"
+#include "index/serialization.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/xxhash.h"
 
@@ -321,7 +326,7 @@ TEST_CASE(RemergeReplacesContribution) {
     index::SymbolHash defined{};
     for(auto& [symbol, relations]: header_idx.relations) {
         for(auto& relation: relations) {
-            if(relation.kind & RelationKind(RelationKind::Definition)) {
+            if(RelationKind(relation.kind) & RelationKind(RelationKind::Definition)) {
                 defined = symbol;
             }
         }
@@ -369,7 +374,7 @@ TEST_CASE(RemergePreservesOtherTus) {
     index::SymbolHash defined{};
     for(auto& [symbol, relations]: header_idx.relations) {
         for(auto& relation: relations) {
-            if(relation.kind & RelationKind(RelationKind::Definition)) {
+            if(RelationKind(relation.kind) & RelationKind(RelationKind::Definition)) {
                 defined = symbol;
             }
         }
@@ -414,6 +419,46 @@ TEST_CASE(CompactionDropsMasked) {
         return false;
     });
     ASSERT_FALSE(found);
+}
+
+TEST_CASE(SerializeCompactsInPlace) {
+    // Two contributions with distinct content, so each gets its own
+    // canonical id; only one is removed.
+    index::FileIndex live_idx;
+    live_idx.occurrences.emplace_back(index::Range{0, 3}, 100);
+    index::FileIndex dead_idx;
+    dead_idx.occurrences.emplace_back(index::Range{10, 13}, 200);
+
+    index::MergedIndex merged;
+    merged.merge("tu0", std::uint32_t(0), live_idx, "synthetic");
+    merged.merge("tu1", std::uint32_t(0), dead_idx, "synthetic");
+    merged.remove("tu1");
+
+    llvm::SmallString<1024> buf;
+    llvm::raw_svector_ostream os(buf);
+    merged.serialize(os);
+
+    // The save flip is conditional: when it does not happen, the in-memory
+    // impl — now compacted by serialize() — keeps serving queries. Surviving
+    // rows must still resolve and removed ones stay gone.
+    auto hits_at = [&](std::uint32_t offset) {
+        std::size_t hits = 0;
+        merged.lookup(offset, [&](const index::Occurrence&) {
+            hits += 1;
+            return true;
+        });
+        return hits;
+    };
+    ASSERT_EQ(hits_at(1), 1u);
+    ASSERT_EQ(hits_at(11), 0u);
+    ASSERT_TRUE(merged.has_contribution("tu0"));
+    ASSERT_FALSE(merged.has_contribution("tu1"));
+
+    // A second serialize of the compacted impl round-trips identically.
+    llvm::SmallString<1024> again;
+    llvm::raw_svector_ostream os2(again);
+    merged.serialize(os2);
+    ASSERT_EQ(llvm::StringRef(buf), llvm::StringRef(again));
 }
 
 TEST_CASE(HasContributionTracking) {
@@ -673,42 +718,289 @@ TEST_CASE(OldShardDiscarded) {
 
     // A version-less (format_version=0) shard from an older build is silently
     // discarded — load returns an empty index, as if nothing were on disk.
+    // Only the version slot is written: every other field reads back absent,
+    // which is structurally valid — rejection must come from the version
+    // check.
     {
-        namespace binary = clice::index::binary;
-        flatbuffers::FlatBufferBuilder builder;
-        auto content = builder.CreateString("stale-shard");
-        auto paths = builder.CreateVector<flatbuffers::Offset<flatbuffers::String>>({});
-        auto cache = builder.CreateVector<flatbuffers::Offset<binary::CacheEntry>>({});
-        auto headers = builder.CreateVector<flatbuffers::Offset<binary::HeaderContextEntry>>({});
-        auto compilations =
-            builder.CreateVector<flatbuffers::Offset<binary::CompilationContextEntry>>({});
-        auto occurrences = builder.CreateVector<flatbuffers::Offset<binary::OccurrenceEntry>>({});
-        auto relations =
-            builder.CreateVector<flatbuffers::Offset<binary::SymbolRelationsEntry>>({});
-        auto root = binary::CreateMergedIndex(builder,
-                                              0,
-                                              paths,
-                                              cache,
-                                              headers,
-                                              compilations,
-                                              occurrences,
-                                              relations,
-                                              0,
-                                              content,
-                                              0,
-                                              0,
-                                              /*format_version=*/0);
-        builder.Finish(root);
+        struct VersionOnly {
+            std::uint32_t format_version = 0;
+        };
+
+        auto blob = kota::codec::fbs::to_bytes(VersionOnly{});
+        ASSERT_TRUE(blob.has_value());
 
         auto path = dir.path("stale.idx");
         std::error_code ec;
         llvm::raw_fd_ostream os(path, ec);
-        os.write(reinterpret_cast<const char*>(builder.GetBufferPointer()), builder.GetSize());
+        os.write(reinterpret_cast<const char*>(blob->data()), blob->size());
         os.flush();
 
         auto loaded = index::MergedIndex::load(path);
         ASSERT_TRUE(loaded.content().empty());
         ASSERT_TRUE(loaded.need_update());
+    }
+
+    // Positive control: the same single-slot shape carrying the CURRENT
+    // version is kept — slot 0 really is the version slot and the rejection
+    // above comes from its value, not from the blob's shape.
+    {
+        struct VersionOnly {
+            std::uint32_t format_version = 0;
+        };
+
+        auto blob = kota::codec::fbs::to_bytes(VersionOnly{index::index_format_version});
+        ASSERT_TRUE(blob.has_value());
+
+        auto path = dir.path("current.idx");
+        std::error_code ec;
+        llvm::raw_fd_ostream os(path, ec);
+        os.write(reinterpret_cast<const char*>(blob->data()), blob->size());
+        os.flush();
+
+        ASSERT_TRUE(index::MergedIndex::load(path).loaded());
+    }
+}
+
+TEST_CASE(GarbageLoadRejected) {
+    TempDir dir;
+    dir.touch("garbage.idx", "not a flatbuffer");
+
+    auto loaded = index::MergedIndex::load(dir.path("garbage.idx"));
+    ASSERT_FALSE(loaded.loaded());
+    ASSERT_TRUE(loaded.content().empty());
+    ASSERT_TRUE(loaded.need_update());
+
+    // Queries on the rejected shard answer with silence, not UB.
+    bool visited = false;
+    loaded.lookup(0, [&](const index::Occurrence&) {
+        visited = true;
+        return true;
+    });
+    ASSERT_FALSE(visited);
+
+    loaded.lookup(index::SymbolHash(1), RelationKind::Definition, [&](const index::Relation&) {
+        visited = true;
+        return true;
+    });
+    ASSERT_FALSE(visited);
+
+    std::string name;
+    SymbolKind kind;
+    ASSERT_FALSE(loaded.find_symbol(1, name, kind));
+}
+
+TEST_CASE(CorruptShardRejected) {
+    TempDir dir;
+
+    index::MergedIndex merged;
+    index::FileIndex file_idx;
+    merged.merge("tu0", std::chrono::milliseconds(1), {}, file_idx, "corrupt-me");
+
+    llvm::SmallString<1024> blob;
+    llvm::raw_svector_ostream os(blob);
+    merged.serialize(os);
+    ASSERT_TRUE(blob.size() > 8);
+
+    auto write = [&](llvm::StringRef name, llvm::StringRef bytes) {
+        dir.touch(name, bytes);
+        return dir.path(name);
+    };
+
+    // Sanity: the intact bytes load, so the rejections below are earned.
+    ASSERT_TRUE(index::MergedIndex::load(write("valid.idx", blob)).loaded());
+
+    llvm::StringRef bytes(blob.data(), blob.size());
+    ASSERT_FALSE(
+        index::MergedIndex::load(write("half.idx", bytes.take_front(bytes.size() / 2))).loaded());
+    ASSERT_FALSE(index::MergedIndex::load(write("minus1.idx", bytes.drop_back(1))).loaded());
+
+    // Bytes 4-7 carry the buffer identifier; a blob from another format
+    // must be rejected up front.
+    std::string clobbered = bytes.str();
+    for(std::size_t i = 4; i < 8; ++i) {
+        clobbered[i] = 'X';
+    }
+    ASSERT_FALSE(index::MergedIndex::load(write("clobbered.idx", clobbered)).loaded());
+}
+
+TEST_CASE(OutOfRangeCanonicalIdRejected) {
+    TempDir dir;
+
+    // Field order MUST mirror the persisted shapes in merged_index.cpp
+    // (MergedIndex::Impl prefix — skip-annotated fields occupy no slot —
+    // HeaderContext, IncludeContext, CompilationContext prefix); the
+    // trailing fields read back absent, which is structurally valid.
+    struct IncludeContextMirror {
+        std::uint32_t include_id = 0;
+        std::uint32_t canonical_id = 0;
+    };
+
+    struct HeaderContextMirror {
+        std::uint32_t version = 0;
+        llvm::SmallVector<IncludeContextMirror> includes;
+    };
+
+    // The vector matters beyond field parity: without one the mirror would
+    // be trivially copyable and encode as an inline struct, while the real
+    // CompilationContext encodes as a table — the verifier tells them apart.
+    struct CompilationContextMirror {
+        std::uint32_t version = 0;
+        std::uint32_t canonical_id = 0;
+        std::uint64_t build_at = 0;
+        std::vector<index::IncludeLocation> include_locations;
+    };
+
+    struct ReprMirror {
+        std::uint32_t format_version = 0;
+        std::vector<std::string> paths;
+        std::string content;
+        std::vector<std::uint32_t> line_starts;
+        llvm::SmallDenseMap<std::uint32_t, HeaderContextMirror, 2> header_contexts;
+        llvm::SmallDenseMap<std::uint32_t, CompilationContextMirror, 1> compilation_contexts;
+        std::vector<std::pair<std::string, std::uint32_t>> canonical_cache;
+        std::uint32_t max_canonical_id = 0;
+    };
+
+    // A consistent base: one path, one canonical id, one header context
+    // referencing it.
+    auto base = [] {
+        ReprMirror mirror;
+        mirror.format_version = index::index_format_version;
+        mirror.max_canonical_id = 1;
+        mirror.paths = {"/proj/tu.cpp"};
+        mirror.canonical_cache.emplace_back("hash", 0);
+        mirror.header_contexts[0].includes.push_back({.include_id = 0, .canonical_id = 0});
+        return mirror;
+    };
+
+    // Structure and version pass, so load() accepts the blob off disk; the
+    // first mutation materializes it in memory, where the id values face
+    // the range check. Nullopt = the blob never reached that check.
+    auto materialized_contribution = [&](llvm::StringRef name,
+                                         const ReprMirror& mirror) -> std::optional<bool> {
+        auto blob = kota::codec::fbs::to_bytes(mirror);
+        if(!blob) {
+            return std::nullopt;
+        }
+        dir.touch(name, llvm::StringRef(reinterpret_cast<const char*>(blob->data()), blob->size()));
+        auto shard = index::MergedIndex::load(dir.path(name));
+        if(!shard.loaded()) {
+            return std::nullopt;
+        }
+        shard.remove("/proj/never-indexed.cpp");
+        return shard.has_contribution("/proj/tu.cpp");
+    };
+
+    // Positive control first: the base materializes intact, so the
+    // rejections below come from the hostile ids, not the blob's shape.
+    auto good = materialized_contribution("good.idx", base());
+    ASSERT_TRUE(good.has_value() && *good);
+
+    // Structural verification does not constrain field values: each blob
+    // carries one canonical id at or past max_canonical_id, which would
+    // index canonical_ref_counts out of bounds if the in-memory load
+    // accepted it. The blob is dropped and the shard reads as empty.
+    auto bad_cache = base();
+    bad_cache.canonical_cache.front().second = 5;
+    auto cache_verdict = materialized_contribution("bad-cache.idx", bad_cache);
+    ASSERT_TRUE(cache_verdict.has_value() && !*cache_verdict);
+
+    auto bad_include = base();
+    bad_include.header_contexts[0].includes.front().canonical_id = 5;
+    auto include_verdict = materialized_contribution("bad-include.idx", bad_include);
+    ASSERT_TRUE(include_verdict.has_value() && !*include_verdict);
+
+    auto bad_compilation = base();
+    bad_compilation.compilation_contexts[0].canonical_id = 5;
+    auto compilation_verdict = materialized_contribution("bad-compilation.idx", bad_compilation);
+    ASSERT_TRUE(compilation_verdict.has_value() && !*compilation_verdict);
+}
+
+TEST_CASE(BufferPathLookupParity) {
+    build_index(R"(
+            void §(a)alpha_func() {}
+            int §(b)beta_var = 1;
+        )");
+
+    index::MergedIndex merged;
+    auto fid = unit->interested_file();
+    merged.merge("tu0",
+                 tu_index.graph.include_location_id(fid),
+                 tu_index.main_file_index,
+                 unit->interested_content());
+
+    auto hash_at = [&](llvm::StringRef pos) {
+        auto offset = point(pos);
+        index::SymbolHash hash = 0;
+        merged.lookup(offset, [&](const index::Occurrence& occ) {
+            hash = occ.target;
+            return false;
+        });
+        return hash;
+    };
+
+    using Row = std::tuple<std::uint32_t, std::uint32_t, std::uint64_t>;
+    auto definitions = [](index::MergedIndex& index, index::SymbolHash hash) {
+        std::vector<Row> rows;
+        index.lookup(hash, RelationKind::Definition, [&](const index::Relation& relation) {
+            rows.emplace_back(relation.range.begin, relation.range.end, relation.target_symbol);
+            return true;
+        });
+        std::ranges::sort(rows);
+        return rows;
+    };
+
+    index::SymbolHash hashes[2] = {hash_at("a"), hash_at("b")};
+    std::vector<Row> expected[2];
+    for(std::size_t i = 0; i < 2; ++i) {
+        ASSERT_TRUE(hashes[i] != 0);
+        expected[i] = definitions(merged, hashes[i]);
+        ASSERT_FALSE(expected[i].empty());
+    }
+    ASSERT_TRUE(hashes[0] != hashes[1]);
+
+    llvm::SmallString<4096> buf;
+    llvm::raw_svector_ostream os(buf);
+    merged.serialize(os);
+    auto restored = index::MergedIndex(buf);
+
+    // The zero-copy view is the production read path: it must agree BEFORE
+    // anything materializes the impl (operator== would, so it comes last).
+    for(std::size_t i = 0; i < 2; ++i) {
+        ASSERT_TRUE(definitions(restored, hashes[i]) == expected[i]);
+    }
+
+    ASSERT_FALSE(restored.line_starts().empty());
+    ASSERT_TRUE(std::ranges::equal(restored.line_starts(), merged.line_starts()));
+}
+
+TEST_CASE(BufferPathMultiOccurrenceLookup) {
+    // Synthesized occurrences sorted by (begin, end, target), spaced so each
+    // probe hits exactly one range (contains() is inclusive at both ends).
+    index::FileIndex file_idx;
+    index::SymbolHash target = 100;
+    for(std::uint32_t begin = 0; begin < 60; begin += 10) {
+        file_idx.occurrences.emplace_back(index::Range{begin, begin + 3}, target++);
+    }
+
+    index::MergedIndex merged;
+    merged.merge("tu0", std::uint32_t(0), file_idx, "synthetic");
+
+    llvm::SmallString<1024> buf;
+    llvm::raw_svector_ostream os(buf);
+    merged.serialize(os);
+    auto restored = index::MergedIndex(buf);
+
+    // The buffer path binary-searches the serialized rows: every probe must
+    // land on exactly its own range.
+    for(auto& occurrence: file_idx.occurrences) {
+        std::vector<index::Occurrence> hits;
+        restored.lookup(occurrence.range.begin + 1, [&](const index::Occurrence& hit) {
+            hits.push_back(hit);
+            return true;
+        });
+        ASSERT_EQ(hits.size(), 1u);
+        ASSERT_TRUE(hits.front() == occurrence);
     }
 }
 

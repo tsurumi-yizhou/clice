@@ -5,6 +5,7 @@
 #include "test/test.h"
 #include "test/tester.h"
 #include "feature/feature.h"
+#include "index/serialization.h"
 #include "index/tu_index.h"
 #include "semantic/selection.h"
 
@@ -91,7 +92,7 @@ void GO_TO_DEFINITION(llvm::StringRef pos,
 
     auto& relations = it->second;
     auto target = std::ranges::find_if(relations, [](const index::Relation& relation) {
-        return relation.kind.value() == static_cast<std::uint32_t>(RelationKind::Definition);
+        return relation.kind == RelationKind::Definition;
     });
 
     ASSERT_TRUE(target != relations.end());
@@ -273,7 +274,7 @@ TEST_CASE(Reference) {
 
     auto& relations = it->second;
     auto ref = std::ranges::find_if(relations, [](const index::Relation& r) {
-        return r.kind.value() == static_cast<std::uint32_t>(RelationKind::Reference);
+        return r.kind == RelationKind::Reference;
     });
     ASSERT_TRUE(ref != relations.end());
 }
@@ -297,18 +298,19 @@ TEST_CASE(BaseAndDerived) {
     auto base_hash = base_occs.front().target;
     auto derived_hash = derived_occs.front().target;
 
-    auto has_pair = [&](index::SymbolHash source, RelationKind kind, index::SymbolHash target) {
-        auto it = index.relations.find(source);
-        if(it == index.relations.end()) {
-            return false;
-        }
-        for(auto& r: it->second) {
-            if(r.kind.value() == static_cast<std::uint32_t>(kind) && r.target_symbol == target) {
-                return true;
+    auto has_pair =
+        [&](index::SymbolHash source, RelationKind::Kind kind, index::SymbolHash target) {
+            auto it = index.relations.find(source);
+            if(it == index.relations.end()) {
+                return false;
             }
-        }
-        return false;
-    };
+            for(auto& r: it->second) {
+                if(r.kind == kind && r.target_symbol == target) {
+                    return true;
+                }
+            }
+            return false;
+        };
 
     ASSERT_TRUE(has_pair(derived_hash, RelationKind::Base, base_hash));
     ASSERT_TRUE(has_pair(base_hash, RelationKind::Derived, derived_hash));
@@ -335,7 +337,7 @@ TEST_CASE(CallerAndCallee) {
 
     bool found_callee = false;
     for(auto& r: caller_it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Callee)) {
+        if(r.kind == RelationKind::Callee) {
             found_callee = true;
             break;
         }
@@ -352,7 +354,7 @@ TEST_CASE(CallerAndCallee) {
 
     bool found_caller = false;
     for(auto& r: callee_it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Caller)) {
+        if(r.kind == RelationKind::Caller) {
             found_caller = true;
             break;
         }
@@ -388,8 +390,7 @@ TEST_CASE(MethodCallerCallee) {
 
     bool found_callee = false;
     for(auto& r: method_it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Callee) &&
-           r.target_symbol == callee_hash) {
+        if(r.kind == RelationKind::Callee && r.target_symbol == callee_hash) {
             found_callee = true;
             break;
         }
@@ -401,8 +402,7 @@ TEST_CASE(MethodCallerCallee) {
 
     bool found_caller = false;
     for(auto& r: callee_it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Caller) &&
-           r.target_symbol == method_hash) {
+        if(r.kind == RelationKind::Caller && r.target_symbol == method_hash) {
             found_caller = true;
             break;
         }
@@ -430,8 +430,7 @@ TEST_CASE(UsingRelationKey) {
 
     bool found_use = false;
     for(auto& r: it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::WeakReference) &&
-           r.range == range("use")) {
+        if(r.kind == RelationKind::WeakReference && r.range == range("use")) {
             found_use = true;
             break;
         }
@@ -515,8 +514,7 @@ TEST_CASE(DependentWeakReference) {
 
     bool found_weak = false;
     for(auto& r: it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::WeakReference) &&
-           r.range == range("use")) {
+        if(r.kind == RelationKind::WeakReference && r.range == range("use")) {
             found_weak = true;
             break;
         }
@@ -552,8 +550,7 @@ TEST_CASE(TypeDefinitionRelations) {
             return false;
         }
         for(auto& r: it->second) {
-            if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::TypeDefinition) &&
-               r.target_symbol == target_hash) {
+            if(r.kind == RelationKind::TypeDefinition && r.target_symbol == target_hash) {
                 return true;
             }
         }
@@ -587,11 +584,10 @@ TEST_CASE(ConstructorDestructorRelations) {
     bool found_ctor = false;
     bool found_dtor = false;
     for(auto& r: it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Constructor) &&
-           r.target_symbol == ctor_hash) {
+        if(r.kind == RelationKind::Constructor && r.target_symbol == ctor_hash) {
             found_ctor = true;
         }
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Destructor)) {
+        if(r.kind == RelationKind::Destructor) {
             found_dtor = true;
         }
     }
@@ -604,8 +600,7 @@ TEST_CASE(ConstructorDestructorRelations) {
 
     bool found_type = false;
     for(auto& r: ctor_it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::TypeDefinition) &&
-           r.target_symbol == class_hash) {
+        if(r.kind == RelationKind::TypeDefinition && r.target_symbol == class_hash) {
             found_type = true;
         }
     }
@@ -631,12 +626,10 @@ TEST_CASE(MacroRelations) {
     bool found_definition = false;
     bool found_reference = false;
     for(auto& r: it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Definition) &&
-           r.range == range("def")) {
+        if(r.kind == RelationKind::Definition && r.range == range("def")) {
             found_definition = true;
         }
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Reference) &&
-           r.range == range("use")) {
+        if(r.kind == RelationKind::Reference && r.range == range("use")) {
             found_reference = true;
         }
     }
@@ -656,7 +649,7 @@ TEST_CASE(ModuleName) {
 
     bool found_definition = false;
     for(auto& r: it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Definition)) {
+        if(r.kind == RelationKind::Definition) {
             found_definition = true;
         }
     }
@@ -677,7 +670,7 @@ TEST_CASE(ModulePartitionName) {
 
     bool found_definition = false;
     for(auto& r: it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Definition)) {
+        if(r.kind == RelationKind::Definition) {
             found_definition = true;
         }
     }
@@ -707,10 +700,10 @@ module §(m)⟦§(m)foo⟧;
 
     bool found_reference = false;
     for(auto& r: it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Definition)) {
+        if(r.kind == RelationKind::Definition) {
             ASSERT_TRUE(false);
         }
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Reference)) {
+        if(r.kind == RelationKind::Reference) {
             found_reference = true;
         }
     }
@@ -738,9 +731,9 @@ TEST_CASE(OverrideRelation) {
     auto check_relations = [&](index::FileIndex& idx) {
         for(auto& [hash, rels]: idx.relations) {
             for(auto& r: rels) {
-                if(r.kind.value() == RelationKind::Interface)
+                if(r.kind == RelationKind::Interface)
                     found_interface = true;
-                if(r.kind.value() == RelationKind::Implementation)
+                if(r.kind == RelationKind::Implementation)
                     found_implementation = true;
             }
         }
@@ -775,10 +768,10 @@ TEST_CASE(DeclarationAndDefinition) {
     bool found_decl = false;
     bool found_def = false;
     for(auto& r: it->second) {
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Declaration)) {
+        if(r.kind == RelationKind::Declaration) {
             found_decl = true;
         }
-        if(r.kind.value() == static_cast<std::uint32_t>(RelationKind::Definition)) {
+        if(r.kind == RelationKind::Definition) {
             found_def = true;
         }
     }
@@ -1190,6 +1183,214 @@ TEST_CASE(SuperQualifierRef) {
     tu_index = index::TUIndex::build(*unit);
 
     GO_TO_DEFINITION("use", "def");
+}
+
+TEST_CASE(SerializeRoundTrip) {
+    add_file("header.h", R"(
+            #pragma once
+            inline int §(hdr)helper() { return 1; }
+        )");
+    add_main("main.cpp", R"(
+            #include "header.h"
+            int main() { return §(use)helper(); }
+        )");
+    ASSERT_TRUE(compile());
+    tu_index = index::TUIndex::build(*unit);
+    ASSERT_FALSE(tu_index.file_indices.empty());
+
+    llvm::SmallString<4096> buf;
+    llvm::raw_svector_ostream os(buf);
+    tu_index.serialize(os);
+
+    auto loaded = index::TUIndex::from(buf);
+    ASSERT_TRUE(loaded.has_value());
+
+    ASSERT_EQ(loaded->built_at.count(), tu_index.built_at.count());
+    ASSERT_TRUE(loaded->graph.paths == tu_index.graph.paths);
+    ASSERT_TRUE(loaded->graph.locations == tu_index.graph.locations);
+    ASSERT_TRUE(loaded->graph.path_hashes == tu_index.graph.path_hashes);
+
+    // The persisted per-file rows are keyed by path id; recompute the
+    // expected conversion from the build-time FileID-keyed state.
+    llvm::DenseMap<std::uint32_t, std::pair<std::size_t, std::size_t>> expected;
+    for(auto& [fid, file_index]: tu_index.file_indices) {
+        expected[tu_index.graph.path_id(fid)] = {file_index.occurrences.size(),
+                                                 file_index.relations.size()};
+    }
+    ASSERT_FALSE(expected.empty());
+    ASSERT_EQ(loaded->path_file_indices.size(), expected.size());
+    for(auto& [path_id, counts]: expected) {
+        auto it = loaded->path_file_indices.find(path_id);
+        ASSERT_TRUE(it != loaded->path_file_indices.end());
+        ASSERT_EQ(it->second.occurrences.size(), counts.first);
+        ASSERT_EQ(it->second.relations.size(), counts.second);
+    }
+
+    ASSERT_TRUE(loaded->main_file_index.occurrences == tu_index.main_file_index.occurrences);
+    ASSERT_EQ(loaded->main_file_index.relations.size(), tu_index.main_file_index.relations.size());
+
+    ASSERT_EQ(loaded->symbols.size(), tu_index.symbols.size());
+    for(auto& [hash, symbol]: tu_index.symbols) {
+        auto it = loaded->symbols.find(hash);
+        ASSERT_TRUE(it != loaded->symbols.end());
+        ASSERT_EQ(it->second.name, symbol.name);
+        ASSERT_EQ(it->second.kind.value(), symbol.kind.value());
+        ASSERT_EQ(static_cast<int>(it->second.scope), static_cast<int>(symbol.scope));
+        ASSERT_TRUE(it->second.reference_files == symbol.reference_files);
+    }
+}
+
+TEST_CASE(FromRejectsHostileInput) {
+    ASSERT_FALSE(index::TUIndex::from("not a flatbuffer at all").has_value());
+
+    build_index(R"(
+            int foo() { return 42; }
+        )");
+
+    llvm::SmallString<4096> buf;
+    llvm::raw_svector_ostream os(buf);
+    tu_index.serialize(os);
+
+    // Sanity: the intact blob loads, so the rejections below are earned.
+    ASSERT_TRUE(index::TUIndex::from(buf).has_value());
+
+    ASSERT_FALSE(index::TUIndex::from(llvm::StringRef(buf.data(), buf.size() / 2)).has_value());
+
+    // Bytes 4-7 carry the buffer identifier; a blob from another format
+    // must be rejected up front.
+    ASSERT_TRUE(buf.size() > 8);
+    std::string clobbered(buf.data(), buf.size());
+    for(std::size_t i = 4; i < 8; ++i) {
+        clobbered[i] = 'X';
+    }
+    ASSERT_FALSE(index::TUIndex::from(clobbered).has_value());
+}
+
+TEST_CASE(FromRejectsStaleFormatVersion) {
+    // Only the version slot is written: every other field reads back
+    // absent, which is structurally valid — the verdict must hinge on the
+    // value. Field order MUST mirror TUIndex (tu_index.h): format_version
+    // is slot 0.
+    struct VersionOnly {
+        std::uint32_t format_version = 0;
+    };
+
+    auto bytes_of = [](const std::vector<std::uint8_t>& blob) {
+        return llvm::StringRef(reinterpret_cast<const char*>(blob.data()), blob.size());
+    };
+
+    auto stale = kota::codec::fbs::to_bytes(VersionOnly{index::index_format_version + 1});
+    ASSERT_TRUE(stale.has_value());
+    ASSERT_FALSE(index::TUIndex::from(bytes_of(*stale)).has_value());
+
+    // Positive control: the same shape carrying the current version loads,
+    // so the rejection above comes from the value, not the blob's shape.
+    auto current = kota::codec::fbs::to_bytes(VersionOnly{index::index_format_version});
+    ASSERT_TRUE(current.has_value());
+    ASSERT_TRUE(index::TUIndex::from(bytes_of(*current)).has_value());
+}
+
+TEST_CASE(FromRejectsOutOfRangePathIds) {
+    // Structural verification does not constrain field values, and the
+    // merge pipeline dereferences every decoded path id against the path
+    // table without further checks (Indexer::merge indexes paths and
+    // path_hashes, ProjectIndex::merge indexes file_ids_map with
+    // reference_files values) — a blob pointing outside its own table must
+    // be rejected as a whole.
+    auto serialized = [](index::TUIndex& index) {
+        std::string buf;
+        llvm::raw_string_ostream os(buf);
+        index.serialize(os);
+        return buf;
+    };
+
+    // Positive control first: the same shapes with in-range ids load, so
+    // the rejections below come from the hostile values.
+    index::TUIndex honest;
+    honest.built_at = std::chrono::milliseconds(0);
+    honest.graph.paths = {"/proj/main.cpp"};
+    honest.graph.locations.push_back({.path_id = 0, .line = 1, .include = 0});
+    honest.path_file_indices.try_emplace(0);
+    honest.symbols[42].reference_files.add(0);
+    ASSERT_TRUE(index::TUIndex::from(serialized(honest)).has_value());
+
+    {
+        index::TUIndex hostile;
+        hostile.built_at = std::chrono::milliseconds(0);
+        hostile.graph.paths = {"/proj/main.cpp"};
+        hostile.graph.locations.push_back({.path_id = 7, .line = 1, .include = 0});
+        ASSERT_FALSE(index::TUIndex::from(serialized(hostile)).has_value());
+    }
+    {
+        index::TUIndex hostile;
+        hostile.built_at = std::chrono::milliseconds(0);
+        hostile.graph.paths = {"/proj/main.cpp"};
+        hostile.path_file_indices.try_emplace(7);  // Only path id 0 exists.
+        ASSERT_FALSE(index::TUIndex::from(serialized(hostile)).has_value());
+    }
+    {
+        index::TUIndex hostile;
+        hostile.built_at = std::chrono::milliseconds(0);
+        hostile.graph.paths = {"/proj/main.cpp"};
+        hostile.symbols[42].reference_files.add(7);
+        ASSERT_FALSE(index::TUIndex::from(serialized(hostile)).has_value());
+    }
+}
+
+TEST_CASE(FromNormalizesPathHashes) {
+    build_index(R"(
+            int foo() { return 42; }
+        )");
+    ASSERT_FALSE(tu_index.graph.paths.empty());
+
+    // A blob without path hashes (structurally valid: the field reads back
+    // empty) must come back resized to the path table, all "unavailable".
+    tu_index.graph.path_hashes.clear();
+    llvm::SmallString<4096> buf;
+    llvm::raw_svector_ostream os(buf);
+    tu_index.serialize(os);
+
+    auto loaded = index::TUIndex::from(buf);
+    ASSERT_TRUE(loaded.has_value());
+    ASSERT_EQ(loaded->graph.path_hashes.size(), loaded->graph.paths.size());
+    for(auto hash: loaded->graph.path_hashes) {
+        ASSERT_EQ(hash, 0u);
+    }
+}
+
+TEST_CASE(ReserializeKeepsPathIndices) {
+    add_file("header.h", R"(
+            #pragma once
+            inline int helper() { return 1; }
+        )");
+    add_main("main.cpp", R"(
+            #include "header.h"
+            int main() { return helper(); }
+        )");
+    ASSERT_TRUE(compile());
+    tu_index = index::TUIndex::build(*unit);
+
+    llvm::SmallString<4096> buf;
+    llvm::raw_svector_ostream os(buf);
+    tu_index.serialize(os);
+
+    auto loaded = index::TUIndex::from(buf);
+    ASSERT_TRUE(loaded.has_value());
+    ASSERT_TRUE(loaded->file_indices.empty());
+    ASSERT_FALSE(loaded->path_file_indices.empty());
+
+    // A deserialized index has no FileID-keyed state; re-serializing must
+    // keep the path-keyed rows instead of wiping them from an empty map.
+    llvm::SmallString<4096> again;
+    llvm::raw_svector_ostream os2(again);
+    loaded->serialize(os2);
+
+    auto reloaded = index::TUIndex::from(again);
+    ASSERT_TRUE(reloaded.has_value());
+    ASSERT_EQ(reloaded->path_file_indices.size(), loaded->path_file_indices.size());
+    for(auto& [path_id, file_index]: loaded->path_file_indices) {
+        ASSERT_TRUE(reloaded->path_file_indices.contains(path_id));
+    }
 }
 
 };  // TEST_SUITE(tu_index)

@@ -1,5 +1,6 @@
 #include "test/test.h"
 #include "index/project_index.h"
+#include "index/serialization.h"
 
 #include "llvm/Support/raw_ostream.h"
 
@@ -29,7 +30,7 @@ TEST_CASE(SerializeCollectsGarbage) {
 
     clice::PathPool fresh;
     llvm::SmallVector<std::uint32_t> shards;
-    auto loaded = index::ProjectIndex::from(buf.data(), buf.size(), fresh, shards);
+    auto loaded = index::ProjectIndex::from(buf.str(), fresh, shards);
     ASSERT_TRUE(loaded.has_value());
     ASSERT_TRUE(fresh.find("/proj/used.cpp").has_value());
     ASSERT_FALSE(fresh.find("/proj/garbage.cpp").has_value());
@@ -48,7 +49,7 @@ TEST_CASE(RemapAcrossSessions) {
     clice::PathPool fresh;
     fresh.intern("/proj/opened-first.cpp");
     llvm::SmallVector<std::uint32_t> shards;
-    auto loaded = index::ProjectIndex::from(buf.data(), buf.size(), fresh, shards);
+    auto loaded = index::ProjectIndex::from(buf.str(), fresh, shards);
     ASSERT_TRUE(loaded.has_value());
 
     auto id = fresh.find("/proj/used.cpp");
@@ -67,7 +68,7 @@ TEST_CASE(ShardManifestRoundTrip) {
 
     clice::PathPool fresh;
     llvm::SmallVector<std::uint32_t> shards;
-    auto loaded = index::ProjectIndex::from(buf.data(), buf.size(), fresh, shards);
+    auto loaded = index::ProjectIndex::from(buf.str(), fresh, shards);
     ASSERT_TRUE(loaded.has_value());
     ASSERT_EQ(shards.size(), 1u);
     ASSERT_EQ(fresh.resolve(shards.front()), "/proj/tu.cpp");
@@ -78,7 +79,70 @@ TEST_CASE(OldBlobDiscarded) {
     llvm::SmallVector<std::uint32_t> shards;
     // Arbitrary bytes are rejected by verification, not misread.
     const char junk[] = "not a flatbuffer";
-    ASSERT_FALSE(index::ProjectIndex::from(junk, sizeof(junk), pool, shards).has_value());
+    ASSERT_FALSE(
+        index::ProjectIndex::from(llvm::StringRef(junk, sizeof(junk)), pool, shards).has_value());
+}
+
+llvm::StringRef bytes_of(const std::vector<std::uint8_t>& blob) {
+    return llvm::StringRef(reinterpret_cast<const char*>(blob.data()), blob.size());
+}
+
+TEST_CASE(VersionGate) {
+    // Only the version slot is written: every other field reads back absent,
+    // which is structurally valid — the verdict must hinge on the value.
+    struct VersionOnly {
+        std::uint32_t format_version = 0;
+    };
+
+    clice::PathPool pool;
+    llvm::SmallVector<std::uint32_t> shards;
+
+    auto stale = kota::codec::fbs::to_bytes(VersionOnly{});
+    ASSERT_TRUE(stale.has_value());
+    ASSERT_FALSE(index::ProjectIndex::from(bytes_of(*stale), pool, shards).has_value());
+
+    auto current = kota::codec::fbs::to_bytes(VersionOnly{index::index_format_version});
+    ASSERT_TRUE(current.has_value());
+    auto loaded = index::ProjectIndex::from(bytes_of(*current), pool, shards);
+    ASSERT_TRUE(loaded.has_value());
+    ASSERT_TRUE(loaded->symbols.empty());
+    ASSERT_TRUE(shards.empty());
+}
+
+TEST_CASE(OutOfRangeLocalIdsDropped) {
+    // Field order MUST mirror ProjectIndex (project_index.h):
+    // format_version, paths, symbols, shards.
+    struct ProjectIndexMirror {
+        std::uint32_t format_version = 0;
+        std::vector<std::pair<std::uint32_t, std::string>> paths;
+        index::SymbolTable symbols;
+        std::vector<std::uint32_t> shards;
+    };
+
+    ProjectIndexMirror mirror;
+    mirror.format_version = index::index_format_version;
+    mirror.paths = {
+        {0, "/proj/used.cpp"}
+    };
+    auto& symbol = mirror.symbols[42];
+    symbol.name = "sym";
+    symbol.reference_files.add(7);  // Only pool id 0 is in the table.
+    mirror.shards = {9};
+
+    auto blob = kota::codec::fbs::to_bytes(mirror);
+    ASSERT_TRUE(blob.has_value());
+
+    // Dangling local ids are dropped, not misresolved into the pool: the
+    // blob still loads, the symbol survives with an empty bitmap, and no
+    // shard is fetched.
+    clice::PathPool pool;
+    llvm::SmallVector<std::uint32_t> shards;
+    auto loaded = index::ProjectIndex::from(bytes_of(*blob), pool, shards);
+    ASSERT_TRUE(loaded.has_value());
+    ASSERT_TRUE(loaded->symbols.contains(42));
+    ASSERT_EQ(loaded->symbols[42].name, "sym");
+    ASSERT_EQ(loaded->symbols[42].reference_files.cardinality(), 0u);
+    ASSERT_TRUE(shards.empty());
 }
 
 };  // TEST_SUITE(PersistedIndex)

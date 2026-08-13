@@ -1,6 +1,6 @@
 #include "index/preamble_state.h"
 
-#include <algorithm>
+#include <span>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -9,59 +9,74 @@
 #include "index/serialization.h"
 
 #include "kota/ipc/lsp/text.h"
-#include "llvm/ADT/SmallVector.h"
 
 namespace clice::index {
 
 namespace {
 
-/// Serialize one FileIndex into a PreambleFileEntry, with relations sorted
-/// by symbol hash so the read path can binary-search them.
-fbs::Offset<binary::PreambleFileEntry> serialize_entry(fbs::FlatBufferBuilder& builder,
-                                                       std::uint32_t path_id,
-                                                       const FileIndex& index,
-                                                       llvm::StringRef content,
-                                                       llvm::ArrayRef<std::uint32_t> line_starts) {
-    auto occs = CreateStructVector<binary::Occurrence>(builder, index.occurrences);
+/// One file covered by the preamble compilation: its rows plus content and
+/// line starts for position mapping. The rows are moved out of the TUIndex
+/// and the content borrows the compilation's buffers — entries are only
+/// ever encoded, never decoded (queries run on the zero-copy view).
+struct PreambleFileEntry {
+    std::uint32_t path_id = 0;
+    FileIndex index;
+    llvm::StringRef content;
+    std::vector<std::uint32_t> line_starts;
+};
 
-    llvm::SmallVector<std::pair<SymbolHash, const std::vector<Relation>*>, 0> sorted;
-    sorted.reserve(index.relations.size());
-    for(auto& [symbol_id, relations]: index.relations) {
-        sorted.emplace_back(symbol_id, &relations);
-    }
-    std::ranges::sort(sorted, {}, [](const auto& entry) { return entry.first; });
+/// find_symbol serves only name and kind, so the blob stores this reduced
+/// entry instead of the full Symbol — reflecting that would drag every
+/// symbol's scope and reference bitmap into large SDK preamble blobs for
+/// nothing. The name borrows the consumed TUIndex (encode-only, like
+/// PreambleFileEntry).
+struct PreambleSymbol {
+    llvm::StringRef name;
+    SymbolKind kind;
+};
 
-    auto rels = transform(sorted, [&](const auto& entry) {
-        return binary::CreateTUFileRelationsEntry(
-            builder,
-            entry.first,
-            CreateStructVector<binary::Relation>(builder, *entry.second));
-    });
+/// The persisted shape of a `.pch.idx` blob. Queries run on a zero-copy
+/// view of this layout; nothing is deserialized up front.
+struct PreambleBlob {
+    std::uint32_t format_version = 0;
+    std::vector<std::string> paths;
+    std::vector<PreambleFileEntry> files;
+    PreambleFileEntry preamble;
+    llvm::DenseMap<SymbolHash, PreambleSymbol> symbols;
+    llvm::ArrayRef<feature::DocumentLink> links;
+    llvm::ArrayRef<std::uint32_t> inactive_regions;
+    llvm::ArrayRef<std::uint8_t> open_conditionals;
+};
 
-    return binary::CreatePreambleFileEntry(
-        builder,
-        path_id,
-        occs,
-        CreateVector(builder, rels),
-        content.empty() ? 0 : CreateString(builder, content),
-        line_starts.empty() ? 0 : CreateVector(builder, line_starts));
+using StateView = kota::codec::fbs::table_view<PreambleBlob>;
+using FileEntryView = kota::codec::fbs::table_view<PreambleFileEntry>;
+
+/// The blob was fully verified at load(); per-query views skip that cost.
+StateView root_of(const llvm::MemoryBuffer& buffer) {
+    return StateView::from_verified_bytes(blob_bytes(buffer.getBuffer()));
+}
+
+PreambleState::File file_of(kota::codec::fbs::array_view<std::string> paths, FileEntryView entry) {
+    auto line_starts = to_array_ref(entry[&PreambleFileEntry::line_starts]);
+    return PreambleState::File{
+        .path = to_ref(paths[entry[&PreambleFileEntry::path_id]]),
+        .content = to_ref(entry[&PreambleFileEntry::content]),
+        .line_starts = std::span(line_starts.data(), line_starts.size()),
+    };
 }
 
 }  // namespace
 
 void PreambleState::serialize(CompilationUnitRef unit,
-                              const TUIndex& index,
+                              TUIndex index,
                               llvm::ArrayRef<feature::DocumentLink> links,
                               llvm::ArrayRef<std::uint32_t> inactive_regions,
                               llvm::ArrayRef<std::uint8_t> open_conditionals,
                               llvm::raw_ostream& os) {
-    fbs::FlatBufferBuilder builder(4096);
+    PreambleBlob blob;
+    blob.format_version = preamble_format_version;
 
-    auto paths =
-        transform(index.graph.paths, [&](const std::string& p) { return builder.CreateString(p); });
-
-    Offsets<binary::PreambleFileEntry> files;
-    files.reserve(index.file_indices.size());
+    blob.files.reserve(index.file_indices.size());
     for(auto& [fid, file_index]: index.file_indices) {
         // A file with no include edge is a synthetic buffer (predefines,
         // <command line>): it has no real path to attribute rows to, and
@@ -73,10 +88,13 @@ void PreambleState::serialize(CompilationUnitRef unit,
             continue;
         }
         auto content = unit.file_content(fid);
-        auto line_starts =
-            kota::ipc::lsp::build_line_starts(std::string_view(content.data(), content.size()));
-        files.push_back(
-            serialize_entry(builder, index.graph.path_id(fid), file_index, content, line_starts));
+        blob.files.push_back({
+            .path_id = index.graph.path_id(fid),
+            .index = std::move(file_index),
+            .content = content,
+            .line_starts =
+                kota::ipc::lsp::build_line_starts(std::string_view(content.data(), content.size())),
+        });
     }
 
     // The source file is the last path in graph.paths (convention from
@@ -85,46 +103,24 @@ void PreambleState::serialize(CompilationUnitRef unit,
     // PCH was built from — stored so consumers can compare it against the
     // live buffer's prefix before serving these rows.
     auto preamble_text = unit.interested_content();
-    auto preamble_starts = kota::ipc::lsp::build_line_starts(
-        std::string_view(preamble_text.data(), preamble_text.size()));
-    auto preamble_entry = serialize_entry(builder,
-                                          static_cast<std::uint32_t>(index.graph.paths.size() - 1),
-                                          index.main_file_index,
-                                          preamble_text,
-                                          preamble_starts);
+    blob.preamble = {
+        .path_id = static_cast<std::uint32_t>(index.graph.paths.size() - 1),
+        .index = std::move(index.main_file_index),
+        .content = preamble_text,
+        .line_starts = kota::ipc::lsp::build_line_starts(
+            std::string_view(preamble_text.data(), preamble_text.size())),
+    };
 
-    llvm::SmallVector<std::pair<SymbolHash, const Symbol*>, 0> sorted_symbols;
-    sorted_symbols.reserve(index.symbols.size());
-    for(auto& [symbol_id, symbol]: index.symbols) {
-        sorted_symbols.emplace_back(symbol_id, &symbol);
+    blob.symbols.reserve(index.symbols.size());
+    for(const auto& [hash, symbol]: index.symbols) {
+        blob.symbols.try_emplace(hash, PreambleSymbol{.name = symbol.name, .kind = symbol.kind});
     }
-    std::ranges::sort(sorted_symbols, {}, [](const auto& entry) { return entry.first; });
+    blob.paths = std::move(index.graph.paths);
+    blob.links = links;
+    blob.inactive_regions = inactive_regions;
+    blob.open_conditionals = open_conditionals;
 
-    auto syms = transform(sorted_symbols, [&](const auto& entry) {
-        return binary::CreatePreambleSymbolEntry(builder,
-                                                 entry.first,
-                                                 CreateString(builder, entry.second->name),
-                                                 entry.second->kind.value());
-    });
-
-    auto link_entries = transform(links, [&](const feature::DocumentLink& link) {
-        binary::Range range(link.range.begin, link.range.end);
-        return binary::CreatePreambleDocumentLink(builder,
-                                                  &range,
-                                                  CreateString(builder, link.target));
-    });
-
-    auto root = binary::CreatePreambleState(builder,
-                                            preamble_format_version,
-                                            CreateVector(builder, paths),
-                                            CreateVector(builder, files),
-                                            preamble_entry,
-                                            CreateVector(builder, syms),
-                                            CreateVector(builder, link_entries),
-                                            CreateVector(builder, inactive_regions),
-                                            CreateVector(builder, open_conditionals));
-    builder.Finish(root);
-    os.write(safe_cast<const char>(builder.GetBufferPointer()), builder.GetSize());
+    serialize_blob(blob, os);
 }
 
 PreambleState::PreambleState(std::unique_ptr<llvm::MemoryBuffer> buffer) :
@@ -136,23 +132,13 @@ std::shared_ptr<PreambleState> PreambleState::load(llvm::StringRef path) {
         return nullptr;
     }
 
-    // A stale or truncated blob must never crash the server. Verify it is
-    // a structurally valid flatbuffer, then discard any blob whose format
-    // version differs (version-less blobs read back 0). The table budget
-    // is far above the default: a large preamble's symbol table alone can
-    // exceed a million entries, and a verification failure here would
-    // otherwise send every compile into a rebuild loop.
-    auto data = reinterpret_cast<const std::uint8_t*>((*buffer)->getBufferStart());
-    fbs::Verifier verifier(data,
-                           (*buffer)->getBufferSize(),
-                           /*max_depth=*/64,
-                           /*max_tables=*/1u << 26);
-    if(!verifier.VerifyBuffer<binary::PreambleState>(nullptr)) {
-        return nullptr;
-    }
-
-    auto root = fbs::GetRoot<binary::PreambleState>((*buffer)->getBufferStart());
-    if(root->format_version() != preamble_format_version) {
+    // A stale or truncated blob must never crash the server. from_bytes
+    // deep-verifies every offset, string, vector and table the views can
+    // reach — queries then run unchecked (root_of). Blobs of a different
+    // format version load as "missing" (version-less blobs read back 0)
+    // and the PCH pair is rebuilt.
+    auto root = StateView::from_bytes(blob_bytes((*buffer)->getBuffer()));
+    if(!root.valid() || root[&PreambleBlob::format_version] != preamble_format_version) {
         return nullptr;
     }
 
@@ -162,40 +148,30 @@ std::shared_ptr<PreambleState> PreambleState::load(llvm::StringRef path) {
 void PreambleState::lookup(SymbolHash symbol,
                            RelationKind kind,
                            llvm::function_ref<bool(const File&, const Relation&)> callback) const {
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    auto paths = root->paths();
+    auto root = root_of(*buffer);
+    auto paths = root[&PreambleBlob::paths];
+    auto files = root[&PreambleBlob::files];
 
-    for(auto entry: *root->files()) {
-        auto rels = entry->relations();
-        if(!rels) {
-            continue;
-        }
-
-        auto it = std::ranges::lower_bound(*rels, symbol, {}, [](auto e) { return e->symbol(); });
-        if(it == rels->end() || it->symbol() != symbol || !it->relations()) {
+    for(std::size_t i = 0; i < files.size(); ++i) {
+        auto entry = files[i];
+        auto relations = entry[&PreambleFileEntry::index][&FileIndex::relations];
+        auto found = relations.find(symbol);
+        if(!found) {
             continue;
         }
 
         // The verifier checks structure, not cross-references: a corrupt
-        // path_id would index out of bounds on the mapped file.
-        if(entry->path_id() >= paths->size()) {
+        // path_id must not attribute rows to an arbitrary path.
+        if(entry[&PreambleFileEntry::path_id] >= paths.size()) {
             continue;
         }
-        auto path = paths->Get(entry->path_id());
-        File file{
-            .path = llvm::StringRef(path->c_str(), path->size()),
-            .content = entry->content()
-                           ? llvm::StringRef(entry->content()->c_str(), entry->content()->size())
-                           : llvm::StringRef(),
-            .line_starts = entry->line_starts() ? std::span(entry->line_starts()->data(),
-                                                            entry->line_starts()->size())
-                                                : std::span<const std::uint32_t>(),
-        };
+        auto file = file_of(paths, entry);
 
-        for(auto rel: *it->relations()) {
-            auto r = safe_cast<Relation>(rel);
-            if(r->kind & kind) {
-                if(!callback(file, *r)) {
+        auto rels = found->get<1>();
+        for(std::size_t j = 0; j < rels.size(); ++j) {
+            Relation relation = rels[j];
+            if(RelationKind(relation.kind) & kind) {
+                if(!callback(file, relation)) {
                     return;
                 }
             }
@@ -204,68 +180,49 @@ void PreambleState::lookup(SymbolHash symbol,
 }
 
 llvm::StringRef PreambleState::source_path() const {
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    auto paths = root->paths();
-    if(paths->size() == 0) {
+    auto root = root_of(*buffer);
+    auto paths = root[&PreambleBlob::paths];
+    if(paths.empty()) {
         return {};
     }
     // The source file is the last path, by IncludeGraph convention.
-    auto path = paths->Get(paths->size() - 1);
-    return llvm::StringRef(path->c_str(), path->size());
+    return to_ref(paths[paths.size() - 1]);
 }
 
 llvm::StringRef PreambleState::preamble_content() const {
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    auto preamble = root->preamble();
-    if(!preamble || !preamble->content()) {
-        return {};
-    }
-    return llvm::StringRef(preamble->content()->c_str(), preamble->content()->size());
+    auto root = root_of(*buffer);
+    return to_ref(root[&PreambleBlob::preamble][&PreambleFileEntry::content]);
 }
 
 void PreambleState::lookup_preamble(std::uint32_t offset,
                                     llvm::function_ref<bool(const Occurrence&)> callback) const {
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    auto preamble = root->preamble();
-    if(!preamble || !preamble->occurrences()) {
-        return;
-    }
+    auto root = root_of(*buffer);
+    auto occurrences =
+        root[&PreambleBlob::preamble][&PreambleFileEntry::index][&FileIndex::occurrences];
 
-    auto& occurrences = *preamble->occurrences();
-    auto it =
-        std::ranges::lower_bound(occurrences, offset, {}, [](auto o) { return o->range().end(); });
-
-    while(it != occurrences.end()) {
-        auto o = safe_cast<Occurrence>(*it);
-        if(!o->range.contains(offset)) {
-            break;
-        }
-        if(!callback(*o)) {
-            break;
-        }
-        ++it;
-    }
+    scan_occurrences_at(
+        occurrences.size(),
+        offset,
+        [&](std::size_t i) { return occurrences[i]; },
+        callback);
 }
 
 void PreambleState::lookup_preamble(SymbolHash symbol,
                                     RelationKind kind,
                                     llvm::function_ref<bool(const Relation&)> callback) const {
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    auto preamble = root->preamble();
-    if(!preamble || !preamble->relations()) {
+    auto root = root_of(*buffer);
+    auto relations =
+        root[&PreambleBlob::preamble][&PreambleFileEntry::index][&FileIndex::relations];
+    auto found = relations.find(symbol);
+    if(!found) {
         return;
     }
 
-    auto& rels = *preamble->relations();
-    auto it = std::ranges::lower_bound(rels, symbol, {}, [](auto e) { return e->symbol(); });
-    if(it == rels.end() || it->symbol() != symbol || !it->relations()) {
-        return;
-    }
-
-    for(auto rel: *it->relations()) {
-        auto r = safe_cast<Relation>(rel);
-        if(r->kind & kind) {
-            if(!callback(*r)) {
+    auto rels = found->get<1>();
+    for(std::size_t i = 0; i < rels.size(); ++i) {
+        Relation relation = rels[i];
+        if(RelationKind(relation.kind) & kind) {
+            if(!callback(relation)) {
                 return;
             }
         }
@@ -273,54 +230,42 @@ void PreambleState::lookup_preamble(SymbolHash symbol,
 }
 
 bool PreambleState::find_symbol(SymbolHash hash, std::string& name, SymbolKind& kind) const {
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    auto& syms = *root->symbols();
-
-    auto it = std::ranges::lower_bound(syms, hash, {}, [](auto e) { return e->symbol_id(); });
-    if(it == syms.end() || it->symbol_id() != hash) {
+    auto root = root_of(*buffer);
+    auto found = root[&PreambleBlob::symbols].find(hash);
+    if(!found) {
         return false;
     }
 
-    name = it->name() ? it->name()->str() : std::string();
-    kind = SymbolKind(static_cast<std::uint8_t>(it->kind()));
+    auto symbol = found->get<1>();
+    name = std::string(symbol[&PreambleSymbol::name]);
+    kind = SymbolKind(symbol[&PreambleSymbol::kind]);
     return true;
 }
 
 std::vector<feature::DocumentLink> PreambleState::links() const {
+    auto root = root_of(*buffer);
+    auto entries = root[&PreambleBlob::links];
+
     std::vector<feature::DocumentLink> links;
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    if(auto ls = root->links()) {
-        links.reserve(ls->size());
-        for(auto entry: *ls) {
-            feature::DocumentLink link;
-            if(auto range = entry->range()) {
-                link.range = *safe_cast<Range>(range);
-            }
-            if(auto target = entry->target()) {
-                link.target = target->str();
-            }
-            links.push_back(std::move(link));
-        }
+    links.reserve(entries.size());
+    for(std::size_t i = 0; i < entries.size(); ++i) {
+        auto entry = entries[i];
+        links.push_back(feature::DocumentLink{
+            .range = entry[&feature::DocumentLink::range],
+            .target = std::string(entry[&feature::DocumentLink::target]),
+        });
     }
     return links;
 }
 
 llvm::ArrayRef<std::uint32_t> PreambleState::inactive_regions() const {
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    auto regions = root->inactive_regions();
-    if(!regions) {
-        return {};
-    }
-    return llvm::ArrayRef(regions->data(), regions->size());
+    auto root = root_of(*buffer);
+    return to_array_ref(root[&PreambleBlob::inactive_regions]);
 }
 
 llvm::ArrayRef<std::uint8_t> PreambleState::open_conditionals() const {
-    auto root = fbs::GetRoot<binary::PreambleState>(buffer->getBufferStart());
-    auto conditionals = root->open_conditionals();
-    if(!conditionals) {
-        return {};
-    }
-    return llvm::ArrayRef(conditionals->data(), conditionals->size());
+    auto root = root_of(*buffer);
+    return to_array_ref(root[&PreambleBlob::open_conditionals]);
 }
 
 }  // namespace clice::index
