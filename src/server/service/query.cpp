@@ -16,10 +16,13 @@
 #include "server/state/session.h"
 #include "server/state/session_store.h"
 #include "support/filesystem.h"
+#include "support/logging.h"
+#include "support/timer.h"
 
 #include "kota/ipc/lsp/position.h"
 #include "kota/ipc/lsp/protocol.h"
 #include "kota/ipc/lsp/uri.h"
+#include "kota/meta/enum.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Path.h"
@@ -279,9 +282,18 @@ std::vector<protocol::Location> IndexQuery::query_relations(llvm::StringRef path
                                                             const protocol::Position& position,
                                                             RelationKind kind,
                                                             Session* session) {
+    ScopedTimer timer;
     auto hit = resolve_cursor(path, position, session);
-    if(hit.hash == 0)
+    if(hit.hash == 0) {
+        // Misses (whitespace, comments, unindexed positions) are normal
+        // inputs; their latency belongs in the series like any hit's.
+        LOG_PERF("index_query",
+                 "kind=relations rel={} path={} results=0 elapsed_ms={:.2f}",
+                 kota::meta::enum_name(static_cast<RelationKind::Kind>(kind), "Invalid"),
+                 path,
+                 timer.ms_f());
         return {};
+    }
 
     std::vector<protocol::Location> locations;
 
@@ -358,6 +370,12 @@ std::vector<protocol::Location> IndexQuery::query_relations(llvm::StringRef path
         });
 
     dedup_locations(locations);
+    LOG_PERF("index_query",
+             "kind=relations rel={} path={} results={} elapsed_ms={:.2f}",
+             kota::meta::enum_name(static_cast<RelationKind::Kind>(kind), "Invalid"),
+             path,
+             locations.size(),
+             timer.ms_f());
     return locations;
 }
 
@@ -800,6 +818,7 @@ std::vector<protocol::TypeHierarchyItem> IndexQuery::find_subtypes(index::Symbol
 
 std::vector<protocol::SymbolInformation> IndexQuery::search_symbols(llvm::StringRef query,
                                                                     std::size_t max_results) {
+    ScopedTimer timer;
     std::string query_lower = query.lower();
 
     auto is_indexable_kind = [](SymbolKind sk) {
@@ -866,6 +885,14 @@ std::vector<protocol::SymbolInformation> IndexQuery::search_symbols(llvm::String
         }
         return true;
     });
+    // The query is arbitrary LSP input; its length is logged instead of its
+    // text, which could contain newlines or `key=` fragments and corrupt
+    // the key/value record.
+    LOG_PERF("index_query",
+             "kind=search query_len={} results={} elapsed_ms={:.2f}",
+             query.size(),
+             results.size(),
+             timer.ms_f());
     return results;
 }
 

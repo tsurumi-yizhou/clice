@@ -1207,7 +1207,7 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
 
         auto version = session->version;
 
-        LOG_PERF("request", "kind=Compile file={} total_ms={}", file_path, timer.ms());
+        LOG_PERF("request", "kind=Compile file={} total_ms={:.2f}", file_path, timer.ms_f());
         // The preamble's share lives with the PCH; the compile result
         // covers the content past the bound. Publish both.
         auto inactive = std::move(pch_inactive);
@@ -1401,7 +1401,7 @@ Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
     if(!co_await ensure_compiled(session)) {
         co_return serde_raw{"null"};
     }
-    auto wait_ms = timer.ms();
+    auto wait_ms = timer.ms_f();
 
     if(session->generation != gen) {
         co_return serde_raw{"null"};
@@ -1472,7 +1472,12 @@ Compiler::RawResult Compiler::forward_query(worker::QueryKind kind,
             publish_recovered(session);
         }
     }
-    LOG_PERF("request", "kind={} file={} wait_ms={} total_ms={}", kind, path, wait_ms, timer.ms());
+    LOG_PERF("request",
+             "kind={} file={} wait_ms={:.2f} total_ms={:.2f}",
+             kind,
+             path,
+             wait_ms,
+             timer.ms_f());
     co_return std::move(result.value());
 }
 
@@ -1490,7 +1495,7 @@ kota::task<std::vector<feature::DocumentLink>, kota::ipc::Error>
     if(session->generation != gen) {
         co_return std::vector<feature::DocumentLink>{};
     }
-    auto wait_ms = timer.ms();
+    auto wait_ms = timer.ms_f();
 
     if(session->quarantine.kind_blocked(document_link_evidence)) {
         co_return kota::outcome_error(
@@ -1534,10 +1539,10 @@ kota::task<std::vector<feature::DocumentLink>, kota::ipc::Error>
         publish_recovered(session);
     }
     LOG_PERF("request",
-             "kind=DocumentLink file={} wait_ms={} total_ms={}",
+             "kind=DocumentLink file={} wait_ms={:.2f} total_ms={:.2f}",
              path,
              wait_ms,
-             timer.ms());
+             timer.ms_f());
     co_return std::move(result.value());
 }
 
@@ -1599,7 +1604,7 @@ Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
         co_return kota::outcome_error(
             kota::ipc::Error{worker::dispatch_errc::worker_unavailable, "Document is quarantined"});
     }
-    auto wait_ms = timer.ms();
+    auto wait_ms = timer.ms_f();
 
     if(session->generation != gen) {
         co_return serde_raw{"null"};
@@ -1646,7 +1651,12 @@ Compiler::RawResult Compiler::forward_build(worker::BuildKind kind,
             publish_recovered(session);
         }
     }
-    LOG_PERF("request", "kind={} file={} wait_ms={} total_ms={}", kind, path, wait_ms, timer.ms());
+    LOG_PERF("request",
+             "kind={} file={} wait_ms={:.2f} total_ms={:.2f}",
+             kind,
+             path,
+             wait_ms,
+             timer.ms_f());
     co_return std::move(result.value().result_json);
 }
 
@@ -1712,7 +1722,7 @@ Compiler::RawResult Compiler::forward_format(std::shared_ptr<Session> session,
             publish_recovered(session);
         }
     }
-    LOG_PERF("request", "kind=Format file={} total_ms={}", path, timer.ms());
+    LOG_PERF("request", "kind=Format file={} total_ms={:.2f}", path, timer.ms_f());
     co_return std::move(result.value().result_json);
 }
 

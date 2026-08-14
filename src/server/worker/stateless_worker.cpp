@@ -41,19 +41,6 @@ struct ScopedNice {
 using kota::ipc::RequestResult;
 using RequestContext = kota::ipc::BincodePeer::RequestContext;
 
-/// Extract error messages from compilation diagnostics.
-static std::string collect_errors(CompilationUnit& unit) {
-    std::string errors;
-    for(auto& diag: unit.diagnostics()) {
-        if(diag.id.level >= DiagnosticLevel::Error) {
-            if(!errors.empty())
-                errors += "; ";
-            errors += diag.message;
-        }
-    }
-    return errors;
-}
-
 /// Serialize the preamble's PreambleState blob (full index + document
 /// links + inactive regions) into a string. Runs while the freshly
 /// parsed AST is still in memory — the only moment the preamble's index
@@ -61,9 +48,13 @@ static std::string collect_errors(CompilationUnit& unit) {
 /// happens separately, after the PCH itself is flushed.
 static std::string serialize_preamble_state(CompilationUnit& unit, std::uint32_t preamble_bound) {
     auto tu_index = index::TUIndex::build(unit);
+
+    ScopedTimer links_timer;
     auto links = feature::document_links(unit);
     auto inactive = feature::inactive_regions(unit, {}, 0, preamble_bound);
+    auto links_ms = links_timer.ms_f();
 
+    ScopedTimer blob_timer;
     std::string blob;
     llvm::raw_string_ostream os(blob);
     index::PreambleState::serialize(unit,
@@ -72,6 +63,11 @@ static std::string serialize_preamble_state(CompilationUnit& unit, std::uint32_t
                                     inactive.regions,
                                     inactive.open_stack,
                                     os);
+    LOG_PERF("index_detail",
+             "op=preamble links_ms={:.2f} blob_ms={:.2f} bytes={}",
+             links_ms,
+             blob_timer.ms_f(),
+             blob.size());
     return blob;
 }
 
@@ -127,7 +123,9 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params,
     cp.output_file = tmp_path;
 
     PCHInfo pch_info;
+    ScopedTimer compile_timer;
     auto unit = compile(cp, pch_info);
+    auto compile_ms = compile_timer.ms();
     // A cancelled parse reports !completed(); the extra check catches a
     // cancellation landing between the parse and the serialization, whose
     // blob nobody will read. The tmp file is removed like any failed build.
@@ -139,12 +137,16 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params,
         errors = collect_errors(unit);
 
     std::string blob;
+    ScopedTimer index_timer;
     if(success) {
         blob = serialize_preamble_state(unit, params.preamble_bound);
     }
+    auto index_ms = index_timer.ms();
 
     // Destroy CompilationUnit to flush PCH to disk.
+    ScopedTimer flush_timer;
     unit = CompilationUnit(nullptr);
+    auto flush_ms = flush_timer.ms();
 
     // Write the blob strictly after the PCH flush: the CacheStore's
     // restart adoption validates a pair by "aux not older than primary"
@@ -154,6 +156,7 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params,
     // failure, never a user-code problem — must not be downgraded to an
     // expected build failure.
     bool internal_error = false;
+    ScopedTimer state_write_timer;
     if(success) {
         if(auto error = write_preamble_state(blob, params.index_output_path)) {
             success = false;
@@ -161,9 +164,19 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params,
             errors = std::move(*error);
         }
     }
+    auto state_write_ms = state_write_timer.ms();
 
     if(success) {
-        LOG_INFO("BuildPCH done: file={}, output={}, {}ms", params.file, tmp_path, timer.ms());
+        LOG_PERF("build",
+                 "kind=pch file={} output={} compile_ms={} preamble_index_ms={} flush_ms={} "
+                 "state_write_ms={} total_ms={}",
+                 params.file,
+                 tmp_path,
+                 compile_ms,
+                 index_ms,
+                 flush_ms,
+                 state_write_ms,
+                 timer.ms());
         worker::BuildResult result;
         result.success = true;
         result.output_path = tmp_path;
@@ -208,7 +221,9 @@ static worker::BuildResult handle_build_pcm(const worker::BuildParams& params,
     cp.output_file = tmp_path;
 
     PCMInfo pcm_info;
+    ScopedTimer compile_timer;
     auto unit = compile(cp, pcm_info);
+    auto compile_ms = compile_timer.ms();
     bool success = unit.completed() && !stop->load(std::memory_order_relaxed);
     auto build_at = unit.build_at().count();
 
@@ -220,10 +235,17 @@ static worker::BuildResult handle_build_pcm(const worker::BuildParams& params,
     // buffer-derived artifact — module units are ordinary disk files with
     // CDB entries, so their symbols should flow through the normal
     // background-indexing path (no per-blob pair needed).
+    ScopedTimer flush_timer;
     unit = CompilationUnit(nullptr);
+    auto flush_ms = flush_timer.ms();
 
     if(success) {
-        LOG_INFO("BuildPCM done: module={}, {}ms", params.module_name, timer.ms());
+        LOG_PERF("build",
+                 "kind=pcm module={} compile_ms={} flush_ms={} total_ms={}",
+                 params.module_name,
+                 compile_ms,
+                 flush_ms,
+                 timer.ms());
         worker::BuildResult result;
         result.success = true;
         result.output_path = tmp_path;
@@ -256,7 +278,9 @@ static worker::BuildResult handle_index(const worker::BuildParams& params,
     }
     cp.stop = stop;
 
+    ScopedTimer compile_timer;
     auto unit = compile(cp);
+    auto compile_ms = compile_timer.ms();
     if(!unit.completed()) {
         LOG_WARN("Index failed: file={}, {}ms", params.file, timer.ms());
         return {false, "Index compilation failed"};
@@ -267,14 +291,35 @@ static worker::BuildResult handle_index(const worker::BuildParams& params,
     if(stop->load(std::memory_order_relaxed)) {
         return {false, "Index cancelled"};
     }
+    ScopedTimer index_timer;
     auto tu_index = index::TUIndex::build(unit);
+    auto index_ms = index_timer.ms();
+
+    ScopedTimer serialize_timer;
     std::string serialized;
     llvm::raw_string_ostream os(serialized);
     tu_index.serialize(os);
+    auto serialize_ms = serialize_timer.ms();
 
-    LOG_INFO("Index done: file={}, {} symbols, {}ms",
+    // AST teardown for a large TU is material work that belongs to this
+    // task: sample the total only after the unit and index are gone, so
+    // the logged span covers everything that blocks the worker.
+    auto symbol_count = tu_index.symbols.size();
+    ScopedTimer teardown_timer;
+    tu_index = index::TUIndex();
+    unit = CompilationUnit(nullptr);
+    auto teardown_ms = teardown_timer.ms();
+
+    LOG_PERF("build",
+             "kind=index file={} symbols={} bytes={} compile_ms={} index_ms={} serialize_ms={} "
+             "teardown_ms={} total_ms={}",
              params.file,
-             tu_index.symbols.size(),
+             symbol_count,
+             serialized.size(),
+             compile_ms,
+             index_ms,
+             serialize_ms,
+             teardown_ms,
              timer.ms());
     worker::BuildResult result;
     result.success = true;
