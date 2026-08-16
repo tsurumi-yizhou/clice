@@ -306,9 +306,9 @@ void MasterServer::on_agentic_query() {
         if(!disk) {
             continue;
         }
-        auto shard_it = workspace.merged_indices.find(path_id);
+        auto shard_it = workspace.shards.find(path_id);
         bool shard_current =
-            shard_it != workspace.merged_indices.end() && *disk == shard_it->second.content();
+            shard_it != workspace.shards.end() && *disk == shard_it->second.content();
         indexer.enqueue(path_id,
                         shard_current ? ReindexReason::DepsOnly : ReindexReason::ContentChanged);
     }
@@ -365,6 +365,10 @@ void MasterServer::dispatch(llvm::ArrayRef<FileEvent> events) {
     // DirtySet via mark_ast_dirty.
     for(auto path_id: dirty.drop_context) {
         contexts.drop_header_context(path_id);
+    }
+
+    for(auto path_id: dirty.drop_index) {
+        indexer.drop_index(path_id);
     }
 
     for(auto path_id: dirty.reindex_content_changed) {
@@ -485,10 +489,10 @@ void MasterServer::open_cache_store() {
     store->register_namespace(
         {.name = "pcm", .extension = ".pcm", .policy = CachePolicy::LRU, .max_bytes = 8 * GiB});
     store->register_namespace(
-        {.name = "index", .extension = ".idx", .policy = CachePolicy::Persistent});
-    store->register_namespace(
         {.name = "header_context", .extension = ".h", .policy = CachePolicy::Scratch});
     workspace.store.emplace(std::move(*store));
+    // Registers the index namespaces itself.
+    workspace.index_storage = index::make_fs_index_storage(*workspace.store);
     LOG_INFO("Cache store: {}", workspace.store->base_dir());
 
     workspace.load_cache(contexts);

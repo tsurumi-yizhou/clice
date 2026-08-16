@@ -4,40 +4,76 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "index/path_pool.h"
 #include "index/tu_index.h"
 #include "semantic/symbol.h"
 #include "support/bitmap.h"
 
 #include "kota/codec/fbs/fbs.h"
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
+namespace clice::index {
+
+/// Decode a serialized bitmap without trusting its bytes: bounded by the
+/// buffer, nullopt on a failed parse — croaring's C++ read wrappers abort
+/// on one, and blob bitmaps are untrusted disk/wire input. The caller
+/// chooses what a failure means: anything feeding persisted state (the
+/// project merge, blob loaders) rejects the whole input — normalized to
+/// empty, reference bits would read as fresh and stay lost forever —
+/// while the session-scoped full decode degrades to an empty bitmap,
+/// rebuilt by the next parse.
+inline std::optional<Bitmap> read_bitmap(const void* data, std::size_t size) {
+    auto* decoded =
+        roaring::api::roaring_bitmap_portable_deserialize_safe(static_cast<const char*>(data),
+                                                               size);
+    if(!decoded) {
+        return std::nullopt;
+    }
+    // deserialize_safe only bounds the reads; the bitmap it hands back can
+    // still violate internal invariants (unsorted containers), on which
+    // croaring's operations are undefined.
+    if(!roaring::api::roaring_bitmap_internal_validate(decoded, nullptr)) {
+        roaring::api::roaring_bitmap_free(decoded);
+        return std::nullopt;
+    }
+    return Bitmap(decoded);
+}
+
+/// Encode a bitmap as its portable image — the only format with a bounded
+/// deserializer.
+inline std::vector<std::byte> write_bitmap(const Bitmap& bitmap) {
+    std::vector<std::byte> buffer(bitmap.getSizeInBytes(true));
+    bitmap.write(reinterpret_cast<char*>(buffer.data()), true);
+    return buffer;
+}
+
+}  // namespace clice::index
+
 namespace kota::meta {
 
-/// Roaring bitmaps travel as their own serialized image (the non-portable
-/// format, matching every in-process reader).
+/// Roaring bitmaps travel in the portable format — the only one with a
+/// bounded deserializer. Only the session-scoped full decode goes through
+/// this repr (it has no failure channel, so a malformed image degrades to
+/// empty); the merge path and persisted blobs read raw images and reject
+/// unparseable ones.
 template <>
 struct repr<clice::Bitmap, codec::fbs::format> {
     using type = std::vector<std::byte>;
 
     static type to(const clice::Bitmap& bitmap) {
-        type buffer(bitmap.getSizeInBytes(false));
-        bitmap.write(reinterpret_cast<char*>(buffer.data()), false);
-        return buffer;
+        return clice::index::write_bitmap(bitmap);
     }
 
     static clice::Bitmap from(const type& buffer) {
-        return clice::Bitmap::read(reinterpret_cast<const char*>(buffer.data()), false);
+        return clice::index::read_bitmap(buffer.data(), buffer.size()).value_or(clice::Bitmap{});
     }
 };
 
@@ -53,80 +89,6 @@ struct repr<clice::SymbolKind, codec::fbs::format> {
 
     static clice::SymbolKind from(type value) {
         return clice::SymbolKind(value);
-    }
-};
-
-/// A PathPool persists as its path table; ids are the dense indices, so
-/// interning the table back in order reproduces them. Both directions drive
-/// the visitor: encoding writes the interned StringRefs straight to the
-/// wire, decoding interns one path at a time.
-template <>
-struct repr<clice::index::PathPool, codec::fbs::format> {
-    using type = std::vector<std::string>;
-
-    template <typename Config>
-    static bool serialize(auto& vis, const clice::index::PathPool& pool) {
-        return codec::encode_value<Config>(vis, pool.paths);
-    }
-
-    template <typename Config>
-    static bool deserialize(auto& vis, clice::index::PathPool& pool) {
-        type shape;
-        return vis.visit_seq(shape, [&](auto& sv) -> bool {
-            while(sv.has_element()) {
-                std::string path;
-                if(!sv.visit_element(
-                       [&](auto& ev) -> bool { return codec::decode_value<Config>(ev, path); })) {
-                    return false;
-                }
-                // The pool never interns an empty path, so a blob carrying
-                // one is corrupt; reject it instead of tripping the intern
-                // precondition.
-                if(path.empty()) {
-                    return false;
-                }
-                pool.path_id(path);
-            }
-            return true;
-        });
-    }
-};
-
-/// A StringMap iterates as StringMapEntry, which no codec understands;
-/// persist the entries as key/value pairs, sorted by value for
-/// deterministic blobs (values are unique canonical ids). Format-agnostic,
-/// unlike the reprs above: the pair-list form is not fbs-specific, and the
-/// schema layer classifies fields without a format tag — a format-scoped
-/// repr would leave it staring at StringMapEntry, which it rejects.
-template <>
-struct repr<llvm::StringMap<std::uint32_t>> {
-    using type = std::vector<std::pair<std::string, std::uint32_t>>;
-
-    template <typename Config>
-    static bool serialize(auto& vis, const llvm::StringMap<std::uint32_t>& map) {
-        llvm::SmallVector<std::pair<llvm::StringRef, std::uint32_t>> entries;
-        entries.reserve(map.size());
-        for(const auto& entry: map) {
-            entries.emplace_back(entry.getKey(), entry.getValue());
-        }
-        llvm::sort(entries, llvm::less_second{});
-        return codec::encode_value<Config>(vis, entries);
-    }
-
-    template <typename Config>
-    static bool deserialize(auto& vis, llvm::StringMap<std::uint32_t>& map) {
-        type shape;
-        return vis.visit_seq(shape, [&](auto& sv) -> bool {
-            while(sv.has_element()) {
-                std::pair<std::string, std::uint32_t> entry;
-                if(!sv.visit_element(
-                       [&](auto& ev) -> bool { return codec::decode_value<Config>(ev, entry); })) {
-                    return false;
-                }
-                map.try_emplace(entry.first, entry.second);
-            }
-            return true;
-        });
     }
 };
 
@@ -151,7 +113,7 @@ namespace clice::index {
 /// regular field and every loader discards blobs with a different value —
 /// including version-less blobs from older builds, which read back as 0.
 /// Bump it whenever a persisted type's reflected layout changes.
-constexpr inline std::uint32_t index_format_version = 3;
+constexpr inline std::uint32_t index_format_version = 5;
 
 /// Serialize a reflected index blob to `os` as a verified-readable
 /// flatbuffer. Encoding only fails on structural impossibilities (e.g. more
