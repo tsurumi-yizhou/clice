@@ -238,6 +238,7 @@ TEST_CASE(GlobalBitmapPayloadGate) {
     // A malformed image after columns that decoded fine: the reject must
     // leave no partial state — file versions or symbols — that later
     // merges would build on and the next save persist.
+    mirror.next_fv_id = 8;
     mirror.fv_ids = {7};
     mirror.fv_paths = {"/proj/partial.h"};
     mirror.fv_hashes = {0x1};
@@ -297,6 +298,7 @@ TEST_CASE(GlobalDuplicateVersionsRejected) {
     // to the wrong file.
     GlobalBlobMirror mirror;
     mirror.format_version = index::index_format_version;
+    mirror.next_fv_id = 9;
     mirror.fv_ids = {7, 7};
     mirror.fv_paths = {"/proj/a.h", "/proj/b.h"};
     mirror.fv_hashes = {0x1, 0x2};
@@ -325,6 +327,124 @@ TEST_CASE(GlobalDuplicateVersionsRejected) {
     ASSERT_TRUE(distinct.has_value());
     ASSERT_TRUE(loaded.load_global(bytes_of(*distinct), pool, pins));
     ASSERT_EQ(loaded.file_versions.size(), std::size_t(2));
+}
+
+TEST_CASE(GlobalBadCounterRejected) {
+    // Ids are handed out from the counter, so a legit writer's ids all sit
+    // below it; a lagging counter would alias stored ids on the next
+    // intern, and a sentinel one would insert a DenseMap reserved key.
+    GlobalBlobMirror mirror;
+    mirror.format_version = index::index_format_version;
+    mirror.next_fv_id = 8;
+    mirror.fv_ids = {7};
+    mirror.fv_paths = {"/proj/a.h"};
+    mirror.fv_hashes = {0x1};
+    mirror.fv_sizes = {1};
+    mirror.fv_mtimes = {1};
+
+    clice::PathPool pool;
+    llvm::DenseMap<std::uint32_t, std::uint64_t> pins;
+    auto ahead = kota::codec::fbs::to_bytes(mirror);
+    ASSERT_TRUE(ahead.has_value());
+    index::ProjectIndex loaded;
+    ASSERT_TRUE(loaded.load_global(bytes_of(*ahead), pool, pins));
+
+    mirror.next_fv_id = 7;
+    auto lagging = kota::codec::fbs::to_bytes(mirror);
+    ASSERT_TRUE(lagging.has_value());
+    ASSERT_FALSE(loaded.load_global(bytes_of(*lagging), pool, pins));
+
+    mirror.next_fv_id = llvm::DenseMapInfo<std::uint32_t>::getTombstoneKey();
+    mirror.fv_ids = {};
+    mirror.fv_paths = {};
+    mirror.fv_hashes = {};
+    mirror.fv_sizes = {};
+    mirror.fv_mtimes = {};
+    auto reserved = kota::codec::fbs::to_bytes(mirror);
+    ASSERT_TRUE(reserved.has_value());
+    ASSERT_FALSE(loaded.load_global(bytes_of(*reserved), pool, pins));
+}
+
+TEST_CASE(GlobalDuplicateSymbolRejected) {
+    // Symbol hashes are map keys in the writer; a structurally valid blob
+    // repeating one would silently replace the earlier entry's identity
+    // and reference bitmap while every manifest still loads as fresh.
+    GlobalBlobMirror mirror;
+    mirror.format_version = index::index_format_version;
+    mirror.sym_hashes = {42, 42};
+    mirror.sym_names = {"sym", "impostor"};
+    mirror.sym_kinds = {0, 0};
+    clice::Bitmap bits;
+    bits.add(3);
+    mirror.sym_bitmaps = {index::write_bitmap(bits), index::write_bitmap(bits)};
+    mirror.sym_paths = {
+        {3, "/proj/ref.h"}
+    };
+
+    clice::PathPool pool;
+    llvm::DenseMap<std::uint32_t, std::uint64_t> pins;
+    auto dup = kota::codec::fbs::to_bytes(mirror);
+    ASSERT_TRUE(dup.has_value());
+    index::ProjectIndex loaded;
+    ASSERT_FALSE(loaded.load_global(bytes_of(*dup), pool, pins));
+    ASSERT_TRUE(loaded.symbols.empty());
+
+    mirror.sym_hashes = {42, 43};
+    auto distinct = kota::codec::fbs::to_bytes(mirror);
+    ASSERT_TRUE(distinct.has_value());
+    ASSERT_TRUE(loaded.load_global(bytes_of(*distinct), pool, pins));
+    ASSERT_EQ(loaded.symbols.size(), std::size_t(2));
+}
+
+TEST_CASE(GlobalReservedKeysRejected) {
+    // The two DenseMap sentinel key values can never sit in the in-memory
+    // tables, so the writer can never emit them; a blob carrying one is
+    // corrupt, and inserting it would corrupt (or assert in) the loader's
+    // own containers.
+    clice::PathPool pool;
+    llvm::DenseMap<std::uint32_t, std::uint64_t> pins;
+    index::ProjectIndex loaded;
+
+    {
+        GlobalBlobMirror mirror;
+        mirror.format_version = index::index_format_version;
+        mirror.fv_ids = {0xffffffffu};
+        mirror.fv_paths = {"/proj/a.h"};
+        mirror.fv_hashes = {0x1};
+        mirror.fv_sizes = {1};
+        mirror.fv_mtimes = {1};
+        auto bytes = kota::codec::fbs::to_bytes(mirror);
+        ASSERT_TRUE(bytes.has_value());
+        ASSERT_FALSE(loaded.load_global(bytes_of(*bytes), pool, pins));
+    }
+    {
+        GlobalBlobMirror mirror;
+        mirror.format_version = index::index_format_version;
+        mirror.sym_hashes = {~std::uint64_t(0)};
+        mirror.sym_names = {"sym"};
+        mirror.sym_kinds = {0};
+        clice::Bitmap bits;
+        bits.add(3);
+        mirror.sym_bitmaps = {index::write_bitmap(bits)};
+        mirror.sym_paths = {
+            {3, "/proj/ref.h"}
+        };
+        auto bytes = kota::codec::fbs::to_bytes(mirror);
+        ASSERT_TRUE(bytes.has_value());
+        ASSERT_FALSE(loaded.load_global(bytes_of(*bytes), pool, pins));
+    }
+    {
+        GlobalBlobMirror mirror;
+        mirror.format_version = index::index_format_version;
+        mirror.sym_paths = {
+            {0xfffffffeu, "/proj/ref.h"}
+        };
+        auto bytes = kota::codec::fbs::to_bytes(mirror);
+        ASSERT_TRUE(bytes.has_value());
+        ASSERT_FALSE(loaded.load_global(bytes_of(*bytes), pool, pins));
+    }
+    ASSERT_TRUE(loaded.file_versions.empty());
+    ASSERT_TRUE(loaded.symbols.empty());
 }
 
 TEST_CASE(UnknownFileVersionsDetected) {

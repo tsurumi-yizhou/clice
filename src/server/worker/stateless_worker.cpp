@@ -7,7 +7,6 @@
 
 #include "compile/compilation.h"
 #include "feature/feature.h"
-#include "index/preamble_state.h"
 #include "index/tu_index.h"
 #include "server/protocol/worker.h"
 #include "server/worker/worker_common.h"
@@ -41,28 +40,20 @@ struct ScopedNice {
 using kota::ipc::RequestResult;
 using RequestContext = kota::ipc::BincodePeer::RequestContext;
 
-/// Serialize the preamble's PreambleState blob (full index + document
-/// links + inactive regions) into a string. Runs while the freshly
-/// parsed AST is still in memory — the only moment the preamble's index
-/// is obtainable without deserializing the whole PCH. The file write
+/// Serialize the preamble's index envelope (full index + document links
+/// + inactive regions) into a string. Runs while the freshly parsed AST
+/// is still in memory — the only moment the preamble's index is
+/// obtainable without deserializing the whole PCH. The file write
 /// happens separately, after the PCH itself is flushed.
-static std::string serialize_preamble_state(CompilationUnit& unit, std::uint32_t preamble_bound) {
-    auto tu_index = index::TUIndex::build(unit);
-
+static std::string serialize_preamble_envelope(CompilationUnit& unit,
+                                               std::uint32_t preamble_bound) {
     ScopedTimer links_timer;
     auto links = feature::document_links(unit);
     auto inactive = feature::inactive_regions(unit, {}, 0, preamble_bound);
     auto links_ms = links_timer.ms_f();
 
     ScopedTimer blob_timer;
-    std::string blob;
-    llvm::raw_string_ostream os(blob);
-    index::PreambleState::serialize(unit,
-                                    std::move(tu_index),
-                                    links,
-                                    inactive.regions,
-                                    inactive.open_stack,
-                                    os);
+    auto blob = index::build_preamble_index(unit, links, inactive.regions, inactive.open_stack);
     LOG_PERF("index_detail",
              "op=preamble links_ms={:.2f} blob_ms={:.2f} bytes={}",
              links_ms,
@@ -73,20 +64,20 @@ static std::string serialize_preamble_state(CompilationUnit& unit, std::uint32_t
 
 /// Write the serialized blob next to the PCH. Returns an error description
 /// on failure so the master's anomaly carries the cause.
-static std::optional<std::string> write_preamble_state(llvm::StringRef blob,
-                                                       llvm::StringRef output_path) {
+static std::optional<std::string> write_preamble_envelope(llvm::StringRef blob,
+                                                          llvm::StringRef output_path) {
     std::error_code ec;
     llvm::raw_fd_ostream os(output_path, ec);
     if(ec) {
         auto message =
-            std::format("cannot open PreambleState blob {}: {}", output_path, ec.message());
+            std::format("cannot open pch.idx envelope {}: {}", output_path, ec.message());
         LOG_ERROR("BuildPCH: {}", message);
         return message;
     }
     os << blob;
     os.flush();
     if(os.has_error()) {
-        auto message = std::format("failed writing PreambleState blob {}: {}",
+        auto message = std::format("failed writing pch.idx envelope {}: {}",
                                    output_path,
                                    os.error().message());
         os.clear_error();
@@ -139,7 +130,7 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params,
     std::string blob;
     ScopedTimer index_timer;
     if(success) {
-        blob = serialize_preamble_state(unit, params.preamble_bound);
+        blob = serialize_preamble_envelope(unit, params.preamble_bound);
     }
     auto index_ms = index_timer.ms();
 
@@ -158,7 +149,7 @@ static worker::BuildResult handle_build_pch(const worker::BuildParams& params,
     bool internal_error = false;
     ScopedTimer state_write_timer;
     if(success) {
-        if(auto error = write_preamble_state(blob, params.index_output_path)) {
+        if(auto error = write_preamble_envelope(blob, params.index_output_path)) {
             success = false;
             internal_error = true;
             errors = std::move(*error);
@@ -292,33 +283,22 @@ static worker::BuildResult handle_index(const worker::BuildParams& params,
         return {false, "Index cancelled"};
     }
     ScopedTimer index_timer;
-    auto tu_index = index::TUIndex::build(unit);
+    auto serialized = index::build_tu_index(unit);
     auto index_ms = index_timer.ms();
 
-    ScopedTimer serialize_timer;
-    std::string serialized;
-    llvm::raw_string_ostream os(serialized);
-    tu_index.serialize(os);
-    auto serialize_ms = serialize_timer.ms();
-
     // AST teardown for a large TU is material work that belongs to this
-    // task: sample the total only after the unit and index are gone, so
-    // the logged span covers everything that blocks the worker.
-    auto symbol_count = tu_index.symbols.size();
+    // task: sample the total only after the unit is gone, so the logged
+    // span covers everything that blocks the worker.
     ScopedTimer teardown_timer;
-    tu_index = index::TUIndex();
     unit = CompilationUnit(nullptr);
     auto teardown_ms = teardown_timer.ms();
 
     LOG_PERF("build",
-             "kind=index file={} symbols={} bytes={} compile_ms={} index_ms={} serialize_ms={} "
-             "teardown_ms={} total_ms={}",
+             "kind=index file={} bytes={} compile_ms={} index_ms={} teardown_ms={} total_ms={}",
              params.file,
-             symbol_count,
              serialized.size(),
              compile_ms,
              index_ms,
-             serialize_ms,
              teardown_ms,
              timer.ms());
     worker::BuildResult result;

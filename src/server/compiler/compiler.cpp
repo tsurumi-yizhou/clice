@@ -8,7 +8,6 @@
 #include <utility>
 
 #include "command/argument_parser.h"
-#include "index/preamble_state.h"
 #include "index/tu_index.h"
 #include "server/compiler/context_resolver.h"
 #include "server/protocol/extension.h"
@@ -493,7 +492,7 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
     if(auto it = workspace.pch_cache.find(pch_key); it != workspace.pch_cache.end()) {
         auto& st = it->second;
         // Both halves of the pair must be present: a PCH whose
-        // PreambleState blob is gone (crash between commits, failed aux
+        // pch.idx envelope is gone (crash between commits, failed aux
         // commit) rebuilds whole.
         bool in_store = workspace.store && workspace.store->lookup("pch", pch_key) &&
                         workspace.store->lookup_aux("pch", pch_key);
@@ -576,7 +575,7 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
     }
 
     // Build a new PCH pair via stateless worker: it writes the PCH and its
-    // PreambleState blob to the tmp paths allocated here; the store
+    // pch.idx envelope to the tmp paths allocated here; the store
     // commits (fsync + rename) both on success, primary first.
     auto pending = workspace.store->begin_store("pch", pch_key);
     auto pending_idx = workspace.store->begin_store_aux("pch", pch_key);
@@ -628,7 +627,7 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
     struct PairCommit {
         std::optional<std::string> pch_path;
         std::optional<std::string> index_path;
-        std::shared_ptr<index::PreambleState> state;
+        std::shared_ptr<index::TUIndex> state;
     };
 
     auto committed = co_await kota::queue([&]() -> PairCommit {
@@ -648,7 +647,7 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
             return outcome;
         }
         outcome.index_path = std::move(*index_path);
-        outcome.state = index::PreambleState::load(*outcome.index_path);
+        outcome.state = load_pch_envelope(*outcome.index_path);
         return outcome;
     });
     if(!committed.has_value() || !committed.value().pch_path.has_value()) {
@@ -656,7 +655,7 @@ kota::task<bool> Compiler::ensure_pch(Session& session,
         co_return false;
     }
     if(!committed.value().index_path.has_value()) {
-        LOG_WARN("Failed to commit PreambleState blob for {}", path);
+        LOG_WARN("Failed to commit pch.idx envelope for {}", path);
         // A rebuild of an existing key just had its blobs retracted from
         // the store; the entry's paths now dangle and waiters checking
         // `!path.empty()` would hand the compile a deleted PCH. Drop it —
@@ -974,7 +973,7 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
         // out: concurrent compiles can insert into pch_cache across the
         // await below and rehash the map from under a held pointer.
         std::vector<std::uint32_t> pch_inactive;
-        std::shared_ptr<index::PreambleState> preamble_state;
+        std::shared_ptr<index::TUIndex> preamble_state;
         if(session->pch_key.has_value()) {
             preamble_state = workspace.preamble_state(*session->pch_key);
         }
@@ -1189,26 +1188,16 @@ kota::task<> Compiler::run_compile(std::shared_ptr<Session> session) {
         pc->succeeded = true;
         record_deps(*session, result.value().deps, result.value().build_at);
 
-        auto tu_index = result.value().tu_index_data.empty()
-                            ? std::nullopt
-                            : index::TUIndex::from(result.value().tu_index_data);
-        if(tu_index) {
-            // The interested file's rows travel as a wire section; a file
-            // with no rows at all has no section and gets an empty index.
-            auto* section = tu_index->main_section();
-            auto rows = section ? index::TUIndex::decode_rows(*section)
-                                : std::optional<index::FileIndex>{std::in_place};
-            session->file_index = rows ? std::move(*rows) : index::FileIndex();
-            session->symbols = std::move(tu_index->symbols);
-        } else {
-            // The AST and the file index settle together — that pairing is
-            // what lets navigation trust the index after ensure_compiled. A
-            // compile that produced no index data (fatal error, no AST) must
-            // therefore drop the previous buffer's index rather than leave
-            // it posing as current: an honest gap over yesterday's offsets.
-            session->file_index.reset();
-            session->symbols.reset();
-        }
+        // The AST and the file index settle together — that pairing is
+        // what lets navigation trust the index after ensure_compiled. A
+        // compile that produced no index data (fatal error, no AST) must
+        // therefore drop the previous buffer's index rather than leave it
+        // posing as current: an honest gap over yesterday's offsets.
+        auto& index_data = result.value().tu_index_data;
+        session->index =
+            index_data.empty()
+                ? index::TUIndex()
+                : index::TUIndex::from_buffer(llvm::MemoryBuffer::getMemBufferCopy(index_data));
 
         auto version = session->version;
 
