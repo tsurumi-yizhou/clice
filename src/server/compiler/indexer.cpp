@@ -131,6 +131,16 @@ std::string serialize_cdb_snapshot(Workspace& workspace,
 
 }  // namespace
 
+Indexer::Indexer(kota::event_loop& loop,
+                 Workspace& workspace,
+                 WorkerPool& pool,
+                 ContextResolver& contexts,
+                 const SessionStore& sessions) :
+    loop(loop), bg_tasks(loop), workspace(workspace), pool(pool), contexts(contexts),
+    sessions(sessions) {
+    capacity_conn = pool.on_stateless_capacity.connect([this] { capacity_event.set(); });
+}
+
 bool Indexer::merge(const void* tu_index_data, std::size_t size) {
     // Zero-copy consumption: the wire stays serialized; a new variant's
     // blob bytes are sliced out and installed or merged without decoding
@@ -1064,7 +1074,7 @@ kota::task<> Indexer::stop() {
     co_await bg_tasks.join();
 }
 
-void Indexer::schedule() {
+void Indexer::schedule(bool immediate) {
     if(!workspace.config.project.enable_indexing.value || indexing_active || indexing_scheduled)
         return;
     indexing_scheduled = true;
@@ -1072,8 +1082,13 @@ void Indexer::schedule() {
     if(!index_idle_timer) {
         index_idle_timer = std::make_shared<kota::timer>(kota::timer::create(loop));
     }
+    // The idle timeout exists to batch edit storms into one round; a
+    // follow-up round for work requeued during the round just ended has
+    // already been batched by that round and starts right away — a crashed
+    // file's retry must not owe an extra idle window on top of the round
+    // boundary it already waited out.
     index_idle_timer->start(
-        std::chrono::milliseconds(workspace.config.project.idle_timeout_ms.value));
+        std::chrono::milliseconds(immediate ? 0 : workspace.config.project.idle_timeout_ms.value));
 
     if(!bg_tasks.spawn(run_background_indexing())) {
         indexing_scheduled = false;
@@ -1300,11 +1315,85 @@ auto Indexer::note_dispatch_failure(std::uint32_t server_path_id,
     return RequeueVerdict::Requeued;
 }
 
+kota::task<> Indexer::run_round_feeder(kota::task_group<>& workers,
+                                       RoundState& round,
+                                       std::size_t round_end,
+                                       std::size_t total,
+                                       std::size_t& dispatched) {
+    while(index_queue_pos < round_end) {
+        // Every wait loops back to re-check ALL gates: a pause arriving
+        // while parked on capacity (or a capacity loss while parked on the
+        // pause) must not let one slot slip through on wake-up.
+        while(true) {
+            if(pause_depth > 0) {
+                co_await resume_event.wait();
+                continue;
+            }
+
+            // With no schedulable worker but revival pending, a dispatch
+            // would only convert the queue slot into an instant
+            // worker_unavailable failure; park until a slot returns to
+            // service. With revival off such failures are terminal and
+            // take the normal failure path.
+            if(pool.revives_slots() && pool.schedulable_stateless() == 0) {
+                capacity_event.reset();
+                co_await capacity_event.wait();
+                continue;
+            }
+
+            // Feed at most twice the pool's low budget: deep enough that
+            // workers never idle waiting for the feeder, shallow enough
+            // that the pool queue holds little when a pause or budget cut
+            // lands. The floor keeps the window alive when the budget
+            // reads zero (a pool that has not started yet); without it
+            // the feeder would wait on task_done with nothing in flight
+            // to ever set it.
+            if(round.inflight >= std::max<std::size_t>(2 * pool.effective_low_limit(), 2)) {
+                round.task_done.reset();
+                co_await round.task_done.wait();
+                continue;
+            }
+            break;
+        }
+
+        auto server_path_id = index_queue[index_queue_pos];
+        index_queue_pos += 1;
+        pending_ids.erase(server_path_id);
+        // No open-session or hash-freshness shortcut here: index_one is the
+        // single decision point for skipping (it knows the pending reason;
+        // a hash check alone cannot see a file's own edit), and the
+        // completion clear in run_index_task retires the pending state with
+        // the ticket honored. A second, reason-blind copy of these checks
+        // here is exactly what once erased ContentChanged state early and
+        // let a stale shard keep serving.
+
+        // A queued slot with no pending entry was cleared mid-batch: the
+        // file was removed from disk after being enqueued (clear_pending),
+        // so there is nothing to index — skip the slot. Every other slot
+        // has an entry, because enqueue writes it before the queue push.
+        auto pending_it = reindex_reasons.find(server_path_id);
+        if(pending_it == reindex_reasons.end()) {
+            continue;
+        }
+
+        dispatched += 1;
+        round.inflight += 1;
+        auto ticket = pending_it->second.ticket;
+        // A member coroutine, not an immediately-invoked capturing lambda:
+        // a lambda's captures live in the lambda object, which dies at the
+        // end of this statement — anything read after the first suspension
+        // would dangle. Coroutine parameters are copied into the frame.
+        workers.spawn(run_index_task(server_path_id, ticket, dispatched, total, round));
+    }
+
+    LOG_DEBUG("Background indexing: all {} tasks spawned, waiting for completion", dispatched);
+}
+
 kota::task<> Indexer::run_index_task(std::uint32_t server_path_id,
                                      std::uint64_t ticket,
                                      std::size_t index,
                                      std::size_t total,
-                                     std::size_t& completed) {
+                                     RoundState& round) {
     co_await index_one(server_path_id, ticket, index, total);
     // The pending window ends with the index attempt, success or not. On
     // failure the last-known rows resume serving — deliberately: keeping
@@ -1317,9 +1406,11 @@ kota::task<> Indexer::run_index_task(std::uint32_t server_path_id,
        it != reindex_reasons.end() && it->second.ticket == ticket) {
         reindex_reasons.erase(it);
     }
-    ++completed;
+    round.completed += 1;
+    round.inflight -= 1;
+    round.task_done.set();
     progress_data.stage = Progress::Stage::Report;
-    progress_data.completed = completed;
+    progress_data.completed = round.completed;
     on_progress_changed.emit();
 }
 
@@ -1347,9 +1438,15 @@ kota::task<> Indexer::run_background_indexing() {
         index_queue.end(),
         [this](std::uint32_t id) { return workspace.path_to_module.contains(id); });
 
-    auto total = index_queue.size() - index_queue_pos;
+    // This round consumes [index_queue_pos, round_end) only. Anything
+    // appended during the round — including its own failures' requeues —
+    // waits for the next round; consuming a requeue in the round that
+    // produced it is what let a worker outage spin the dispatch loop
+    // against instant failures (#611).
+    auto round_end = index_queue.size();
+    auto total = round_end - index_queue_pos;
     std::size_t dispatched = 0;
-    std::size_t completed = 0;
+    RoundState round;
 
     // Announce the round; a progress reporter reads the counts from
     // progress() and owns the LSP token's begin/report/end handshake. With
@@ -1362,51 +1459,25 @@ kota::task<> Indexer::run_background_indexing() {
     ScopedTimer timer;
     kota::task_group<> workers(loop);
 
-    while(index_queue_pos < index_queue.size()) {
-        if(pause_depth > 0)
-            co_await resume_event.wait();
-
-        auto server_path_id = index_queue[index_queue_pos++];
-        pending_ids.erase(server_path_id);
-        // No open-session or hash-freshness shortcut here: index_one is the
-        // single decision point for skipping (it knows the pending reason;
-        // a hash check alone cannot see a file's own edit), and the
-        // completion clear in run_index_task retires the pending state with
-        // the ticket honored. A second, reason-blind copy of these checks
-        // here is exactly what once erased ContentChanged state early and
-        // let a stale shard keep serving.
-
-        // A queued slot with no pending entry was cleared mid-batch: the
-        // file was removed from disk after being enqueued (clear_pending),
-        // so there is nothing to index — skip the slot. Every other slot
-        // has an entry, because enqueue writes it before the queue push.
-        auto pending_it = reindex_reasons.find(server_path_id);
-        if(pending_it == reindex_reasons.end()) {
-            continue;
-        }
-
-        ++dispatched;
-        auto ticket = pending_it->second.ticket;
-        // A member coroutine, not an immediately-invoked capturing lambda:
-        // a lambda's captures live in the lambda object, which dies at the
-        // end of this statement — anything read after the first suspension
-        // would dangle. Coroutine parameters are copied into the frame.
-        workers.spawn(run_index_task(server_path_id, ticket, dispatched, total, completed));
-    }
-
-    LOG_DEBUG("Background indexing: all {} tasks spawned, waiting for completion", dispatched);
+    // The dispatch loop runs as a child of `workers`, so this frame's only
+    // suspension while children live is the join below: a shutdown cancel
+    // cascades through the join into the group, and the feeder plus every
+    // in-flight task unwind before `workers` is destroyed. Parking the
+    // feeder's waits on this frame instead would let the cancel finalize
+    // the frame — destroying the group with children still in flight.
+    workers.spawn(run_round_feeder(workers, round, round_end, total, dispatched));
     co_await workers.join();
 
     // Skipped files bump `completed` without a Report emit; refresh the
     // materialized count so a subscriber waking up on End reads the truth.
-    progress_data.completed = completed;
+    progress_data.completed = round.completed;
     progress_data.stage = Progress::Stage::End;
     progress_data.dispatched = dispatched;
     on_progress_changed.emit();
 
     // Safe point to compact: no dispatch loop holds an index into the queue.
-    // Files enqueued while we awaited the workers keep the queue alive for
-    // the next scheduled round.
+    // Files enqueued or requeued past the round snapshot keep the queue
+    // alive for the next scheduled round.
     if(index_queue_pos >= index_queue.size()) {
         assert(pending_ids.empty() && "drained queue must have no pending ids");
         assert(reindex_reasons.empty() && "drained queue must have no pending reasons");
@@ -1427,12 +1498,12 @@ kota::task<> Indexer::run_background_indexing() {
     // one's in-flight batch, racing same-key blob writes on the pool.
     indexing_active = false;
 
-    // Files enqueued while the round was joining its workers saw their
-    // schedule() no-op against indexing_active; without this kick they
-    // would wait for the next external event — and a content-changed
-    // pending file's rows stay skipped for that whole wait.
+    // Files enqueued or requeued while the round ran saw their schedule()
+    // no-op against indexing_active; without this kick they would wait for
+    // the next external event — and a content-changed pending file's rows
+    // stay skipped for that whole wait.
     if(index_queue_pos < index_queue.size()) {
-        schedule();
+        schedule(/*immediate=*/true);
     }
 }
 
