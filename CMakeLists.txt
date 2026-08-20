@@ -178,6 +178,7 @@ add_dependencies(clice-core generate_version_header)
 
 target_include_directories(clice-core PUBLIC
     "${PROJECT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/cmake"
     "${PROJECT_BINARY_DIR}/generated"
 )
 target_link_libraries(clice-core PUBLIC
