@@ -104,6 +104,10 @@ Kinds derived from the token stream itself, independent of the AST.
   #endif
 
   #pragma pack(1)
+
+  #
+  #define STRINGIZE(x) #x
+  const char* stringized = STRINGIZE(abc);
   ```
 
   </details>
@@ -173,7 +177,7 @@ Kinds derived from the token stream itself, independent of the AST.
 
   </details>
 
-- [ ] Primitive token type — a distinct kind for built-in types instead of plain `keyword`
+- [x] Primitive token type — a distinct kind for built-in types instead of plain `keyword`
 
   <details>
   <summary>Example</summary>
@@ -182,6 +186,9 @@ Kinds derived from the token stream itself, independent of the AST.
   int number = 0;
   float ratio = 0.5f;
   void act();
+  unsigned long long wide_number = 0;
+  __int128 extended_int = 0;
+  _Float16 extended_float = 0;
   ```
 
   </details>
