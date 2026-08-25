@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,15 +25,24 @@ std::uint32_t default_max_stateless_worker_count();
 /// Corresponds to `[[rules]]` in clice.toml.
 struct ConfigRule {
     KOTATSU_ANNOTATE(defaulted = true,
-                     description = "Glob patterns selecting the files this rule applies to.")
+                     description =
+                         "Glob patterns selecting the files this rule applies "
+                         "to: `*` matches within a path segment (a pattern of "
+                         "just `*` matches any path), `?` a single character, "
+                         "`**` any number of segments, `{a,b}` alternatives, "
+                         "`[0-9]` a character range, `[!...]` a negated range.")
     <std::vector<std::string>> patterns;
 
     KOTATSU_ANNOTATE(defaulted = true,
-                     description = "Compilation flags appended for matching files.")
+                     description =
+                         "Compilation flags appended for matching files, e.g. "
+                         "`[\"-std=c++20\", \"-DNDEBUG\"]`.")
     <std::vector<std::string>> append;
 
     KOTATSU_ANNOTATE(defaulted = true,
-                     description = "Compilation flags removed for matching files.")
+                     description =
+                         "Compilation flags removed for matching files, e.g. "
+                         "`[\"-Wall\"]`.")
     <std::vector<std::string>> remove;
 };
 
@@ -42,25 +52,40 @@ struct ConfigRule {
 /// finalize().
 struct ProjectConfig {
     KOTATSU_ANNOTATE(defaulted = true,
-                     description = "Run clang-tidy alongside compiler diagnostics.")
+                     description =
+                         "Run clang-tidy alongside compiler diagnostics. Not yet "
+                         "wired: the option is parsed but has no effect.")
     <bool> clang_tidy = false;
 
     KOTATSU_ANNOTATE(defaulted = true,
                      description =
-                         "Directory for the index and PCH cache; empty derives it "
-                         "from the workspace root.")
+                         "Directory for the unified on-disk cache (PCH, PCM and "
+                         "index artifacts). Empty derives it from XDG_CACHE_HOME "
+                         "(or `~/.cache`) with a per-workspace subdirectory named "
+                         "after the workspace plus a short hash, falling back to "
+                         "`${workspace}/.clice`; the resolved path is printed at "
+                         "startup.")
     <std::string> cache_dir;
 
     KOTATSU_ANNOTATE(defaulted = true,
                      description =
-                         "Directory for log files; empty derives it from the "
-                         "cache directory.")
+                         "Directory for log files; empty derives `${cache_dir}/logs`. "
+                         "Each server session logs into its own timestamped "
+                         "subdirectory.")
     <std::string> logging_dir;
 
-    KOTATSU_ANNOTATE(defaulted = true, description = "Paths searched for compile_commands.json.")
+    KOTATSU_ANNOTATE(defaulted = true,
+                     description =
+                         "Paths searched for compile_commands.json — file paths, "
+                         "or directories to look inside. When these all miss — or "
+                         "the list is empty — the workspace root and then each of "
+                         "its immediate subdirectories are searched.")
     <std::vector<std::string>> compile_commands_paths;
 
-    KOTATSU_ANNOTATE(defaulted = true, description = "Build the background index.")
+    KOTATSU_ANNOTATE(defaulted = true,
+                     description =
+                         "Build the background index that serves cross-TU "
+                         "features (find references, workspace symbols, ...).")
     <bool> enable_indexing = true;
 
     KOTATSU_ANNOTATE(defaulted = true,
@@ -73,7 +98,7 @@ struct ProjectConfig {
                      description =
                          "Idle delay in milliseconds before background indexing "
                          "starts.")
-    <int> idle_timeout_ms = 3000;
+    <std::uint32_t> idle_timeout_ms = 3000;
 
     /// The hooks can generate load on demand (log floods).
     KOTATSU_ANNOTATE(defaulted = true,
@@ -82,22 +107,41 @@ struct ProjectConfig {
                          "harness.")
     <bool> test_hooks = false;
 
-    KOTATSU_ANNOTATE(defaulted = true, description = "Number of stateful workers.")
+    KOTATSU_ANNOTATE(defaulted = true,
+                     description =
+                         "Number of stateful workers — they hold ASTs in memory "
+                         "and serve queries (hover, semantic tokens, ...); `0` is "
+                         "invalid and falls back to the default.")
     <std::uint32_t> stateful_worker_count = 2;
 
-    KOTATSU_ANNOTATE(defaulted = true, description = "Initial number of stateless workers.")
+    KOTATSU_ANNOTATE(defaulted = true,
+                     description =
+                         "Initial number of stateless workers — they handle "
+                         "ephemeral tasks (PCH/PCM builds, completion, signature "
+                         "help); defaults to half the machine's parallelism, at "
+                         "least 2. `0` is invalid and falls back to that default.")
     <std::uint32_t> stateless_worker_count = default_stateless_worker_count();
 
     /// See WorkerPoolOptions.
     KOTATSU_ANNOTATE(defaulted = true,
-                     description = "Lower bound for dynamic stateless-worker scaling.")
+                     description =
+                         "Lower bound for dynamic stateless-worker scaling; `0` "
+                         "is invalid and falls back to the default.")
     <std::uint32_t> min_stateless_worker_count = 1;
 
     KOTATSU_ANNOTATE(defaulted = true,
-                     description = "Upper bound for dynamic stateless-worker scaling.")
+                     description =
+                         "Upper bound for dynamic stateless-worker scaling; `0` "
+                         "means the machine's parallelism, which is also the "
+                         "default.")
     <std::uint32_t> max_stateless_worker_count = default_max_stateless_worker_count();
 
-    KOTATSU_ANNOTATE(defaulted = true, description = "Per-stateful-worker memory limit in bytes.")
+    KOTATSU_ANNOTATE(defaulted = true,
+                     description =
+                         "Per-stateful-worker memory limit in bytes; `0` is "
+                         "invalid and falls back to the default. Not yet "
+                         "enforced: parsed, but memory-based eviction is not "
+                         "implemented.")
     <std::uint64_t> worker_memory_limit = 4ULL * 1024 * 1024 * 1024;
 };
 
@@ -219,6 +263,14 @@ struct Config {
                                       std::vector<ConfigIssue>* issues = nullptr,
                                       std::string* loaded_path = nullptr,
                                       bool finalized = true);
+
+    /// The configuration's JSON schema (draft 2020-12), pretty-printed.
+    /// Fields whose defaults derive from the running machine (the worker
+    /// counts follow the CPU count) carry no `default` annotation, so the
+    /// schema is byte-identical on every host. Unknown properties are
+    /// rejected — the schema-side face of the strict decode pass's typo
+    /// warnings.
+    static std::expected<std::string, std::string> json_schema();
 };
 
 }  // namespace clice

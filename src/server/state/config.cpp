@@ -1,6 +1,7 @@
 #include "server/state/config.h"
 
 #include <algorithm>
+#include <array>
 
 #include "feature/feature.h"
 #include "support/filesystem.h"
@@ -8,6 +9,7 @@
 
 #include "kota/async/io/system.h"
 #include "kota/codec/json/json.h"
+#include "kota/codec/json/schema.h"
 #include "kota/codec/toml/toml.h"
 #include "kota/support/glob_pattern.h"
 #include "llvm/Support/FileSystem.h"
@@ -100,6 +102,9 @@ void Config::finalize(llvm::StringRef workspace_root) {
     reject_zero(p.stateless_worker_count,
                 defaults.stateless_worker_count,
                 "stateless_worker_count");
+    reject_zero(p.min_stateless_worker_count,
+                defaults.min_stateless_worker_count,
+                "min_stateless_worker_count");
     reject_zero(p.worker_memory_limit, defaults.worker_memory_limit, "worker_memory_limit");
 
     if(p.cache_dir.empty() && !workspace_root.empty()) {
@@ -169,7 +174,10 @@ void Config::match_rules(llvm::StringRef file_path,
     }
 }
 
-/// Codec config for the strict validation pass: reject unknown keys.
+/// Codec config that rejects unknown keys: the strict validation pass
+/// decodes under it, and the published schema derives its
+/// `additionalProperties: false` from it — the same typo surfaces both
+/// ways.
 struct DenyUnknownKeys {
     constexpr static bool deny_unknown_fields = true;
 };
@@ -269,6 +277,98 @@ Config Config::load_from_workspace(llvm::StringRef workspace_root,
         config.finalize(workspace_root);
     }
     return config;
+}
+
+constexpr std::array MACHINE_DERIVED_FIELDS = {"stateless_worker_count",
+                                               "max_stateless_worker_count"};
+
+/// The fields finalize() rejects `0` for.
+constexpr std::array ZERO_INVALID_FIELDS = {"stateful_worker_count",
+                                            "stateless_worker_count",
+                                            "min_stateless_worker_count",
+                                            "worker_memory_limit"};
+
+/// Scrub the machine-derived fields out of a `default` object: sections
+/// carry whole-object defaults, so the values appear below `default`
+/// keys too, not only in the fields' own schemas.
+static void remove_machine_fields(kota::codec::dyn::Value& value) {
+    if(auto* object = value.get_object()) {
+        for(auto field: MACHINE_DERIVED_FIELDS) {
+            object->remove(field);
+        }
+        for(auto& [key, child]: *object) {
+            remove_machine_fields(child);
+        }
+    } else if(auto* array = value.get_array()) {
+        for(auto& child: *array) {
+            remove_machine_fields(child);
+        }
+    }
+}
+
+/// The schema object of `field` inside a `properties` map, if present.
+static kota::codec::dyn::Object* field_schema(kota::codec::dyn::Object& properties,
+                                              std::string_view field) {
+    if(auto* schema = properties.find(field)) {
+        return schema->get_object();
+    }
+    return nullptr;
+}
+
+/// Patch the field schemas with what the annotations cannot express:
+/// `default`s whose fresh value depends on the running machine are
+/// dropped — a committed schema must be byte-identical on every host, so
+/// the affected fields' descriptions state the derivation instead — the
+/// zero-invalid fields carry the lower bound finalize() enforces, and
+/// `index_db` names the backends open_database() accepts, so editors
+/// flag a typo that would silently fall back to LMDB.
+static void patch_field_schemas(kota::codec::dyn::Value& value) {
+    if(auto* object = value.get_object()) {
+        for(auto& [key, child]: *object) {
+            if(key == "properties") {
+                if(auto* properties = child.get_object()) {
+                    for(auto field: MACHINE_DERIVED_FIELDS) {
+                        if(auto* schema = field_schema(*properties, field)) {
+                            schema->remove("default");
+                        }
+                    }
+                    for(auto field: ZERO_INVALID_FIELDS) {
+                        if(auto* schema = field_schema(*properties, field)) {
+                            schema->assign("minimum", std::uint64_t{1});
+                        }
+                    }
+                    if(auto* schema = field_schema(*properties, "index_db")) {
+                        schema->assign("enum", kota::codec::dyn::Array{"lmdb", "files"});
+                    }
+                }
+            } else if(key == "default") {
+                remove_machine_fields(child);
+            }
+            patch_field_schemas(child);
+        }
+    } else if(auto* array = value.get_array()) {
+        for(auto& child: *array) {
+            patch_field_schemas(child);
+        }
+    }
+}
+
+std::expected<std::string, std::string> Config::json_schema() {
+    auto schema = kota::codec::json::schema<Config, DenyUnknownKeys>();
+    if(!schema) {
+        return std::unexpected(schema.error().message);
+    }
+    patch_field_schemas(*schema);
+
+    auto compact = kota::codec::json::to_string(std::move(*schema));
+    if(!compact) {
+        return std::unexpected(compact.error().message);
+    }
+    auto pretty = kota::codec::json::prettify(*compact);
+    if(!pretty) {
+        return std::unexpected(pretty.error().message);
+    }
+    return std::move(*pretty);
 }
 
 }  // namespace clice
