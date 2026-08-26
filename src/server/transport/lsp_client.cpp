@@ -48,11 +48,25 @@ static bool past_shutdown(ServerLifecycle lifecycle) {
     return lifecycle == ServerLifecycle::ShuttingDown || lifecycle == ServerLifecycle::Exited;
 }
 
+/// Fire a workspace refresh request without awaiting the reply. Peer
+/// lifetime discipline as in the progress handshake: the peer outlives the
+/// client, and teardown fails pending requests before run() returns. A
+/// captureless coroutine lambda invoked immediately: parameters are copied
+/// into the frame, captures would dangle.
+template <typename Params>
+static void fire_refresh(kota::event_loop& loop, kota::ipc::JsonPeer& peer, Params params) {
+    loop.schedule([](kota::ipc::JsonPeer* peer, Params request) -> kota::task<> {
+        co_await peer->send_request(request, {.timeout = std::chrono::milliseconds(3000)});
+    }(&peer, std::move(params)));
+}
+
 LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(server), peer(peer) {
     output_conn = server.compiler.on_output.connect(
         [this](const std::shared_ptr<Session>& session) { push_output(*session); });
     progress_conn =
         server.indexer.on_progress_changed.connect([this]() { report_index_progress(); });
+    serving_conn =
+        server.indexer.on_serving_rows_changed.connect([this]() { refresh_index_served(); });
 
     // Guidance/anomaly messages travel as window/logMessage, which the LSP
     // spec allows before the initialize handshake — drain what a headless
@@ -102,6 +116,16 @@ void LSPClient::register_lifecycle() {
             // the same spelling the path pool stores.
             srv.workspace_root = uri_to_path(*init.root_uri);
             path::canonicalize(srv.workspace_root);
+        }
+
+        if(init.capabilities.workspace.has_value()) {
+            auto& ws_caps = *init.capabilities.workspace;
+            semantic_tokens_refresh =
+                ws_caps.semantic_tokens.has_value() && ws_caps.semantic_tokens->refresh_support;
+            inlay_hint_refresh =
+                ws_caps.inlay_hint.has_value() && ws_caps.inlay_hint->refresh_support;
+            folding_range_refresh =
+                ws_caps.folding_range.has_value() && ws_caps.folding_range->refresh_support;
         }
 
         if(init.initialization_options.has_value()) {
@@ -258,6 +282,7 @@ void LSPClient::register_document_sync() {
         srv.contexts.validate_saved_context(*session);
 
         srv.dispatch(FileEvent::buffer_opened(path_id));
+        srv.settle_open_serving(session);
 
         LOG_DEBUG("didOpen: {} (v{})", path, params.text_document.version);
     });
@@ -290,6 +315,10 @@ void LSPClient::register_document_sync() {
         // the supersede: with no follow-up request the stale parse (or its
         // dependency prep) would run to completion and hold up its waiters.
         srv.compiler.abandon_superseded(*session);
+
+        // Editing is the canonical escalation trigger: from here on the
+        // session invests in PCH/AST.
+        srv.compiler.escalate(*session);
 
         srv.dispatch(FileEvent::buffer_edited(path_id));
 
@@ -604,6 +633,12 @@ void LSPClient::register_extensions() {
                                                                context_path,
                                                                context_path_id,
                                                                params);
+            // A context choice asks for the context-pure AST view; the
+            // merged index cannot give it (union rows). A rejected switch
+            // (stale epoch, bad host) changed no context and owes none.
+            if(result.success) {
+                this->server.compiler.escalate(*session);
+            }
             co_return to_raw(result);
         });
 
@@ -778,6 +813,36 @@ void LSPClient::push_output(const Session& session) {
         regions.uri = uri_str;
         regions.regions = format_inactive_regions(session, output);
         peer.send_notification("clice/inactiveRegions", regions);
+    }
+
+    // The session served index projections while this compile was
+    // pending: whole-document results the client already pulled (tokens,
+    // folds, inlay hints) just got better, and only a refresh request
+    // makes it re-pull them.
+    if(session.index_served && output.version.has_value()) {
+        if(semantic_tokens_refresh) {
+            fire_refresh(server.loop, peer, protocol::SemanticTokensRefreshParams{});
+        }
+        if(inlay_hint_refresh) {
+            fire_refresh(server.loop, peer, protocol::InlayHintRefreshParams{});
+        }
+        if(folding_range_refresh) {
+            fire_refresh(server.loop, peer, protocol::FoldingRangeRefreshParams{});
+        }
+    }
+}
+
+void LSPClient::refresh_index_served() {
+    if(!client_ready) {
+        return;
+    }
+    // Inlay hints stay out: index projections never produce them, so a
+    // background merge cannot have changed what the client holds.
+    if(semantic_tokens_refresh) {
+        fire_refresh(server.loop, peer, protocol::SemanticTokensRefreshParams{});
+    }
+    if(folding_range_refresh) {
+        fire_refresh(server.loop, peer, protocol::FoldingRangeRefreshParams{});
     }
 }
 

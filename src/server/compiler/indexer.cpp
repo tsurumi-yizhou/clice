@@ -375,7 +375,23 @@ bool Indexer::merge(const void* tu_index_data, std::size_t size) {
         appended,
         rebuilt_ids.size(),
         workspace.shards.size());
+
+    // Sessions without a current file index serve these very rows
+    // (freshness clause 4); index_served says the client pulled some of
+    // them. Tell subscribers so those results get re-pulled.
+    auto serves = [this](std::uint32_t path_id) {
+        return serves_session_rows(path_id);
+    };
+    if(llvm::any_of(llvm::make_first_range(replacements), serves) ||
+       llvm::any_of(affected, serves)) {
+        on_serving_rows_changed.emit();
+    }
     return true;
+}
+
+bool Indexer::serves_session_rows(std::uint32_t path_id) const {
+    auto session = sessions.find(path_id);
+    return session && !session->index_current() && session->index_served;
 }
 
 void Indexer::drop_index(std::uint32_t tu_path_id) {
@@ -383,14 +399,22 @@ void Indexer::drop_index(std::uint32_t tu_path_id) {
     if(!project.manifests.contains(tu_path_id)) {
         return;
     }
+    // Dropped rows change index-served answers exactly like merged rows
+    // do; without the refresh the client keeps them forever, since no
+    // later merge or compile is owed.
+    bool served = false;
     for(auto path_id: project.remove_manifest(tu_path_id)) {
         auto it = workspace.shards.find(path_id);
         if(it != workspace.shards.end()) {
             it->second.set_live(project.live_variants(path_id));
         }
+        served = served || serves_session_rows(path_id);
     }
     dirty_manifests.insert(tu_path_id);
     global_dirty = true;
+    if(served) {
+        on_serving_rows_changed.emit();
+    }
 }
 
 kota::task<> Indexer::save() {
@@ -1202,6 +1226,20 @@ bool Indexer::need_update(llvm::StringRef file_path) {
     return false;
 }
 
+void Indexer::boost(std::uint32_t server_path_id) {
+    enqueue(server_path_id, ReindexReason::DepsOnly);
+    // Front of the un-consumed tail: the file someone is reading beats
+    // the bulk backlog. A running round is not disturbed (its snapshot
+    // semantics stay, see run_background_indexing); the slot then leads
+    // the next round.
+    auto begin = index_queue.begin() + index_queue_pos;
+    auto it = std::find(begin, index_queue.end(), server_path_id);
+    if(it != index_queue.end()) {
+        std::rotate(begin, it, it + 1);
+    }
+    schedule(/*immediate=*/true);
+}
+
 void Indexer::enqueue(std::uint32_t server_path_id, ReindexReason reason) {
     // A fresh slot means any prior slot was already consumed (or none
     // existed); a queued-and-unconsumed slot makes this call a duplicate.
@@ -1240,6 +1278,45 @@ void Indexer::enqueue(std::uint32_t server_path_id, ReindexReason reason) {
     index_queue.push_back(server_path_id);
 }
 
+kota::task<> Indexer::await_attempt(std::uint32_t server_path_id) {
+    auto pending = reindex_reasons.find(server_path_id);
+    if(pending == reindex_reasons.end()) {
+        co_return;
+    }
+    auto ticket = pending->second.ticket;
+    auto& waits = attempt_waits[server_path_id];
+    auto it = llvm::find_if(waits, [&](const AttemptWait& wait) { return wait.ticket == ticket; });
+    if(it == waits.end()) {
+        waits.push_back({ticket, std::make_shared<kota::event>()});
+        it = waits.end() - 1;
+    }
+    // Hold the shared_ptr across the await: the settle moves the event out
+    // of the map before setting it, and a fresh wait after that parks on a
+    // new instance.
+    auto event = it->event;
+    co_await event->wait();
+}
+
+void Indexer::settle_attempt_waits(std::uint32_t server_path_id, std::uint64_t ticket) {
+    auto it = attempt_waits.find(server_path_id);
+    if(it == attempt_waits.end()) {
+        return;
+    }
+    llvm::SmallVector<std::shared_ptr<kota::event>, 2> settled;
+    for(auto& wait: it->second) {
+        if(wait.ticket <= ticket) {
+            settled.push_back(std::move(wait.event));
+        }
+    }
+    llvm::erase_if(it->second, [&](const AttemptWait& wait) { return wait.ticket <= ticket; });
+    if(it->second.empty()) {
+        attempt_waits.erase(it);
+    }
+    for(auto& event: settled) {
+        event->set();
+    }
+}
+
 void Indexer::pause_indexing() {
     ++pause_depth;
     if(pause_depth == 1) {
@@ -1260,6 +1337,14 @@ void Indexer::resume_indexing() {
 kota::task<> Indexer::stop() {
     bg_tasks.cancel();
     co_await bg_tasks.join();
+    // Cancelled tasks unwind before their settle bookkeeping; release any
+    // parked feature request rather than stranding it past shutdown.
+    for(auto& waits: llvm::make_second_range(attempt_waits)) {
+        for(auto& wait: waits) {
+            wait.event->set();
+        }
+    }
+    attempt_waits.clear();
 }
 
 void Indexer::schedule(bool immediate) {
@@ -1290,13 +1375,28 @@ kota::task<> Indexer::index_one(std::uint32_t server_path_id,
                                 std::size_t total) {
     auto file_path = std::string(workspace.path_pool.resolve(server_path_id));
 
-    // Open files are skipped until an agent shows up: the LSP side never
-    // reads their shards (sessions serve them), so indexing them is pure
-    // waste — but agents read disk truth and need the shards, snapshot
-    // taken from disk regardless of the live buffer. Skipping loses no
-    // debt: BufferClosed re-checks the shard against the disk on close.
-    if(!index_open_files && sessions.find(server_path_id) != nullptr)
-        co_return;
+    // Open files whose session invests in an AST are skipped until an
+    // agent shows up: the LSP side never reads their shards (the session
+    // serves them), so indexing them is pure waste — but agents read disk
+    // truth and need the shards, snapshot taken from disk regardless of
+    // the live buffer. Skipping loses no debt: BufferClosed re-checks the
+    // shard against the disk on close. An index-only session is the
+    // opposite case — its shard IS what the LSP serves (freshness clause
+    // 4), so it indexes like a closed file, but only while its buffer
+    // matches the disk this index would read: rows from a diverged disk
+    // fail clause 4's content gate and would replace the one shard the
+    // session can serve from, blanking its features until an escalation.
+    // Keep the last matching rows instead — the close-time re-check
+    // covers the debt here too.
+    if(auto session = sessions.find(server_path_id)) {
+        if(session->serving != ServingMode::IndexOnly) {
+            if(!index_open_files) {
+                co_return;
+            }
+        } else if(auto disk = fs::read(file_path); !disk || *disk != session->text) {
+            co_return;
+        }
+    }
 
     // The engine's own observation is authoritative for content changes:
     // it saw the event. The dep-hash check below cannot be trusted to see
@@ -1594,6 +1694,24 @@ kota::task<> Indexer::run_index_task(std::uint32_t server_path_id,
        it != reindex_reasons.end() && it->second.ticket == ticket) {
         reindex_reasons.erase(it);
     }
+    // The attempt settled with no retry pending; an open session still
+    // waiting on the index with nothing servable will never be served by
+    // it (see on_session_unservable).
+    if(on_session_unservable && !reindex_reasons.contains(server_path_id)) {
+        if(auto session = sessions.find(server_path_id);
+           session && session->serving == ServingMode::IndexOnly) {
+            auto it = workspace.shards.find(server_path_id);
+            if(it == workspace.shards.end() || !it->second.matches_content(session->text)) {
+                on_session_unservable(server_path_id);
+            }
+        }
+    }
+    // Wake the waiters parked on this attempt (and older tickets it
+    // covers) after the unservable escalation above, so they re-derive
+    // their route against the settled state. Waiters of a requeue made
+    // during the flight bound the fresh ticket and stay parked for that
+    // newer attempt.
+    settle_attempt_waits(server_path_id, ticket);
     round.completed += 1;
     round.inflight -= 1;
     round.task_done.set();

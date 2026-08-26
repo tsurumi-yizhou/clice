@@ -24,6 +24,7 @@
 #include "kota/ipc/lsp/uri.h"
 #include "kota/meta/enum.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -40,7 +41,7 @@ void IndexQuery::visit_sessions(SessionVisitor visitor) const {
     sessions.for_each([&](std::uint32_t path_id, const Session& session) -> bool {
         // Freshness contract, clause 3: a dirty session's file index may
         // describe a buffer that no longer exists — skip it.
-        if(session.index.loaded() && !session.ast_dirty) {
+        if(session.index_current()) {
             return visitor(path_id, session);
         }
         return true;
@@ -220,7 +221,25 @@ static void drop_cursor_site(std::vector<protocol::Location>& locations,
 }
 
 bool IndexQuery::skip_shard(std::uint32_t path_id) const {
-    return (!options.disk_only && is_path_open(path_id)) || skip_stale_contribution(path_id);
+    if(options.disk_only) {
+        return skip_stale_contribution(path_id);
+    }
+    auto session = sessions.find(path_id);
+    if(!session) {
+        return skip_stale_contribution(path_id);
+    }
+    if(session->index_current()) {
+        return true;
+    }
+    // Freshness contract, clause 4: an open document without a current
+    // file index is served by its shard as if closed, while the buffer is
+    // byte-identical to the content the rows were built from. The content
+    // gate replaces the stale-contribution check — it compares against
+    // the buffer being served, which is stricter than any disk baseline —
+    // and a diverged buffer (edit in flight, restored unsaved text)
+    // contributes nothing, exactly as before this clause.
+    auto it = workspace.shards.find(path_id);
+    return it == workspace.shards.end() || !it->second.matches_content(session->text);
 }
 
 bool IndexQuery::skip_stale_contribution(std::uint32_t path_id) const {
@@ -284,18 +303,10 @@ bool IndexQuery::find_symbol_info(index::SymbolHash hash,
 IndexQuery::CursorHit IndexQuery::resolve_cursor(llvm::StringRef path,
                                                  const protocol::Position& position,
                                                  Session* session) {
-    // Freshness contract, clause 1: callers awaited the session's compile,
-    // and the file index settles together with it. An open document
-    // resolves against that index or not at all — its shard describes a
-    // disk snapshot, and mapping live buffer offsets onto it is exactly
-    // the mixed-view lookup the contract exists to prevent (the
-    // cross-file visit already skips shards of open files for the same
-    // reason). A dirty-after-await session (failed or superseded compile)
-    // or an index-less one therefore reports no hit.
-    if(session && (!session->index.loaded() || session->ast_dirty)) {
-        return {};
-    }
-    if(session && session->index.loaded() && !session->ast_dirty) {
+    // Freshness contract, clause 1: an open document with a current file
+    // index resolves against it — the compile the caller awaited settled
+    // it together with the buffer.
+    if(session && session->index_current()) {
         auto map = session->line_map();
         auto offset = map.to_offset(position);
         if(!offset)
@@ -328,21 +339,25 @@ IndexQuery::CursorHit IndexQuery::resolve_cursor(llvm::StringRef path,
         return hit;
     }
 
-    // Fallback to the disk shard. Position -> offset uses the session text when
-    // one exists (open but not yet compiled); for closed files the shard's
-    // own stored content provides the mapping.
+    // Fallback to the disk shard. Freshness contract, clause 4: an open
+    // document without a current file index resolves against its shard
+    // while the buffer is byte-identical to the rows' content — the gate
+    // that keeps a diverged buffer (edit in flight, restored unsaved
+    // text) from the mixed-view lookup the contract exists to prevent.
+    // Closed files keep the stale-contribution gate against their disk
+    // baseline instead.
     auto path_id = workspace.path_pool.find(path);
     if(!path_id)
         return {};
-    // A content-changed pending file's rows describe stale text: a cursor
-    // resolved against them would name the wrong symbol.
-    if(skip_stale_contribution(*path_id))
+    if(!session && skip_stale_contribution(*path_id))
         return {};
     auto shard_it = workspace.shards.find(*path_id);
     if(shard_it == workspace.shards.end())
         return {};
 
     auto& merged_index = shard_it->second;
+    if(session && !merged_index.matches_content(session->text))
+        return {};
     IndexedLineMap map(merged_index.content(),
                        merged_index.content_size(),
                        merged_index.line_starts());
@@ -895,6 +910,22 @@ static std::string extract_line(llvm::StringRef content, std::uint32_t offset) {
     return content.slice(line_start, line_end).str();
 }
 
+/// A definition's extent within one shard's stored content, or nullopt
+/// when the shard has no in-bounds Definition payload for the symbol.
+static std::optional<LocalSourceRange> definition_extent(const index::Shard& shard,
+                                                         index::SymbolHash hash,
+                                                         llvm::StringRef content) {
+    std::optional<LocalSourceRange> extent;
+    shard.lookup(hash, RelationKind::Definition, [&](const index::Relation& r) {
+        auto def_range = std::bit_cast<LocalSourceRange>(r.target_symbol);
+        if(def_range.begin >= def_range.end || def_range.end > content.size())
+            return true;
+        extent = def_range;
+        return false;
+    });
+    return extent;
+}
+
 std::optional<IndexQuery::DefinitionText> IndexQuery::get_definition_text(index::SymbolHash hash) {
     auto sym_it = workspace.project_index.symbols.find(hash);
     if(sym_it == workspace.project_index.symbols.end())
@@ -913,30 +944,185 @@ std::optional<IndexQuery::DefinitionText> IndexQuery::get_definition_text(index:
         if(!text)
             continue;
         llvm::StringRef content = *text;
-        lsp::LineMap map(content, merged_index.line_starts());
+        auto extent = definition_extent(merged_index, hash, content);
+        if(!extent)
+            continue;
 
-        std::optional<DefinitionText> result;
-        merged_index.lookup(hash, RelationKind::Definition, [&](const index::Relation& r) {
-            auto def_range = std::bit_cast<LocalSourceRange>(r.target_symbol);
-            if(def_range.begin >= def_range.end || def_range.end > content.size())
-                return true;
-            auto range = map.to_range(def_range.begin, def_range.end);
-            if(!range)
-                return true;
-            result = DefinitionText{
-                .file = file_path.str(),
-                .start_line = static_cast<int>(range->start.line) + 1,
-                .end_line = static_cast<int>(range->end.line) + 1,
-                .text =
-                    std::string(content.substr(def_range.begin, def_range.end - def_range.begin)),
-            };
-            return false;
-        });
-        if(result)
-            return result;
+        lsp::LineMap map(content, merged_index.line_starts());
+        auto range = map.to_range(extent->begin, extent->end);
+        if(!range)
+            continue;
+        return DefinitionText{
+            .file = file_path.str(),
+            .start_line = static_cast<int>(range->start.line) + 1,
+            .end_line = static_cast<int>(range->end.line) + 1,
+            .text = std::string(content.substr(extent->begin, extent->length())),
+        };
     }
 
     return std::nullopt;
+}
+
+const index::Shard* IndexQuery::open_session_shard(const Session& session) const {
+    if(session.index_current()) {
+        return nullptr;
+    }
+    auto it = workspace.shards.find(session.path_id);
+    if(it == workspace.shards.end() || !it->second.matches_content(session.text)) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+std::vector<feature::IndexIncludeEdge> IndexQuery::include_edges(const Session& session) const {
+    auto& project = workspace.project_index;
+
+    // Every consumer projects the edges onto content the serving shard
+    // matches, so a manifest contributes only where the version it entered
+    // for this document carries that same content generation — a TU that
+    // indexed an older revision would place its lines in text that moved.
+    auto shard_it = workspace.shards.find(session.path_id);
+    if(shard_it == workspace.shards.end()) {
+        return {};
+    }
+    auto generation = shard_it->second.content_hash();
+
+    auto version_of = [&](std::uint32_t fv) -> const index::FileVersionRecord* {
+        auto it = project.file_versions.find(fv);
+        return it == project.file_versions.end() ? nullptr : &it->second;
+    };
+    auto is_document = [&](std::uint32_t fv) {
+        const auto* version = version_of(fv);
+        return version && version->path_id == session.path_id &&
+               version->content_hash == generation;
+    };
+
+    // A directive line of the document is a node whose parent node entered
+    // this file: the TU root (parent == ~0u) when the document is the TU
+    // itself, or any node of the document's own file version otherwise
+    // (directives inside included headers hang off the node of the file
+    // that contains them).
+    std::vector<feature::IndexIncludeEdge> edges;
+    auto append = [&](const index::TUManifest& manifest) {
+        bool root_is_document = is_document(manifest.tu_fv);
+        llvm::SmallVector<bool> document_nodes(manifest.nodes.size());
+        for(auto [i, node]: llvm::enumerate(manifest.nodes)) {
+            document_nodes[i] = is_document(node.fv);
+        }
+        for(const auto& node: manifest.nodes) {
+            if(node.parent == ~0u ? !root_is_document : !document_nodes[node.parent]) {
+                continue;
+            }
+            const auto* target = version_of(node.fv);
+            if(!target) {
+                continue;
+            }
+            edges.push_back({
+                .line = node.line,
+                .target = std::string(workspace.path_pool.resolve(target->path_id)),
+            });
+        }
+    };
+
+    // The document's own manifest is its own context and answers alone; a
+    // header reached only through source TUs has none, and its directives
+    // live in the contributing TUs' manifests instead. The generation gate
+    // above dedups divergent revisions; agreeing TUs collapse in the
+    // projection's dedup.
+    if(auto manifest_it = project.manifests.find(session.path_id);
+       manifest_it != project.manifests.end()) {
+        append(manifest_it->second);
+        return edges;
+    }
+    if(auto contribution_it = project.contributions.find(session.path_id);
+       contribution_it != project.contributions.end()) {
+        for(auto tu: llvm::make_first_range(contribution_it->second)) {
+            if(auto manifest_it = project.manifests.find(tu);
+               manifest_it != project.manifests.end()) {
+                append(manifest_it->second);
+            }
+        }
+    }
+    return edges;
+}
+
+std::optional<feature::HoverInfo> IndexQuery::hover_card(llvm::StringRef path,
+                                                         const protocol::Position& position,
+                                                         Session* session) {
+    auto hit = resolve_cursor(path, position, session);
+    if(hit.hash == 0) {
+        return std::nullopt;
+    }
+
+    feature::IndexSymbolInfo info;
+    if(!find_symbol_info(hit.hash, info.name, info.kind)) {
+        return std::nullopt;
+    }
+
+    // Definition text and its comment block, preferring the document's own
+    // serving source (buffer-true content); external symbols defined
+    // elsewhere fall back to the defining file's stored content.
+    std::string definition;
+    std::string comment;
+    auto slice_from = [&](const index::Shard& shard, llvm::StringRef content) {
+        auto extent = definition_extent(shard, hit.hash, content);
+        if(!extent) {
+            return false;
+        }
+        definition = std::string(content.substr(extent->begin, extent->length()));
+        comment = feature::preceding_comment(content, extent->begin);
+        return true;
+    };
+
+    bool sliced = false;
+    if(session) {
+        if(session->index_current()) {
+            sliced = slice_from(session->file_rows(), session->text);
+        } else if(auto* shard = open_session_shard(*session)) {
+            sliced = slice_from(*shard, session->text);
+        }
+    }
+    if(!sliced) {
+        if(auto sym_it = workspace.project_index.symbols.find(hit.hash);
+           sym_it != workspace.project_index.symbols.end()) {
+            for(auto file_id: sym_it->second.reference_files) {
+                // A defining file that is itself open serves through its
+                // session sources — the very reason skip_shard rejects
+                // its disk shard — so slice from those buffer-true rows
+                // instead of losing the definition text.
+                if(!options.disk_only) {
+                    if(auto other = sessions.find(file_id)) {
+                        if(other->index_current() && slice_from(other->file_rows(), other->text))
+                            break;
+                        if(auto* shard = open_session_shard(*other);
+                           shard && slice_from(*shard, other->text))
+                            break;
+                    }
+                }
+                if(skip_shard(file_id))
+                    continue;
+                auto shard_it = workspace.shards.find(file_id);
+                if(shard_it == workspace.shards.end())
+                    continue;
+                std::unique_ptr<llvm::MemoryBuffer> storage;
+                auto text =
+                    indexed_text(workspace.path_pool.resolve(file_id), shard_it->second, storage);
+                if(text && slice_from(shard_it->second, *text))
+                    break;
+            }
+        }
+    }
+
+    auto hover = feature::index_hover(info, definition, comment);
+    if(session) {
+        auto map = session->line_map();
+        auto begin = map.to_offset(hit.range.start);
+        auto end = map.to_offset(hit.range.end);
+        if(begin && end) {
+            hover.symbol_range = LocalSourceRange{*begin, *end};
+        }
+    }
+    return hover;
 }
 
 std::vector<IndexQuery::ReferenceWithContext> IndexQuery::collect_references(index::SymbolHash hash,

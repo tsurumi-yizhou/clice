@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "feature/feature.h"
 #include "semantic/symbol.h"
 #include "server/protocol/agentic.h"
 #include "server/state/workspace.h"
@@ -78,6 +79,14 @@ struct ResolvedSymbol {
 ///      entirely (see visit_sessions): their buffer may have diverged from
 ///      the last file index, and unlike closed files their reindex is the
 ///      next compile, which the current file's request already awaits.
+///   4. An open session without a current file index is served by the
+///      file's shard under closed-file rules — but only while the buffer
+///      is byte-identical to the content the rows were built from
+///      (Shard::matches_content). This is what serves documents opened
+///      for reading before any compile is invested in them; the moment
+///      the buffer diverges (an edit, restored unsaved text) the shard
+///      withdraws and clauses 1-3 govern again. Arbitration is strict:
+///      a current file index always wins over the shard (never both).
 ///
 ///   Symbol identity lookups (find_symbol_info: hash → name/kind) are not
 ///   gated: a hash identifies one symbol, so even a stale shard answers
@@ -243,6 +252,30 @@ public:
     /// changed and awaits reindexing (clause 2), or — unless disk_only —
     /// the file is open and its session serves it instead.
     bool skip_shard(std::uint32_t path_id) const;
+
+    /// The shard that may serve `session`'s document as if closed
+    /// (freshness clause 4): the session has no current file index and
+    /// the buffer is byte-identical to the rows' content. Nullptr
+    /// otherwise — including when the session's own index is current and
+    /// would double-serve.
+    const index::Shard* open_session_shard(const Session& session) const;
+
+    /// The include edges of the session's document, the input of the
+    /// document-link projection: from its own TU manifest when it has one,
+    /// else from the contributing TUs' manifests (a header reached only
+    /// through source TUs — its directives are nodes hanging off the
+    /// header's own node there). Only manifests that entered the document
+    /// at the serving shard's content generation contribute; empty when
+    /// the file was never indexed.
+    std::vector<feature::IndexIncludeEdge> include_edges(const Session& session) const;
+
+    /// The read-only hover card for the symbol under the cursor: name and
+    /// kind from the symbol tables, definition text sliced from stored
+    /// content, the comment block above the definition. No Sema products
+    /// — see feature::index_hover.
+    std::optional<feature::HoverInfo> hover_card(llvm::StringRef path,
+                                                 const protocol::Position& position,
+                                                 Session* session);
 
     /// Iterate all open Sessions with valid, up-to-date file indices.
     void visit_sessions(SessionVisitor visitor) const;

@@ -37,7 +37,7 @@ MasterServer::MasterServer(kota::event_loop& loop, std::string self_path) :
     loop(loop), pool(loop), contexts(workspace), compiler(loop, workspace, contexts, pool),
     indexer(loop, workspace, pool, contexts, sessions), index_query(workspace, sessions, indexer),
     agent_query(workspace, sessions, indexer, {.disk_only = true}),
-    features(compiler, index_query, workspace, contexts, indexer),
+    features(compiler, index_query, workspace, contexts, indexer, sessions),
     invalidator(workspace, sessions, contexts), bg_tasks(loop), self_path(std::move(self_path)) {
     // The notify hook is process-wide because the logging layer cannot
     // depend on the server; the composition root owns it for the server's
@@ -96,6 +96,17 @@ void MasterServer::initialize() {
 
     auto& cfg = workspace.config.project;
 
+    if(cfg.readonly == "on") {
+        workspace.readonly = ReadonlyMode::On;
+    } else if(cfg.readonly == "auto") {
+        workspace.readonly = ReadonlyMode::Auto;
+    } else {
+        if(cfg.readonly != "off") {
+            LOG_WARN("Unknown readonly '{}'; using off", std::string(cfg.readonly));
+        }
+        workspace.readonly = ReadonlyMode::Off;
+    }
+
     if(!cfg.logging_dir.empty()) {
         auto now = std::chrono::system_clock::now();
         auto pid = llvm::sys::Process::getProcessId();
@@ -152,11 +163,18 @@ void MasterServer::initialize() {
     load_workspace();
 
     // Documents opened before the server became ready were validated
-    // against an empty resolver; re-check their persisted context choices
-    // now that the workspace cache is loaded.
+    // against an empty resolver and created under the default mode;
+    // re-check their persisted context choices and re-derive their
+    // serving mode now that the configuration governs. Settlement waits
+    // until here — after load_workspace — so divergence detection sees
+    // the persisted shards it just loaded (a restored unsaved buffer must
+    // escalate, not read as merely unindexed).
     for(auto& [path_id, session]: sessions.sessions) {
         if(session) {
             contexts.validate_saved_context(*session);
+            session->serving = workspace.readonly == ReadonlyMode::Off ? ServingMode::Escalated
+                                                                       : ServingMode::IndexOnly;
+            settle_open_serving(session);
         }
     }
 
@@ -238,6 +256,16 @@ void MasterServer::wire() {
     compiler.on_stale = [this](std::uint32_t path_id) {
         dispatch(FileEvent::disk_changed(path_id));
     };
+
+    // The boost in settle_open_serving promised the index would serve the
+    // cold session; an attempt that settles without a servable shard ends
+    // that promise — escalate like the disabled-indexing branch, or the
+    // session answers empty until its first edit.
+    indexer.on_session_unservable = [this](std::uint32_t path_id) {
+        if(auto session = sessions.find(path_id)) {
+            compiler.escalate(*session);
+        }
+    };
 }
 
 void MasterServer::initialize(llvm::StringRef root) {
@@ -250,7 +278,40 @@ std::shared_ptr<Session> MasterServer::find_session(std::uint32_t path_id) {
 }
 
 std::shared_ptr<Session> MasterServer::open_session(std::uint32_t path_id) {
-    return sessions.open(path_id);
+    auto session = sessions.open(path_id);
+    // The serving mode's creation write point; the only other write is
+    // Compiler::escalate.
+    session->serving =
+        workspace.readonly == ReadonlyMode::Off ? ServingMode::Escalated : ServingMode::IndexOnly;
+    return session;
+}
+
+void MasterServer::settle_open_serving(std::shared_ptr<Session> session) {
+    // An escalated session needs no settlement: builds stay pull-driven,
+    // and boosting its file would enqueue work the indexer skips for
+    // open non-IndexOnly documents.
+    if(session->serving == ServingMode::Escalated) {
+        return;
+    }
+    auto it = workspace.shards.find(session->path_id);
+    if(it != workspace.shards.end()) {
+        // A buffer that already diverges from the indexed content (a
+        // restored unsaved file) can never be served read-only: escalate
+        // now instead of answering empty until the first edit.
+        if(!it->second.matches_content(session->text)) {
+            compiler.escalate(*session);
+        }
+        return;
+    }
+    // Nothing indexed yet: reading this file is the reason to index it
+    // first — unless indexing is disabled, in which case no shard will
+    // ever arrive and only an AST can serve the document. A boost the
+    // indexer cannot fulfill escalates through on_session_unservable.
+    if(workspace.config.project.enable_indexing.value) {
+        indexer.boost(session->path_id);
+    } else {
+        compiler.escalate(*session);
+    }
 }
 
 void MasterServer::close_session(std::uint32_t path_id) {

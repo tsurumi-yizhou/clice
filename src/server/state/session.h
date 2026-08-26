@@ -21,6 +21,18 @@ namespace clice {
 /// the compile command came from; Session only stores the verdict.
 enum class CommandSource : std::uint8_t;
 
+/// A session's resource-investment state. Written at exactly two points:
+/// session creation (from the readonly mode) and Compiler::escalate (the
+/// triggers). Everything else derives routing from readiness, not from
+/// this flag.
+enum class ServingMode : std::uint8_t {
+    /// No PCH/AST investment: the session is served from the index.
+    IndexOnly,
+    /// PCH/AST investment is on; the index still answers while a compile
+    /// is in flight.
+    Escalated,
+};
+
 /// The publishable products of the most recent compilation (materialized
 /// whole-document feature results). The data lives here; the compiler's
 /// on_output signal only wakes the push path up — a missed signal is
@@ -84,6 +96,16 @@ struct Session {
     /// the cut one document burns slot after slot until the whole pool is
     /// dead. All transitions go through the type; see quarantine.h.
     Quarantine quarantine;
+
+    /// See ServingMode for the write discipline. Escalated is the
+    /// default so a session constructed outside the didOpen path (tests,
+    /// fixtures) behaves like the pre-policy server.
+    ServingMode serving = ServingMode::Escalated;
+
+    /// Set when an index projection answered a request for this session;
+    /// the compile-output push path reads it to tell clients to re-pull
+    /// what the AST now answers better (semantic tokens, inlay hints).
+    bool index_served = false;
 
     /// Whether the AST needs to be rebuilt before serving queries.
     bool ast_dirty = true;
@@ -155,6 +177,13 @@ struct Session {
     /// Workspace.project_index — that only gets disk-derived data from
     /// background indexing.
     index::TUIndex index;
+
+    /// Whether `index` describes the current buffer: the last compile
+    /// landed and no invalidation arrived since. The arbitration key of
+    /// the index freshness contract (IndexQuery clauses 3-4).
+    bool index_current() const {
+        return index.loaded() && !ast_dirty;
+    }
 
     /// The interested file's rows within `index` (an empty shard when the
     /// compile produced none).

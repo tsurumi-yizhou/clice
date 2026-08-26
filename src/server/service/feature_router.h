@@ -6,6 +6,7 @@
 #include "feature/feature.h"
 #include "server/service/query.h"
 #include "server/state/session.h"
+#include "server/state/session_store.h"
 #include "server/state/workspace.h"
 
 #include "kota/async/async.h"
@@ -31,13 +32,13 @@ namespace protocol = kota::ipc::protocol;
 ///     region;
 ///   - the index: disk-derived shards queried through IndexQuery.
 ///
-/// Features fall into two shapes. Whole-document results (document links,
-/// semantic tokens, folding ranges, ...) have a payload determined entirely
-/// by the document content, so they could in the future be served from a
-/// content-addressed result cache. Position-parameterized queries
-/// (definition, hover, completion) take a cursor and cannot be keyed that
-/// way; for these the index could in the future grow into a complete
-/// provider, serving files that are not open at all.
+/// Routing is derived per request from readiness, never from a mode
+/// flag: a current AST answers as today; otherwise an index source that
+/// is byte-identical to the buffer answers immediately (whole-document
+/// features through the feature::index_* projections, cursor queries
+/// through IndexQuery's freshness clauses); otherwise the request awaits
+/// the compile the policy owes, or answers honestly empty when it owes
+/// none (ServingMode::IndexOnly).
 ///
 /// Discipline: any feature whose answer is assembled from more than one
 /// source belongs here. Transports (LSP/agentic handlers) only translate
@@ -49,9 +50,10 @@ public:
                   IndexQuery& index_query,
                   Workspace& workspace,
                   ContextResolver& contexts,
-                  Indexer& indexer) :
+                  Indexer& indexer,
+                  SessionStore& sessions) :
         compiler(compiler), index_query(index_query), workspace(workspace), contexts(contexts),
-        indexer(indexer) {}
+        indexer(indexer), sessions(sessions) {}
 
     using RawResult = kota::task<kota::codec::RawValue, kota::ipc::Error>;
 
@@ -72,16 +74,12 @@ public:
                          const protocol::Position& pos,
                          std::optional<kota::cancellation_token> token = {});
 
-    /// Single-source features routed through the router as a matter of
-    /// discipline, not necessity. Each currently forwards to exactly one
-    /// provider (the worker's AST, a stateless build, or the index), so most
-    /// are one-line delegations. They live here as reserved tenants: the
-    /// router is where a feature's answer is assembled once it draws on more
-    /// than one source, and these are the designated hooks for a future
-    /// read-only provider strategy (e.g. serving closed files from the index).
-    /// They are NOT dead code to be inlined back into the transports.
-    /// Each takes the request's cancellation token and forwards it to the
-    /// worker sends (see Compiler::forward_query).
+    /// Whole-document features and hover, routed by readiness (see
+    /// pick_route): the AST answers when current, the index projections
+    /// answer while it is not, and a session the policy keeps un-compiled
+    /// answers with its pinned degraded surface (empty inlay hints and
+    /// code actions). Each takes the request's cancellation token and
+    /// forwards it to the worker sends (see Compiler::forward_query).
     RawResult hover(std::shared_ptr<Session> session,
                     const protocol::Position& position,
                     std::optional<kota::cancellation_token> token = {});
@@ -162,6 +160,65 @@ public:
     RawResult workspace_symbol(llvm::StringRef query);
 
 private:
+    /// Whether the worker's AST can answer for this session right now:
+    /// compiled, current, and not quarantined (the quarantine gate sits
+    /// before ensure_compiled's clean-AST fast path, so a quarantined
+    /// session's forward returns null even with a clean AST). When false,
+    /// the routing rules try the index before deciding to await a compile.
+    static bool ast_answerable(const Session& session);
+
+    /// The route decision for requests the index may serve: drains the
+    /// transport pipe (the handler resumed eagerly; a didChange or cancel
+    /// may be queued), then re-derives the source from current state.
+    enum class Route : std::uint8_t {
+        /// The request was superseded while draining (didChange, close);
+        /// answer empty — the client re-requests against the new state.
+        Superseded,
+        /// Serve from the index slice (the shard admitted by freshness
+        /// clause 4).
+        Index,
+        /// Fall through to the AST path (forward_query, which compiles
+        /// as needed).
+        Ast,
+        /// No source can serve and none is being invested in (IndexOnly
+        /// with no matching shard): answer honestly empty.
+        Empty,
+    };
+
+    /// See Route. Sets up escalated sessions' compile kick so an index
+    /// answer never strands the AST investment the policy asked for.
+    /// `full_lex` marks projections that raw-lex the whole buffer
+    /// (semantic tokens, folds): those follow the investment policy once
+    /// the buffer is oversized, while row- and cursor-backed answers
+    /// serve at any size.
+    kota::task<FeatureRouter::Route> pick_route(std::shared_ptr<Session> session, bool full_lex);
+
+    /// The compile gate of index-navigation requests: awaits the compile
+    /// exactly when the routing decided the AST is the serving source
+    /// (freshness clause 1 needs the settled file index), and lets
+    /// index-served sessions resolve through clauses 1/4 without forcing
+    /// the build. False means answer null — the compile failed or the
+    /// request was superseded.
+    kota::task<bool> nav_gate(std::shared_ptr<Session> session);
+
+    /// The document's rows extracted for the projections, plus the
+    /// resolver the projections share.
+    struct IndexRows {
+        std::vector<index::Occurrence> occurrences;
+        std::vector<feature::IndexDeclRow> decls;
+    };
+
+    static IndexRows extract_rows(const index::Shard& shard);
+
+    /// The lexing dialect of a session's index projections. An explicit -x
+    /// in the file's own CDB entry decides outright; a header follows its
+    /// active context's host when one exists; otherwise C when the file is
+    /// a C source or every TU contributing its indexed rows is one, C++
+    /// else (mixed inclusion favors the superset).
+    const clang::LangOptions& index_lang_options(const Session& session);
+
+    std::optional<feature::IndexSymbolInfo> resolve_symbol_info(index::SymbolHash hash);
+
     /// The preamble include links of a session's active PCH; empty when
     /// there is no PCH or its preamble no longer matches the buffer.
     std::vector<feature::DocumentLink> find_preamble_links(const Session& session);
@@ -182,6 +239,7 @@ private:
     Workspace& workspace;
     ContextResolver& contexts;
     Indexer& indexer;
+    SessionStore& sessions;
 };
 
 }  // namespace clice

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -110,6 +111,22 @@ public:
     /// as stale as the edit makes it).
     void enqueue(std::uint32_t server_path_id, ReindexReason reason);
 
+    /// Someone is reading `server_path_id` through the index and nothing
+    /// serves it yet: enqueue it at the front of the un-consumed queue and
+    /// start a round without the idle delay. A running round finishes
+    /// undisturbed; the file then leads the next one.
+    void boost(std::uint32_t server_path_id);
+
+    /// Wait until the pending (re)index attempt observed at call time
+    /// settles — the merge landed, the attempt gave up, or the entry was
+    /// cleared — and return immediately when nothing is pending. One
+    /// attempt, not a settled file: a requeue landing during the flight
+    /// does not extend the wait. For replies clients cache with no
+    /// refresh request (outline, links): answered while the didOpen
+    /// boost is still running, the empty result would freeze until the
+    /// next edit.
+    kota::task<> await_attempt(std::uint32_t server_path_id);
+
     /// Why the file awaits re-indexing (queued or currently being indexed),
     /// or nullopt when its index is not pending an update. O(1), no I/O —
     /// the query path calls this per candidate file.
@@ -130,6 +147,7 @@ public:
     void clear_pending(std::uint32_t server_path_id) {
         reindex_reasons.erase(server_path_id);
         pending_ids.erase(server_path_id);
+        settle_attempt_waits(server_path_id);
     }
 
     /// Schedule background indexing (respects idle timeout and dedup).
@@ -238,7 +256,27 @@ public:
     /// file completes, round ends). A subscriber reads progress() on wake.
     Signal<> on_progress_changed;
 
+    /// Emitted when a merge replaced (or re-masked) rows that an open
+    /// index-served session is serving: results the client already pulled
+    /// describe the old rows, and only a refresh request makes it re-pull
+    /// them — index-only sessions never compile, so the compile-driven
+    /// refresh in the output push path cannot cover them.
+    Signal<> on_serving_rows_changed;
+
+    /// Invoked when an index attempt for a file with an open
+    /// ServingMode::IndexOnly session settled — no retry pending — without
+    /// a shard that can serve the session's buffer: the file is missing or
+    /// diverged on disk, has no real compile command, or failed to index.
+    /// No later round changes that on its own, so the owner escalates the
+    /// session instead of letting it answer empty forever.
+    std::function<void(std::uint32_t path_id)> on_session_unservable;
+
 private:
+    /// Whether an open session serves this file's project rows (freshness
+    /// clause 4) and a client already pulled some of them — the emit
+    /// condition of on_serving_rows_changed.
+    bool serves_session_rows(std::uint32_t path_id) const;
+
     kota::event_loop& loop;
     kota::task_group<> bg_tasks;
     Workspace& workspace;
@@ -392,8 +430,26 @@ private:
     /// the verdicts above are cleared when a round starts, never here.
     bool need_update(llvm::StringRef file_path);
 
+    /// Wake the file's await_attempt waiters whose observed ticket the
+    /// settled attempt covers (`ticket` and older) and drop their events.
+    /// The default wakes every waiter — for the paths where no further
+    /// attempt will come (entry cleared, shutdown).
+    void settle_attempt_waits(std::uint32_t server_path_id, std::uint64_t ticket = -1);
+
     llvm::DenseMap<std::uint32_t, PendingReindex> reindex_reasons;
     llvm::DenseSet<std::uint32_t> failed_ids;
+
+    struct AttemptWait {
+        std::uint64_t ticket;
+        std::shared_ptr<kota::event> event;
+    };
+
+    /// The events await_attempt waiters park on, per file and per pending
+    /// ticket observed at wait time; each fires when an attempt covering
+    /// its ticket settles (or wholesale at stop()). Keyed by ticket so a
+    /// requeue during an attempt's flight cannot extend earlier waits —
+    /// await_attempt promises one attempt, not a settled file.
+    llvm::DenseMap<std::uint32_t, llvm::SmallVector<AttemptWait, 2>> attempt_waits;
     std::uint64_t reindex_ticket = 0;
     bool indexing_active = false;
     bool indexing_scheduled = false;
