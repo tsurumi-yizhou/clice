@@ -28,6 +28,23 @@ void DependencyGraph::add_module(llvm::StringRef module_name, std::uint32_t path
     }
 }
 
+void DependencyGraph::update_module_decl(std::uint32_t path_id, llvm::StringRef module_name) {
+    // Re-declaring the unchanged name is a no-op: providers are selected
+    // by list order, so an erase-and-append would silently reselect
+    // among a duplicated name's providers without any cascade.
+    if(!module_name.empty() && llvm::is_contained(lookup_module(module_name), path_id)) {
+        return;
+    }
+    // An emptied name stays behind as an empty provider list — lookup
+    // treats it the same as absent.
+    for(auto& entry: module_to_path) {
+        llvm::erase(entry.getValue(), path_id);
+    }
+    if(!module_name.empty()) {
+        add_module(module_name, path_id);
+    }
+}
+
 llvm::ArrayRef<std::uint32_t> DependencyGraph::lookup_module(llvm::StringRef module_name) const {
     auto it = module_to_path.find(module_name);
     if(it != module_to_path.end()) {
@@ -637,6 +654,7 @@ kota::task<> scan_impl(CompilationDatabase& cdb,
             if(scan_result.scan_result.is_interface_unit) {
                 graph.add_module(scan_result.scan_result.module_name, scan_result.path_id);
             }
+            graph.set_import_candidate(scan_result.path_id, scan_result.scan_result.has_import);
 
             report.includes_found += scan_result.scan_result.includes.size();
 

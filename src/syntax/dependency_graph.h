@@ -12,6 +12,7 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
@@ -57,6 +58,12 @@ public:
 
     /// Register a module interface unit: module name -> PathID.
     void add_module(llvm::StringRef module_name, std::uint32_t path_id);
+
+    /// Re-register a file's module declaration after a save: the file
+    /// leaves whatever module it declared before and, when `module_name`
+    /// is non-empty, provides that one — so imports resolved between two
+    /// full scans see the declaration the disk actually holds.
+    void update_module_decl(std::uint32_t path_id, llvm::StringRef module_name);
 
     /// Look up all PathIDs that provide a given module (may have multiple candidates).
     llvm::ArrayRef<std::uint32_t> lookup_module(llvm::StringRef module_name) const;
@@ -114,9 +121,29 @@ public:
         return module_to_path;
     }
 
+    /// Files whose lexer scan saw an import declaration (names unknown —
+    /// lexical text is not a trustworthy source of edges). A non-empty
+    /// set means module code exists somewhere: the scan gates treat the
+    /// whole project as modular from that point, because per-file
+    /// reachability approximations have irreducible blind spots.
+    void set_import_candidate(std::uint32_t path_id, bool has_import) {
+        if(has_import) {
+            import_candidates_.insert(path_id);
+        } else {
+            import_candidates_.erase(path_id);
+        }
+    }
+
+    const llvm::DenseSet<std::uint32_t>& import_candidates() const {
+        return import_candidates_;
+    }
+
 private:
     /// Module name -> PathIDs (multiple candidates possible, e.g. different targets).
     llvm::StringMap<llvm::SmallVector<std::uint32_t, 2>> module_to_path;
+
+    /// See set_import_candidate().
+    llvm::DenseSet<std::uint32_t> import_candidates_;
 
     /// (PathID, ConfigID) -> list of directly included PathIDs.
     /// Each PathID may have bit 31 set to indicate conditional include.

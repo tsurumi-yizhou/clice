@@ -7,11 +7,16 @@
 #include "index/serialization.h"
 #include "index/shard.h"
 #include "index/tu_index.h"
-#include "server/compiler/context_resolver.h"
-#include "server/compiler/indexer.h"
+#include "sched/context.h"
+#include "sched/families/pcm.h"
+#include "sched/families/turun.h"
+#include "sched/graph.h"
+#include "sched/index/pump.h"
+#include "sched/index/store.h"
 #include "server/service/query.h"
+#include "server/state/ast_projection.h"
 #include "server/state/session_store.h"
-#include "server/worker/worker_pool.h"
+#include "worker/pool.h"
 
 #include "kota/ipc/lsp/text.h"
 #include "llvm/ADT/SmallVector.h"
@@ -29,9 +34,14 @@ Workspace workspace;
 SessionStore session_store;
 WorkerPool pool{loop};
 ContextResolver resolver{workspace};
-Indexer indexer{loop, workspace, pool, resolver, session_store};
-IndexQuery index_query{workspace, session_store, indexer};
-IndexQuery agent_query{workspace, session_store, indexer, {.disk_only = true}};
+TaskGraph graph{loop};
+PCMFamily pcm{graph, workspace, resolver, pool};
+ASTProjectionTable projections;
+IndexStore index_store{loop, workspace};
+TURunFamily turun{graph, workspace, resolver, pcm, index_store, pool};
+IndexPump indexer{loop, workspace, turun, index_store, pool};
+IndexQuery index_query{workspace, session_store, indexer, projections};
+IndexQuery agent_query{workspace, session_store, indexer, projections, {.disk_only = true}};
 
 TempDir dir;
 index::TUIndex full_index;
@@ -66,10 +76,13 @@ void open_with_overlay(std::source_location location = std::source_location::cur
     session->text = it->second.content;
     session->line_starts = kota::ipc::lsp::build_line_starts(session->text);
 
-    session->index = index::TUIndex::from_buffer(
-        llvm::MemoryBuffer::getMemBufferCopy(index::build_tu_index(*unit, true)));
-    session->ast_dirty = false;
-    session->pch_key = "key";
+    auto& entry = projections.entries[path_id];
+    auto projection = std::make_shared<ASTProjection>();
+    projection->index = std::make_shared<index::TUIndex>(index::TUIndex::from_buffer(
+        llvm::MemoryBuffer::getMemBufferCopy(index::build_tu_index(*unit, true))));
+    projection->pch_key = "key";
+    entry.projection = std::move(projection);
+    entry.current = true;
 }
 
 index::SymbolHash hash_of(llvm::StringRef name,
@@ -131,6 +144,15 @@ index::TUIndex empty_session_index() {
     }
     return index::TUIndex::from_buffer(llvm::MemoryBuffer::getMemBufferCopy(
         llvm::StringRef(reinterpret_cast<const char*>(bytes->data()), bytes->size())));
+}
+
+void install_empty_index(std::source_location location = std::source_location::current()) {
+    auto index = std::make_shared<index::TUIndex>(empty_session_index());
+    ASSERT_TRUE(index->loaded());
+    auto& entry = projections.entries[session->path_id];
+    auto next = ASTProjection(*entry.projection);
+    next.index = std::move(index);
+    entry.projection = std::make_shared<const ASTProjection>(std::move(next));
 }
 
 protocol::Position position_of(llvm::StringRef name) {
@@ -199,8 +221,7 @@ int main() { return 0; }
     // Production per-edit indexes never see the preamble region (the PCH
     // swallows it); emulate that by emptying the session's own index so
     // the cursor can only resolve through the overlay's main-file entry.
-    session->index = empty_session_index();
-    ASSERT_TRUE(session->index.loaded());
+    install_empty_index();
 
     auto uri = std::string("file://") + main_path;
     auto info = index_query.lookup_symbol(uri, main_path, position_of("macro"), session.get());
@@ -429,8 +450,7 @@ TEST_CASE(SharedPreambleScoped) {
 int main() { return 0; }
 )");
     open_with_overlay();
-    session->index = empty_session_index();
-    ASSERT_TRUE(session->index.loaded());
+    install_empty_index();
 
     // A second file with a byte-identical preamble shares the PCH (the
     // key excludes the source path), but the preamble entry carries
@@ -440,8 +460,11 @@ int main() { return 0; }
     auto other = session_store.open(workspace.path_pool.intern(other_path));
     other->text = session->text;
     other->line_starts = session->line_starts;
-    other->ast_dirty = false;
-    other->pch_key = session->pch_key;
+    auto& other_entry = projections.entries[other->path_id];
+    auto other_projection = std::make_shared<ASTProjection>();
+    other_projection->pch_key = "key";
+    other_entry.projection = std::move(other_projection);
+    other_entry.current = true;
 
     auto locations = index_query.query_relations(main_path,
                                                  position_of("macro"),
@@ -456,13 +479,12 @@ TEST_CASE(DirtyPreambleServed) {
 int main() { return 0; }
 )");
     open_with_overlay();
-    session->index = empty_session_index();
-    ASSERT_TRUE(session->index.loaded());
+    install_empty_index();
 
     // Body edits dirty the session but never move preamble rows: as long
     // as the buffer still starts with the blob's preamble text, the
     // entry keeps serving — the prefix comparison is the freshness check.
-    session->ast_dirty = true;
+    projections.entries[session->path_id].current = false;
     session->text += "int more;\n";
     session->line_starts = kota::ipc::lsp::build_line_starts(session->text);
     EXPECT_TRUE(index_query.find_definition_location(hash_of("FOO")).has_value());
@@ -473,8 +495,7 @@ TEST_CASE(PreambleDriftSkipped) {
 int main() { return 0; }
 )");
     open_with_overlay();
-    session->index = empty_session_index();
-    ASSERT_TRUE(session->index.loaded());
+    install_empty_index();
 
     // A deferred PCH rebuild keeps an old blob while the buffer's
     // preamble moved on; once the buffer no longer starts with the blob's

@@ -24,6 +24,36 @@ int x = 1;
     EXPECT_FALSE(result.includes[1].is_angled);
     EXPECT_FALSE(result.includes[1].conditional);
     EXPECT_TRUE(result.module_name.empty());
+    EXPECT_FALSE(result.has_import);
+}
+
+TEST_CASE(ImportDetected) {
+    // Detection only: the names stay uncollected (imports macro-expand,
+    // so lexical text cannot name edges) — the flag marks the file worth
+    // a precise scan.
+    auto result = scan_quick(R"(
+import some.mod;
+int x = 1;
+)");
+    EXPECT_TRUE(result.has_import);
+    EXPECT_TRUE(result.modules.empty());
+
+    auto exported = scan_quick(R"(
+export module top;
+export import :part;
+)");
+    EXPECT_TRUE(exported.has_import);
+
+    // A conditional module declaration defers the name to the
+    // preprocessor fallback but must not hide later directives.
+    auto conditional = scan_quick(R"(
+#if 0
+export module maybe;
+#endif
+import m;
+)");
+    EXPECT_TRUE(conditional.need_preprocess);
+    EXPECT_TRUE(conditional.has_import);
 }
 
 TEST_CASE(IncludeOffsets) {
@@ -195,6 +225,28 @@ TEST_CASE(PreciseWithContent) {
 
     ASSERT_EQ(result.includes.size(), 1u);
     EXPECT_FALSE(result.includes[0].not_found);
+}
+
+TEST_CASE(RemapBypassesSharedCache) {
+    auto vfs = llvm::makeIntrusiveRefCnt<TestVFS>();
+    auto main_path = TestVFS::path("main.cpp");
+    vfs->add("main.cpp", R"(#include "header.h")");
+    vfs->add("header.h");
+
+    SharedScanCache cache;
+    auto args = std::vector<const char*>{"clang++", "-std=c++20", main_path.c_str()};
+
+    // A remapped scan must not seed the path-keyed cache with
+    // overlay-derived directives.
+    auto remapped = scan_precise(args, TestVFS::root(), llvm::StringRef("int x = 1;"), &cache, vfs);
+    EXPECT_TRUE(remapped.includes.empty());
+    EXPECT_FALSE(cache.entries.contains(main_path));
+
+    // Poisoned, this scan would hit the overlay's no-directives entry
+    // and miss the disk include.
+    auto disk = scan_precise(args, TestVFS::root(), {}, &cache, vfs);
+    ASSERT_EQ(disk.includes.size(), 1u);
+    EXPECT_TRUE(disk.includes[0].path.find("header.h") != std::string::npos);
 }
 
 };  // TEST_SUITE(Scan)

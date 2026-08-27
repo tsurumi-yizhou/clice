@@ -4,10 +4,10 @@
 #include <vector>
 
 #include "feature/feature.h"
+#include "sched/workspace.h"
 #include "server/service/query.h"
 #include "server/state/session.h"
 #include "server/state/session_store.h"
-#include "server/state/workspace.h"
 
 #include "kota/async/async.h"
 #include "kota/codec/json/json.h"
@@ -16,9 +16,11 @@
 
 namespace clice {
 
-class Compiler;
+class ASTFamily;
 class ContextResolver;
-class Indexer;
+class IndexPump;
+class WorkerForwarder;
+struct IndexRowsSource;
 
 namespace protocol = kota::ipc::protocol;
 
@@ -46,14 +48,15 @@ namespace protocol = kota::ipc::protocol;
 /// or gate results themselves.
 class FeatureRouter {
 public:
-    FeatureRouter(Compiler& compiler,
+    FeatureRouter(ASTFamily& ast,
+                  WorkerForwarder& forwarder,
                   IndexQuery& index_query,
                   Workspace& workspace,
                   ContextResolver& contexts,
-                  Indexer& indexer,
+                  IndexPump& pump,
                   SessionStore& sessions) :
-        compiler(compiler), index_query(index_query), workspace(workspace), contexts(contexts),
-        indexer(indexer), sessions(sessions) {}
+        ast(ast), forwarder(forwarder), index_query(index_query), workspace(workspace),
+        contexts(contexts), pump(pump), sessions(sessions) {}
 
     using RawResult = kota::task<kota::codec::RawValue, kota::ipc::Error>;
 
@@ -68,7 +71,7 @@ public:
     /// retry after the forward's compile refreshes a dirty session.
     /// @param session may be null (document not open).
     /// @param token the request's cancellation token, forwarded to the
-    /// worker sends (see Compiler::forward_query).
+    /// worker sends (see WorkerForwarder::forward_query).
     RawResult definition(std::shared_ptr<Session> session,
                          llvm::StringRef path,
                          const protocol::Position& pos,
@@ -79,7 +82,7 @@ public:
     /// answer while it is not, and a session the policy keeps un-compiled
     /// answers with its pinned degraded surface (empty inlay hints and
     /// code actions). Each takes the request's cancellation token and
-    /// forwards it to the worker sends (see Compiler::forward_query).
+    /// forwards it to the worker sends (see WorkerForwarder::forward_query).
     RawResult hover(std::shared_ptr<Session> session,
                     const protocol::Position& position,
                     std::optional<kota::cancellation_token> token = {});
@@ -165,7 +168,7 @@ private:
     /// before ensure_compiled's clean-AST fast path, so a quarantined
     /// session's forward returns null even with a clean AST). When false,
     /// the routing rules try the index before deciding to await a compile.
-    static bool ast_answerable(const Session& session);
+    bool ast_answerable(const Session& session) const;
 
     /// The route decision for requests the index may serve: drains the
     /// transport pipe (the handler resumed eagerly; a didChange or cancel
@@ -190,8 +193,13 @@ private:
     /// `full_lex` marks projections that raw-lex the whole buffer
     /// (semantic tokens, folds): those follow the investment policy once
     /// the buffer is oversized, while row- and cursor-backed answers
-    /// serve at any size.
-    kota::task<FeatureRouter::Route> pick_route(std::shared_ptr<Session> session, bool full_lex);
+    /// serve at any size. A Route::Index decision stores the validated
+    /// rows source into `source` (when given) — callers must serve from
+    /// it rather than re-derive, or the state could shift between the
+    /// decision and the read.
+    kota::task<FeatureRouter::Route> pick_route(std::shared_ptr<Session> session,
+                                                bool full_lex,
+                                                IndexRowsSource* source = nullptr);
 
     /// The compile gate of index-navigation requests: awaits the compile
     /// exactly when the routing decided the AST is the serving source
@@ -234,11 +242,12 @@ private:
     std::optional<protocol::Hover> resolve_preamble_hover(Session& session,
                                                           const protocol::Position& position);
 
-    Compiler& compiler;
+    ASTFamily& ast;
+    WorkerForwarder& forwarder;
     IndexQuery& index_query;
     Workspace& workspace;
     ContextResolver& contexts;
-    Indexer& indexer;
+    IndexPump& pump;
     SessionStore& sessions;
 };
 

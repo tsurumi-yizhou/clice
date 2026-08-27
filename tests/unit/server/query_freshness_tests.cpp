@@ -7,11 +7,16 @@
 #include "test/tester.h"
 #include "index/shard.h"
 #include "index/tu_index.h"
-#include "server/compiler/context_resolver.h"
-#include "server/compiler/indexer.h"
+#include "sched/context.h"
+#include "sched/families/pcm.h"
+#include "sched/families/turun.h"
+#include "sched/graph.h"
+#include "sched/index/pump.h"
+#include "sched/index/store.h"
 #include "server/service/query.h"
+#include "server/state/ast_projection.h"
 #include "server/state/session_store.h"
-#include "server/worker/worker_pool.h"
+#include "worker/pool.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Path.h"
@@ -27,9 +32,14 @@ Workspace workspace;
 SessionStore store;
 WorkerPool pool{loop};
 ContextResolver resolver{workspace};
-Indexer indexer{loop, workspace, pool, resolver, store};
-IndexQuery index_query{workspace, store, indexer};
-IndexQuery agent_query{workspace, store, indexer, {.disk_only = true}};
+TaskGraph graph{loop};
+PCMFamily pcm{graph, workspace, resolver, pool};
+ASTProjectionTable projections;
+IndexStore index_store{loop, workspace};
+TURunFamily turun{graph, workspace, resolver, pcm, index_store, pool};
+IndexPump indexer{loop, workspace, turun, index_store, pool};
+IndexQuery index_query{workspace, store, indexer, projections};
+IndexQuery agent_query{workspace, store, indexer, projections, {.disk_only = true}};
 
 std::uint32_t main_id = 0;
 std::uint32_t header_id = 0;

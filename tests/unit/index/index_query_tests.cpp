@@ -6,11 +6,16 @@
 #include "feature/feature.h"
 #include "index/shard.h"
 #include "index/tu_index.h"
-#include "server/compiler/context_resolver.h"
-#include "server/compiler/indexer.h"
+#include "sched/context.h"
+#include "sched/families/pcm.h"
+#include "sched/families/turun.h"
+#include "sched/graph.h"
+#include "sched/index/pump.h"
+#include "sched/index/store.h"
 #include "server/service/query.h"
+#include "server/state/ast_projection.h"
 #include "server/state/session_store.h"
-#include "server/worker/worker_pool.h"
+#include "worker/pool.h"
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -27,8 +32,13 @@ Workspace workspace;
 SessionStore store;
 WorkerPool pool{loop};
 ContextResolver resolver{workspace};
-Indexer indexer{loop, workspace, pool, resolver, store};
-clice::IndexQuery query{workspace, store, indexer};
+TaskGraph graph{loop};
+PCMFamily pcm{graph, workspace, resolver, pool};
+ASTProjectionTable projections;
+IndexStore index_store{loop, workspace};
+TURunFamily turun{graph, workspace, resolver, pcm, index_store, pool};
+IndexPump indexer{loop, workspace, turun, index_store, pool};
+clice::IndexQuery query{workspace, store, indexer, projections};
 
 std::uint32_t main_id = 0;
 std::uint32_t header_id = 0;
@@ -192,7 +202,7 @@ TEST_CASE(OpenSessionServedByShard) {
     // compile it: freshness clause 4 serves it from its shard.
     auto session = store.open(main_id);
     store.apply_open(*session, unit->interested_content().str(), 1);
-    ASSERT_FALSE(session->index_current());
+    ASSERT_FALSE(projections.index_current(session->path_id));
 
     auto position = feature::to_position(session->line_map(), point("use"));
     ASSERT_TRUE(position.has_value());

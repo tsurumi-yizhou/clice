@@ -6,15 +6,18 @@
 #include <optional>
 #include <string>
 
-#include "server/compiler/context_resolver.h"
+#include "sched/context.h"
+#include "sched/workspace.h"
 #include "server/state/session_store.h"
-#include "server/state/workspace.h"
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace clice {
+
+class PCMFamily;
 
 /// A change to a file the server cares about, described by what happened —
 /// not by what must be invalidated. Events are plain values handed to
@@ -211,17 +214,13 @@ public:
     bool save_cache = false;
     /// Kick the background indexer's scheduler.
     bool reschedule_indexing = false;
-    /// A CDB reload may have introduced the first C++20 modules; create the
-    /// compile graph if it does not exist yet. Executed by the dispatcher,
-    /// which owns the Compiler.
-    bool ensure_compile_graph = false;
 
     bool empty() const {
         return mark_ast_dirty.empty() && mark_lost.empty() && reset_trial.empty() &&
                reset_header_mode.empty() && force_revalidate.empty() &&
                reindex_content_changed.empty() && reindex_deps_only.empty() &&
                clear_reindex.empty() && drop_index.empty() && drop_context.empty() &&
-               !recheck_contexts && !save_cache && !reschedule_indexing && !ensure_compile_graph;
+               !recheck_contexts && !save_cache && !reschedule_indexing;
     }
 };
 
@@ -257,12 +256,19 @@ public:
     Invalidator(Workspace& workspace,
                 const SessionStore& store,
                 const ContextResolver& contexts,
+                PCMFamily& pcm,
                 ReadFile read_file = {});
 
     /// Fold a batch of events into one deduplicated effect set.
     DirtySet apply(llvm::ArrayRef<FileEvent> events);
 
 private:
+    /// Rescan the file's disk state (include edges, module maps). A module
+    /// name the rescan gave its first provider cascades to the consumers
+    /// holding sentinel edges against it; a name the file stopped
+    /// providing cascades through the provider's real node instead.
+    void rescan_disk_state(std::uint32_t path_id, DirtySet& dirty);
+
     /// The invalidation cascade for "this file's on-disk content is new":
     /// rescan the file's disk state, then split every affected file into
     /// open (recompile) and closed (reindex). Shared by BufferSaved (disk
@@ -275,6 +281,11 @@ private:
     /// dependent module units), splitting dirtied units open/closed.
     void cascade_compile_graph(std::uint32_t path_id, DirtySet& dirty);
 
+    /// A module name just gained its first provider: cascade through its
+    /// sentinel node and route the dirtied consumers to recompiles and
+    /// ContentChanged reindexes.
+    void provider_appeared(llvm::StringRef module_name, DirtySet& dirty);
+
     /// See the definition: the open/closed/index-only split of a
     /// dependency invalidation.
     void mark_dependent(std::uint32_t path_id, DirtySet& dirty);
@@ -282,7 +293,16 @@ private:
     Workspace& workspace;
     const SessionStore& store;
     const ContextResolver& contexts;
+    PCMFamily& pcm;
     ReadFile read_file;
+
+    /// Files whose disk content changed while their buffer was open. The
+    /// DiskChanged case defers the dependent cascade (the buffer is the
+    /// truth until close) and the tracker has already consumed the event,
+    /// so this set is the only surviving record of the debt. BufferSaved
+    /// discharges it — the save's own cascade covers everything owed —
+    /// and BufferClosed drains it.
+    llvm::DenseSet<std::uint32_t> disk_changed_while_open;
 };
 
 }  // namespace clice

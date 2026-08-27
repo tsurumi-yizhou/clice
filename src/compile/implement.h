@@ -1,5 +1,6 @@
 #pragma once
 
+#include "compile/compilation.h"
 #include "compile/compilation_unit.h"
 #include "compile/diagnostic.h"
 #include "semantic/semantics.h"
@@ -17,8 +18,6 @@ using namespace clang::tidy;
 bool is_registered_tidy_check(llvm::StringRef check);
 
 std::optional<bool> is_fast_tidy_check(llvm::StringRef check);
-
-struct TidyParams {};
 
 class ClangTidyChecker;
 
@@ -97,6 +96,11 @@ struct CompilationUnitRef::Self {
     std::vector<clang::Decl*> top_level_decls;
 
     std::unique_ptr<tidy::ClangTidyChecker> checker;
+
+    /// The tidy configuration reports on headers (HeaderFilterRegex or
+    /// SystemHeaders), so the matcher traversal must see their
+    /// declarations — top_level_decls holds the interested file only.
+    bool tidy_traverse_headers = false;
 
     std::chrono::milliseconds build_at;
     std::chrono::milliseconds build_duration;

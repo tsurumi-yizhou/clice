@@ -1,9 +1,14 @@
 #include "test/cdb_helper.h"
 #include "test/temp_dir.h"
 #include "test/test.h"
-#include "server/compiler/compile_graph.h"
-#include "server/compiler/context_resolver.h"
+#include "sched/context.h"
+#include "sched/families/pcm.h"
+#include "sched/families/turun.h"
+#include "sched/graph.h"
+#include "server/service/ast_family.h"
+#include "server/service/context_service.h"
 #include "server/state/invalidator.h"
+#include "worker/pool.h"
 
 namespace clice::testing {
 namespace {
@@ -21,17 +26,135 @@ index::Shard shard_of(llvm::StringRef content) {
     return index::Shard::from_buffer(llvm::MemoryBuffer::getMemBufferCopy(bytes));
 }
 
+/// Non-module fixtures need the invalidator's PCMFamily reference but
+/// never drive it; this bundles the inert graph plumbing behind it.
+struct PCMHarness {
+    kota::event_loop loop;
+    TaskGraph graph{loop};
+    WorkerPool pool{loop};
+    PCMFamily pcm;
+
+    PCMHarness(Workspace& workspace, ContextResolver& resolver) :
+        pcm(graph, workspace, resolver, pool) {}
+};
+
+/// The orphaned-choice tests exercise ContextService's session reset,
+/// which goes through the AST family; this bundles its inert stack.
+struct ASTHarness {
+    kota::event_loop loop;
+    TaskGraph graph{loop};
+    WorkerPool pool{loop};
+    PCMFamily pcm;
+    PCHFamily pch;
+    ASTFamily ast;
+
+    ASTHarness(Workspace& workspace, ContextResolver& resolver, SessionStore& store) :
+        pcm(graph, workspace, resolver, pool), pch(graph, workspace, resolver, pool),
+        ast(workspace, resolver, graph, pcm, pch, pool, store, loop) {}
+};
+
 TEST_SUITE(Invalidator) {
 
 TEST_CASE(EmptyBatchNoEffects) {
     Workspace workspace;
     SessionStore store;
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
 
     auto dirty = invalidator.apply({});
 
     ASSERT_TRUE(dirty.empty());
+}
+
+TEST_CASE(NewProviderDirtiesImporters) {
+    // Consumers that scanned the name unresolved hold durable edges to
+    // its sentinel node; the first provider cascades through them. A
+    // closed TU reindexes as ContentChanged (its dep snapshot never
+    // named the interface, so the hash gate cannot see the change); an
+    // open document recompiles. Nothing is ever dropped — a consumer
+    // that can no longer build keeps serving its last-known rows.
+    TempDir tmp;
+    tmp.touch("m.cppm", "export module m;\nexport int mv();\n");
+
+    Workspace workspace;
+    SessionStore store;
+    auto iface = workspace.path_pool.intern(tmp.path("m.cppm"));
+    auto closed = workspace.path_pool.intern("/proj/closed.cpp");
+    auto open = workspace.path_pool.intern("/proj/open.cpp");
+    store.open(open);
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    ph.graph.declare({turun_family, closed}, {PCMFamily::unresolved_node("m")});
+    ph.graph.declare({ast_family, open}, {PCMFamily::unresolved_node("m")});
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
+
+    FileEvent events[] = {FileEvent::disk_changed(iface)};
+    auto dirty = invalidator.apply(events);
+
+    EXPECT_TRUE(llvm::is_contained(dirty.reindex_content_changed, closed));
+    EXPECT_TRUE(llvm::is_contained(dirty.mark_ast_dirty, open));
+    EXPECT_TRUE(dirty.drop_index.empty());
+
+    // The same save again: the name already has its provider.
+    auto again = invalidator.apply(events);
+    EXPECT_FALSE(llvm::is_contained(again.reindex_content_changed, closed));
+    EXPECT_FALSE(llvm::is_contained(again.mark_ast_dirty, open));
+}
+
+TEST_CASE(ReloadProviderCascades) {
+    // The CDB-reload flavor of provider appearance: the provider-set diff
+    // drives the same sentinel cascade, and a consumer retired by the
+    // very same reload is enqueued harmlessly (its run falls to a skip)
+    // rather than having its deliberately-kept index dropped.
+    TempDir tmp;
+    tmp.touch("m.cppm", "export module m;\nexport int mv();\n");
+
+    Workspace workspace;
+    SessionStore store;
+    // The producer already reloaded the CDB: only the provider remains.
+    write_cdb(tmp,
+              workspace.cdb,
+              build_cdb_json({
+                  {tmp.root, tmp.path("m.cppm"), {}}
+    }));
+    auto iface = workspace.path_pool.intern(tmp.path("m.cppm"));
+    auto retired = workspace.path_pool.intern(tmp.path("old.cpp"));
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    ph.graph.declare({turun_family, retired}, {PCMFamily::unresolved_node("m")});
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
+
+    FileEvent::CDBDelta delta;
+    delta.added = {iface};
+    delta.removed = {retired};
+    FileEvent events[] = {FileEvent::cdb_changed(std::move(delta))};
+    auto dirty = invalidator.apply(events);
+
+    EXPECT_TRUE(llvm::is_contained(dirty.reindex_content_changed, retired));
+    EXPECT_FALSE(llvm::is_contained(dirty.drop_index, retired));
+}
+
+TEST_CASE(DiskRemovedDropsProvider) {
+    // Deleting a provider must leave the module map too: a later
+    // replacement provider would otherwise sit behind the deleted one in
+    // the candidate list and never be selected.
+    Workspace workspace;
+    SessionStore store;
+    auto iface = workspace.path_pool.intern("/proj/m.cppm");
+    workspace.dep_graph.add_module("m", iface);
+    workspace.path_to_module[iface] = "m";
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
+
+    FileEvent events[] = {FileEvent::disk_removed(iface)};
+    invalidator.apply(events);
+
+    EXPECT_TRUE(workspace.dep_graph.lookup_module("m").empty());
 }
 
 TEST_CASE(NoOpEventsNoEffects) {
@@ -41,7 +164,8 @@ TEST_CASE(NoOpEventsNoEffects) {
     store.open(file);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     // Buffer sync stays in SessionStore (exempt from the pipeline); these
     // events must produce no effects of their own.
     FileEvent events[] = {FileEvent::buffer_opened(file), FileEvent::buffer_edited(file)};
@@ -59,7 +183,8 @@ TEST_CASE(SaveResetsTrialOnly) {
 
     ContextResolver resolver(workspace);
     // A plain save: the disk holds exactly what the buffer holds.
-    Invalidator invalidator(workspace, store, resolver, [](llvm::StringRef) {
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
         return std::optional<std::string>{"int x;"};
     });
     auto dirty = invalidator.apply(FileEvent::buffer_saved(saved));
@@ -75,49 +200,33 @@ TEST_CASE(SaveResetsTrialOnly) {
 }
 
 TEST_CASE(CascadeSplitsOpenClosed) {
-    kota::event_loop loop;
     Workspace workspace;
     SessionStore store;
     auto mod = workspace.path_pool.intern("/proj/m.cppm");
     auto open_user = workspace.path_pool.intern("/proj/open_user.cppm");
     auto closed_user = workspace.path_pool.intern("/proj/closed_user.cppm");
 
-    llvm::DenseMap<std::uint32_t, llvm::SmallVector<std::uint32_t>> deps;
-    deps[open_user] = {mod};
-    deps[closed_user] = {mod};
-    workspace.compile_graph = std::make_unique<CompileGraph>(
-        loop,
-        [](std::uint32_t, bool) -> kota::task<CompileUnit::Outcome> {
-            co_return CompileUnit::Outcome::Success;
-        },
-        [deps = std::move(deps)](std::uint32_t id) -> llvm::SmallVector<std::uint32_t> {
-            auto it = deps.find(id);
-            return it != deps.end() ? it->second : llvm::SmallVector<std::uint32_t>{};
-        });
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    // The consumer edges build_deps declares in production — no rounds.
+    auto node = [](std::uint32_t pid) {
+        return NodeId{pcm_family, pid};
+    };
+    ph.graph.declare(node(open_user), {node(mod)});
+    ph.graph.declare(node(closed_user), {node(mod)});
 
     store.open(open_user);
-    ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
 
-    auto body = [&]() -> kota::task<> {
-        co_await workspace.compile_graph->compile(open_user);
-        co_await workspace.compile_graph->compile(closed_user);
+    auto dirty = invalidator.apply(FileEvent::buffer_saved(mod));
 
-        auto dirty = invalidator.apply(FileEvent::buffer_saved(mod));
-
-        // Cascade-dirtied module units split by session state: open buffers
-        // recompile, closed files go back to the background indexer.
-        EXPECT_EQ(dirty.mark_ast_dirty, llvm::SmallVector<std::uint32_t>{open_user});
-        llvm::SmallVector<std::uint32_t> reindexed{mod, closed_user};
-        llvm::sort(reindexed);
-        EXPECT_EQ(dirty.reindex_deps_only, reindexed);
-        EXPECT_TRUE(dirty.reindex_content_changed.empty());
-
-        co_await workspace.compile_graph->shutdown();
-    };
-    auto task = body();
-    loop.schedule(task);
-    loop.run();
+    // Cascade-dirtied module units split by session state: open buffers
+    // recompile, closed files go back to the background indexer.
+    EXPECT_EQ(dirty.mark_ast_dirty, llvm::SmallVector<std::uint32_t>{open_user});
+    llvm::SmallVector<std::uint32_t> reindexed{mod, closed_user};
+    llvm::sort(reindexed);
+    EXPECT_EQ(dirty.reindex_deps_only, reindexed);
+    EXPECT_TRUE(dirty.reindex_content_changed.empty());
 }
 
 TEST_CASE(ChainHitAndMiss) {
@@ -136,7 +245,8 @@ TEST_CASE(ChainHitAndMiss) {
     resolver.header_contexts[hit].chain = {saved};
     resolver.header_contexts[miss].chain = {other};
     resolver.header_contexts[closed].chain = {saved};
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::buffer_saved(saved));
 
     // Every context embedding the saved file re-validates and drops its
@@ -165,7 +275,8 @@ TEST_CASE(SaveMarksDependents) {
     store.open(open_tu);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::buffer_saved(header));
 
     // Open dependents recompile, closed ones reindex; the old/new dependent
@@ -187,7 +298,8 @@ TEST_CASE(TransitiveDependentsEnqueue) {
     workspace.dep_graph.build_reverse_map();
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::buffer_saved(header));
 
     // Only root TUs own index shards; the intermediate header is not one.
@@ -209,7 +321,8 @@ TEST_CASE(StaleReverseMapUnion) {
     workspace.dep_graph.set_includes(unmapped, 0, {header});
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::buffer_saved(header));
 
     llvm::SmallVector<std::uint32_t> expected{known, unmapped};
@@ -225,7 +338,8 @@ TEST_CASE(CloseWithoutShardReindexes) {
 
     ContextResolver resolver(workspace);
     // The file exists on disk (injected read), it just was never indexed.
-    Invalidator invalidator(workspace, store, resolver, [](llvm::StringRef) {
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
         return std::optional<std::string>("int x;");
     });
     auto dirty = invalidator.apply(FileEvent::buffer_closed(closed));
@@ -246,7 +360,8 @@ TEST_CASE(CloseCurrentShardDepsOnly) {
     ContextResolver resolver(workspace);
     // Disk matches the content the shard was built from: a browse-and-close
     // must not blank the file's rows for the reindex queue's latency.
-    Invalidator invalidator(workspace, store, resolver, [](llvm::StringRef) {
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
         return std::optional<std::string>{"int x;"};
     });
     auto dirty = invalidator.apply(FileEvent::buffer_closed(closed));
@@ -264,13 +379,228 @@ TEST_CASE(CloseDivergentShardContentChanged) {
     ContextResolver resolver(workspace);
     // Disk holds edits the shard never saw (saved while open): the shard's
     // rows describe text that no longer exists.
-    Invalidator invalidator(workspace, store, resolver, [](llvm::StringRef) {
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
         return std::optional<std::string>{"int edited;"};
     });
     auto dirty = invalidator.apply(FileEvent::buffer_closed(closed));
 
     ASSERT_EQ(dirty.reindex_content_changed, llvm::SmallVector<std::uint32_t>{closed});
     ASSERT_TRUE(dirty.reindex_deps_only.empty());
+}
+
+TEST_CASE(CloseStaleModuleCascades) {
+    // An external rewrite consumed while the interface was open skipped the
+    // module cascade (buffer authoritative) and the tracker will not refire:
+    // the close must deliver it, or importers keep the pre-change PCM.
+    Workspace workspace;
+    SessionStore store;
+    auto mod = workspace.path_pool.intern("/proj/m.cppm");
+    auto user = workspace.path_pool.intern("/proj/user.cpp");
+    workspace.shards[mod] = shard_of("export module m;\nexport int v1();\n");
+    workspace.pcm_cache[mod] = {
+        .path = "/cache/m.pcm",
+        .key = "k",
+        .deps = {.deps = {DepState{.path_id = mod, .missing = true}}},
+    };
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    ph.graph.declare(
+        {
+            turun_family,
+            user
+    },
+        {{pcm_family, mod}});
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
+        return std::optional<std::string>{"export module m;\nexport int v2();\n"};
+    });
+    auto dirty = invalidator.apply(FileEvent::buffer_closed(mod));
+
+    EXPECT_TRUE(llvm::is_contained(dirty.reindex_content_changed, mod));
+    EXPECT_TRUE(llvm::is_contained(dirty.reindex_deps_only, user));
+    EXPECT_TRUE(workspace.pcm_cache.empty());
+}
+
+TEST_CASE(CloseRefreshesEdges) {
+    // The shard can be current while the include edges are not (an
+    // agent-mode reindex read the rewritten disk while the file stayed
+    // open): the close refreshes the edges without a cascade.
+    TempDir tmp;
+    tmp.touch("new.h", "#pragma once\n");
+    tmp.touch("a.cpp", "#include \"new.h\"\nint main() { return 0; }\n");
+
+    Workspace workspace;
+    SessionStore store;
+    auto file = workspace.path_pool.intern(tmp.path("a.cpp"));
+    auto old_header = workspace.path_pool.intern("/proj/old.h");
+    auto new_header = workspace.path_pool.intern(tmp.path("new.h"));
+    workspace.dep_graph.set_includes(file, 0, {old_header});
+    workspace.dep_graph.build_reverse_map();
+
+    auto disk = llvm::MemoryBuffer::getFile(tmp.path("a.cpp"));
+    workspace.shards[file] = shard_of((*disk)->getBuffer());
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
+    invalidator.apply(FileEvent::buffer_closed(file));
+
+    auto includes = workspace.dep_graph.get_all_includes(file);
+    EXPECT_TRUE(llvm::is_contained(includes, new_header));
+    EXPECT_FALSE(llvm::is_contained(includes, old_header));
+}
+
+TEST_CASE(DeferredDiskChangeCascades) {
+    // A DiskChanged consumed while the header was open defers the
+    // dependent cascade to the close, and an agent-mode reindex can
+    // refresh the shard from the rewritten disk before then: a current
+    // shard must not hide the recorded debt from the close.
+    Workspace workspace;
+    SessionStore store;
+    auto header = workspace.path_pool.intern("/proj/h.h");
+    auto tu = workspace.path_pool.intern("/proj/a.cpp");
+    workspace.dep_graph.set_includes(tu, 0, {header});
+    workspace.dep_graph.build_reverse_map();
+    workspace.shards[header] = shard_of("int rewritten;");
+    store.open(header);
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
+        return std::optional<std::string>{"int rewritten;"};
+    });
+
+    auto deferred = invalidator.apply(FileEvent::disk_changed(header));
+    ASSERT_TRUE(deferred.reindex_deps_only.empty());
+
+    store.close(header);
+    auto dirty = invalidator.apply(FileEvent::buffer_closed(header));
+
+    EXPECT_TRUE(llvm::is_contained(dirty.reindex_deps_only, tu));
+    EXPECT_TRUE(llvm::is_contained(dirty.reindex_deps_only, header));
+    EXPECT_TRUE(dirty.recheck_contexts);
+}
+
+TEST_CASE(CloseFirstProviderCascades) {
+    // An external rewrite can make an open file a module's first provider
+    // with the shard already current (an agent-mode reindex read the
+    // rewritten disk): the close-time edge refresh must reach the name's
+    // sentinel-edged consumers exactly as a save would.
+    TempDir tmp;
+    tmp.touch("m.cppm", "export module m;\n");
+
+    Workspace workspace;
+    SessionStore store;
+    auto iface = workspace.path_pool.intern(tmp.path("m.cppm"));
+    auto importer = workspace.path_pool.intern("/proj/use.cpp");
+
+    auto disk = llvm::MemoryBuffer::getFile(tmp.path("m.cppm"));
+    workspace.shards[iface] = shard_of((*disk)->getBuffer());
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    ph.graph.declare({turun_family, importer}, {PCMFamily::unresolved_node("m")});
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
+
+    auto dirty = invalidator.apply(FileEvent::buffer_closed(iface));
+    EXPECT_TRUE(llvm::is_contained(dirty.reindex_content_changed, importer));
+}
+
+TEST_CASE(CloseProviderRenameCascades) {
+    // An external rewrite can rename an open provider's module while an
+    // agent-mode reindex keeps the shard current and an evicted PCM
+    // leaves no cache entry for the close path's staleness probe: the
+    // rescan's map delta is the only remaining signal, and it must
+    // cascade the old name's consumers through the provider's node.
+    TempDir tmp;
+    tmp.touch("m.cppm", "export module b;\n");
+
+    Workspace workspace;
+    SessionStore store;
+    auto iface = workspace.path_pool.intern(tmp.path("m.cppm"));
+    auto importer = workspace.path_pool.intern("/proj/use.cpp");
+    workspace.path_to_module[iface] = "a";
+    workspace.dep_graph.update_module_decl(iface, "a");
+
+    auto disk = llvm::MemoryBuffer::getFile(tmp.path("m.cppm"));
+    workspace.shards[iface] = shard_of((*disk)->getBuffer());
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    ph.graph.declare(
+        {
+            turun_family,
+            importer
+    },
+        {{pcm_family, iface}});
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
+
+    auto dirty = invalidator.apply(FileEvent::buffer_closed(iface));
+    EXPECT_TRUE(llvm::is_contained(dirty.reindex_deps_only, importer));
+}
+
+TEST_CASE(CloseKeepsGuardedProvider) {
+    // A close/save rescan meeting a module declaration inside a
+    // preprocessor conditional must resolve it the way the startup scan
+    // does (scan_quick alone leaves the name empty) instead of dropping
+    // the provider and leaving its importers unresolved.
+    TempDir tmp;
+    tmp.touch("m.cpp", "#if 1\nexport module m;\n#endif\n");
+
+    Workspace workspace;
+    SessionStore store;
+    auto iface = workspace.path_pool.intern(tmp.path("m.cpp"));
+    workspace.path_to_module[iface] = "m";
+    workspace.dep_graph.update_module_decl(iface, "m");
+
+    auto disk = llvm::MemoryBuffer::getFile(tmp.path("m.cpp"));
+    workspace.shards[iface] = shard_of((*disk)->getBuffer());
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
+
+    invalidator.apply(FileEvent::buffer_closed(iface));
+
+    EXPECT_EQ(workspace.path_to_module.lookup(iface), "m");
+    EXPECT_TRUE(llvm::is_contained(workspace.dep_graph.lookup_module("m"), iface));
+}
+
+TEST_CASE(CloseStalePCMCascades) {
+    // Agent-mode corner: a reindex read the rewritten disk while the file
+    // was open, so the shard is current — but the PCM consumed bytes the
+    // disk no longer holds. The artifact's deps snapshot is the judge, and
+    // the current shard keeps serving (deps-only).
+    Workspace workspace;
+    SessionStore store;
+    auto mod = workspace.path_pool.intern("/proj/m.cppm");
+    auto user = workspace.path_pool.intern("/proj/user.cpp");
+    workspace.shards[mod] = shard_of("export module m;\nexport int v2();\n");
+    workspace.pcm_cache[mod] = {
+        .path = "/cache/m.pcm",
+        .key = "k",
+        .deps = {.deps = {DepState{.path_id = mod, .hash = 1234}}},
+    };
+
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    ph.graph.declare(
+        {
+            turun_family,
+            user
+    },
+        {{pcm_family, mod}});
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
+        return std::optional<std::string>{"export module m;\nexport int v2();\n"};
+    });
+    auto dirty = invalidator.apply(FileEvent::buffer_closed(mod));
+
+    llvm::SmallVector<std::uint32_t> reindexed{mod, user};
+    llvm::sort(reindexed);
+    EXPECT_EQ(dirty.reindex_deps_only, reindexed);
+    EXPECT_TRUE(dirty.reindex_content_changed.empty());
+    EXPECT_TRUE(workspace.pcm_cache.empty());
 }
 
 TEST_CASE(CrashMarksLostDirty) {
@@ -282,7 +612,8 @@ TEST_CASE(CrashMarksLostDirty) {
     store.open(second);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     std::uint32_t lost[] = {first, second};
     auto dirty = invalidator.apply(FileEvent::worker_crashed(lost));
 
@@ -301,7 +632,8 @@ TEST_CASE(EvictionMarksLost) {
     store.open(file);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::document_evicted(file));
 
     // Same loss as a crash, scoped to one document.
@@ -317,7 +649,8 @@ TEST_CASE(BatchSavesDeduplicate) {
     store.open(saved);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     FileEvent events[] = {FileEvent::buffer_saved(saved), FileEvent::buffer_saved(saved)};
     auto dirty = invalidator.apply(events);
 
@@ -333,7 +666,8 @@ TEST_CASE(SaveDivergentDiskDirties) {
 
     ContextResolver resolver(workspace);
     // A save hook rewrote the file as it landed: disk != buffer.
-    Invalidator invalidator(workspace, store, resolver, [](llvm::StringRef) {
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
         return std::optional<std::string>{"int disk;"};
     });
     auto dirty = invalidator.apply(FileEvent::buffer_saved(saved));
@@ -353,7 +687,8 @@ TEST_CASE(SaveUnreadableDiskDirties) {
     ContextResolver resolver(workspace);
     // The file cannot be read back after the save: the disk state is
     // unknown, which is treated as divergent (conservative).
-    Invalidator invalidator(workspace, store, resolver, [](llvm::StringRef) {
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
         return std::optional<std::string>{};
     });
     auto dirty = invalidator.apply(FileEvent::buffer_saved(saved));
@@ -368,7 +703,8 @@ TEST_CASE(DiskChangeOpenMarksDirty) {
     store.open(open_file);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::disk_changed(open_file));
 
     // The buffer is the truth for an open file: recompile so the next
@@ -394,7 +730,8 @@ TEST_CASE(DiskChangeClosedCascades) {
     store.open(open_tu);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::disk_changed(header));
 
     // A closed file's disk change cascades exactly like a save, plus the
@@ -420,7 +757,8 @@ TEST_CASE(DiskRemovedScrubsSourceRole) {
     auto epoch = workspace.context_epoch;
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::disk_removed(removed_tu));
 
     // The removed file stops being an includer (and thus a host-source
@@ -445,7 +783,8 @@ TEST_CASE(RemoveRecreateBatchOrder) {
     workspace.dep_graph.set_includes(file, 0, {});
     workspace.dep_graph.build_reverse_map();
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
 
     // Change then delete: the removal is the later fact, the clear wins.
     {
@@ -482,7 +821,8 @@ TEST_CASE(EntryChangeThenRemoval) {
     auto file = workspace.path_pool.intern(tmp.path("a.cpp"));
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     FileEvent::CDBDelta delta;
     delta.changed = {file};
     FileEvent events[] = {FileEvent::cdb_changed(std::move(delta)), FileEvent::disk_removed(file)};
@@ -502,7 +842,8 @@ TEST_CASE(CloseOfDeletedFile) {
     auto file = workspace.path_pool.intern("/proj/gone.cpp");
     ContextResolver resolver(workspace);
     // Disk read fails: the file vanished while it was open.
-    Invalidator invalidator(workspace, store, resolver, [](llvm::StringRef) {
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm, [](llvm::StringRef) {
         return std::optional<std::string>{};
     });
 
@@ -531,7 +872,8 @@ TEST_CASE(CDBAddedScansAndEnqueues) {
     auto header_id = workspace.path_pool.intern(tmp.path("inc/header.h"));
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     FileEvent::CDBDelta delta;
     delta.added = {main_id};
     auto dirty = invalidator.apply(FileEvent::cdb_changed(std::move(delta)));
@@ -543,7 +885,6 @@ TEST_CASE(CDBAddedScansAndEnqueues) {
     ASSERT_EQ(dirty.drop_index, llvm::SmallVector<std::uint32_t>{main_id});
     ASSERT_TRUE(dirty.reindex_deps_only.empty());
     ASSERT_TRUE(dirty.recheck_contexts);
-    ASSERT_TRUE(dirty.ensure_compile_graph);
 }
 
 TEST_CASE(CDBChangedSplitsOpenClosed) {
@@ -565,7 +906,8 @@ TEST_CASE(CDBChangedSplitsOpenClosed) {
     workspace.shards[closed_id];
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     FileEvent::CDBDelta delta;
     delta.changed = {open_id, closed_id};
     auto dirty = invalidator.apply(FileEvent::cdb_changed(std::move(delta)));
@@ -599,7 +941,8 @@ TEST_CASE(CDBAddedOpenMarksDirty) {
     store.open(file);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     FileEvent::CDBDelta delta;
     delta.added = {file};
     auto dirty = invalidator.apply(FileEvent::cdb_changed(std::move(delta)));
@@ -627,7 +970,8 @@ TEST_CASE(CDBChangedDropsHostedContext) {
     resolver.header_contexts[open_header].host_path_id = host;
     resolver.header_contexts[closed_header].host_path_id = host;
     resolver.header_contexts[other_header].host_path_id = no_path_id;
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     FileEvent::CDBDelta delta;
     delta.changed = {host};
     auto dirty = invalidator.apply(FileEvent::cdb_changed(std::move(delta)));
@@ -650,55 +994,39 @@ TEST_CASE(CDBChangedDropsHostedContext) {
 }
 
 TEST_CASE(CDBChangedCascadesModule) {
-    kota::event_loop loop;
     Workspace workspace;
     SessionStore store;
     auto mod = workspace.path_pool.intern("/proj/m.cppm");
     auto open_user = workspace.path_pool.intern("/proj/open_user.cppm");
     auto closed_user = workspace.path_pool.intern("/proj/closed_user.cppm");
 
-    llvm::DenseMap<std::uint32_t, llvm::SmallVector<std::uint32_t>> deps;
-    deps[open_user] = {mod};
-    deps[closed_user] = {mod};
-    workspace.compile_graph = std::make_unique<CompileGraph>(
-        loop,
-        [](std::uint32_t, bool) -> kota::task<CompileUnit::Outcome> {
-            co_return CompileUnit::Outcome::Success;
-        },
-        [deps = std::move(deps)](std::uint32_t id) -> llvm::SmallVector<std::uint32_t> {
-            auto it = deps.find(id);
-            return it != deps.end() ? it->second : llvm::SmallVector<std::uint32_t>{};
-        });
+    ContextResolver resolver(workspace);
+    PCMHarness ph(workspace, resolver);
+    // The consumer edges build_deps declares in production — no rounds.
+    auto node = [](std::uint32_t pid) {
+        return NodeId{pcm_family, pid};
+    };
+    ph.graph.declare(node(open_user), {node(mod)});
+    ph.graph.declare(node(closed_user), {node(mod)});
 
     store.open(open_user);
-    ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
 
-    auto body = [&]() -> kota::task<> {
-        co_await workspace.compile_graph->compile(open_user);
-        co_await workspace.compile_graph->compile(closed_user);
+    FileEvent::CDBDelta delta;
+    delta.changed = {mod};
+    auto dirty = invalidator.apply(FileEvent::cdb_changed(std::move(delta)));
 
-        FileEvent::CDBDelta delta;
-        delta.changed = {mod};
-        auto dirty = invalidator.apply(FileEvent::cdb_changed(std::move(delta)));
-
-        // A module unit's flag change cascades through the compile graph
-        // exactly like a content change: importers' PCMs went stale. The
-        // unit itself lands in both lists (its own entry changed AND the
-        // cascade dirtied its PCM); the indexer's absorbing upgrade
-        // resolves the overlap to ContentChanged.
-        EXPECT_EQ(dirty.mark_ast_dirty, llvm::SmallVector<std::uint32_t>{open_user});
-        EXPECT_EQ(dirty.reindex_content_changed, llvm::SmallVector<std::uint32_t>{mod});
-        EXPECT_EQ(dirty.drop_index, llvm::SmallVector<std::uint32_t>{mod});
-        llvm::SmallVector<std::uint32_t> deps{mod, closed_user};
-        llvm::sort(deps);
-        EXPECT_EQ(dirty.reindex_deps_only, deps);
-
-        co_await workspace.compile_graph->shutdown();
-    };
-    auto task = body();
-    loop.schedule(task);
-    loop.run();
+    // A module unit's flag change cascades through the compile graph
+    // exactly like a content change: importers' PCMs went stale. The
+    // unit itself lands in both lists (its own entry changed AND the
+    // cascade dirtied its PCM); the indexer's absorbing upgrade
+    // resolves the overlap to ContentChanged.
+    EXPECT_EQ(dirty.mark_ast_dirty, llvm::SmallVector<std::uint32_t>{open_user});
+    EXPECT_EQ(dirty.reindex_content_changed, llvm::SmallVector<std::uint32_t>{mod});
+    EXPECT_EQ(dirty.drop_index, llvm::SmallVector<std::uint32_t>{mod});
+    llvm::SmallVector<std::uint32_t> deps{mod, closed_user};
+    llvm::sort(deps);
+    EXPECT_EQ(dirty.reindex_deps_only, deps);
 }
 
 TEST_CASE(DiskRemovedReindexesIncluders) {
@@ -713,7 +1041,8 @@ TEST_CASE(DiskRemovedReindexesIncluders) {
     store.open(open_tu);
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::disk_removed(header));
 
     // Dependents now compile against a missing include: open ones
@@ -744,7 +1073,8 @@ TEST_CASE(CDBRemovedDropsSourceRole) {
     auto kept_id = workspace.path_pool.intern(tmp.path("kept.cpp"));
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     FileEvent::CDBDelta delta;
     delta.removed = {gone_id};
     auto dirty = invalidator.apply(FileEvent::cdb_changed(std::move(delta)));
@@ -762,7 +1092,8 @@ TEST_CASE(CDBEmptyDeltaNoEffects) {
     SessionStore store;
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     auto dirty = invalidator.apply(FileEvent::cdb_changed({}));
 
     ASSERT_TRUE(dirty.empty());
@@ -775,7 +1106,8 @@ TEST_CASE(BatchDiskEventsDeduplicate) {
     auto second = workspace.path_pool.intern("/proj/b.h");
 
     ContextResolver resolver(workspace);
-    Invalidator invalidator(workspace, store, resolver);
+    PCMHarness ph(workspace, resolver);
+    Invalidator invalidator(workspace, store, resolver, ph.pcm);
     FileEvent events[] = {FileEvent::disk_changed(first),
                           FileEvent::disk_changed(first),
                           FileEvent::disk_changed(second)};
@@ -803,7 +1135,8 @@ TEST_CASE(SurvivingEdgeKeepsChoice) {
     auto session = store.open(header);
     resolver.saved_contexts[header] = SavedContext{host, std::nullopt, ""};
 
-    ASSERT_FALSE(resolver.drop_orphaned_choices(store));
+    ASTHarness harness(workspace, resolver, store);
+    ASSERT_FALSE(ContextService{workspace, resolver, harness.ast}.drop_orphaned_choices(store));
     ASSERT_TRUE(resolver.saved_contexts.contains(header));
 }
 
@@ -821,9 +1154,11 @@ TEST_CASE(RemovedEdgeDropsChoice) {
     resolver.saved_contexts[header] = SavedContext{host, std::nullopt, ""};
     auto generation = session->generation;
 
-    ASSERT_TRUE(resolver.drop_orphaned_choices(store));
+    ASTHarness harness(workspace, resolver, store);
+    harness.ast.projections.entries[header].current = true;
+    ASSERT_TRUE(ContextService{workspace, resolver, harness.ast}.drop_orphaned_choices(store));
     ASSERT_FALSE(resolver.header_contexts.contains(header));
-    ASSERT_TRUE(session->ast_dirty);
+    ASSERT_FALSE(harness.ast.projections.current(header));
     ASSERT_FALSE(session->trial_done);
     ASSERT_EQ(session->generation, generation + 1);
     ASSERT_FALSE(resolver.saved_contexts.contains(header));
@@ -846,7 +1181,8 @@ TEST_CASE(VanishedOccurrenceDropsChoice) {
     store.open(header);
     resolver.saved_contexts[header] = SavedContext{host, 1, ""};
 
-    ASSERT_TRUE(resolver.drop_orphaned_choices(store));
+    ASTHarness harness(workspace, resolver, store);
+    ASSERT_TRUE(ContextService{workspace, resolver, harness.ast}.drop_orphaned_choices(store));
     ASSERT_FALSE(resolver.saved_contexts.contains(header));
 }
 

@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -21,6 +22,74 @@ namespace clang {
 class CodeCompleteConsumer;
 
 }
+
+namespace clice::tidy {
+
+/// The frozen clang-tidy configuration of one run. Plain data on purpose:
+/// it travels in worker requests and in the TURun family's product plan,
+/// both of which freeze it at takeoff.
+struct TidyParams {
+    /// Effective checks glob list in clang-tidy syntax; empty falls back
+    /// to the built-in default set.
+    std::string checks;
+
+    /// Restrict the run to checks classified fast — the interactive
+    /// path's latency guard. Batch lint runs everything configured.
+    bool fast_only = true;
+
+    /// Check options (the .clang-tidy CheckOptions map).
+    std::vector<std::pair<std::string, std::string>> options;
+
+    /// Checks whose findings report as errors (WarningsAsErrors globs).
+    std::string warnings_as_errors;
+
+    /// Also report findings in headers matching this regex (clang-tidy's
+    /// HeaderFilterRegex; empty = main file only).
+    std::string header_filter;
+
+    /// Headers excluded from reporting even when header_filter matches
+    /// (clang-tidy's ExcludeHeaderFilterRegex).
+    std::string exclude_header_filter;
+
+    /// Also report findings in system headers.
+    bool system_headers = false;
+
+    /// Extra compiler args from the configuration. -W<group> flags are
+    /// consumed engine-side by apply_warning_options so the Checks gate
+    /// applies (the clangd approach, see tidy.cpp); a batch lint run
+    /// additionally applies the remaining args (command_extra_args) to
+    /// its driver command at resolution, as clang-tidy itself does. The
+    /// interactive command is never rewritten.
+    std::vector<std::string> extra_args;
+    std::vector<std::string> extra_args_before;
+};
+
+/// Resolve the effective clang-tidy configuration for `file` from its
+/// nearest .clang-tidy files (clang-tidy's own search and inheritance
+/// semantics). Files without any configuration return empty checks — the
+/// consumer's default set applies.
+TidyParams resolve_tidy_params(llvm::StringRef file);
+
+/// The plan's compilation-affecting extra args, split for clang-tidy's
+/// own insertion points on the driver command: extra_args_before prepend
+/// right after the binary name, extra_args append at the end. Applied
+/// BEFORE toolchain resolution, so the driver itself interprets
+/// pass-throughs and driver-only options (-Wp,, -Xpreprocessor,
+/// --target) when it produces the cc1 line.
+struct CommandExtraArgs {
+    std::vector<std::string> prepend;
+    std::vector<std::string> append;
+};
+
+/// Split the plan's extra args into the command-affecting halves. -W
+/// warning flags are withheld — they reach the diagnostics engine through
+/// apply_warning_options, where the Checks gate applies; on the command
+/// they would bypass it. -Wp,/-Wl,/-Wa, are driver pass-throughs, not
+/// warning flags, and stay in.
+CommandExtraArgs command_extra_args(llvm::ArrayRef<std::string> extra_args,
+                                    llvm::ArrayRef<std::string> extra_args_before);
+
+}  // namespace clice::tidy
 
 namespace clice {
 
@@ -68,8 +137,8 @@ struct CompilationParams {
     /// The kind of this compilation.
     CompilationKind kind;
 
-    /// Whether to run clang-tidy.
-    bool clang_tidy = false;
+    /// Run clang-tidy over the parse with this frozen configuration.
+    std::optional<tidy::TidyParams> tidy;
 
     /// Whether to collect the syntax::TokenBuffer during the run. Features
     /// need it; measurement paths turn it off to isolate its cost.

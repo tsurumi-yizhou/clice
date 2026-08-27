@@ -9,17 +9,18 @@
 
 #include "version.h"
 #include "command/argument_parser.h"
+#include "sched/context.h"
 #include "semantic/symbol.h"
-#include "server/compiler/context_resolver.h"
 #include "server/protocol/extension.h"
-#include "server/protocol/serialize.h"
 #include "server/service/format.h"
 #include "server/state/file_tracker.h"
 #include "server/transport/master_server.h"
+#include "server/transport/uri.h"
 #include "support/anomaly.h"
 #include "support/filesystem.h"
 #include "support/logging.h"
 #include "syntax/preamble_synthesis.h"
+#include "worker/serialize.h"
 
 #include "kota/codec/json/json.h"
 #include "kota/ipc/lsp/position.h"
@@ -61,12 +62,10 @@ static void fire_refresh(kota::event_loop& loop, kota::ipc::JsonPeer& peer, Para
 }
 
 LSPClient::LSPClient(MasterServer& server, kota::ipc::JsonPeer& peer) : server(server), peer(peer) {
-    output_conn = server.compiler.on_output.connect(
+    output_conn = server.ast.on_output.connect(
         [this](const std::shared_ptr<Session>& session) { push_output(*session); });
-    progress_conn =
-        server.indexer.on_progress_changed.connect([this]() { report_index_progress(); });
-    serving_conn =
-        server.indexer.on_serving_rows_changed.connect([this]() { refresh_index_served(); });
+    progress_conn = server.pump.on_progress_changed.connect([this]() { report_index_progress(); });
+    serving_conn = server.on_serving_rows_changed.connect([this]() { refresh_index_served(); });
 
     // Guidance/anomaly messages travel as window/logMessage, which the LSP
     // spec allows before the initialize handshake — drain what a headless
@@ -230,14 +229,15 @@ void LSPClient::register_lifecycle() {
         // output would pair stale inactive regions (whose notification
         // carries no version) with the new text — the next compile pushes
         // fresh results instead.
-        srv.sessions.for_each(
-            [this]([[maybe_unused]] std::uint32_t path_id, const Session& session) {
-                if(session.output.has_value() && !session.ast_dirty &&
-                   session.output->version == session.version) {
-                    this->push_output(session);
-                }
-                return true;
-            });
+        srv.sessions.for_each([this](std::uint32_t path_id, const Session& session) {
+            auto projection = this->server.ast.projections.projection(path_id);
+            if(projection && projection->output.has_value() &&
+               this->server.ast.projections.current(path_id) &&
+               projection->output->version == session.version) {
+                this->push_output(session);
+            }
+            return true;
+        });
     });
 
     peer.on_request(
@@ -279,7 +279,7 @@ void LSPClient::register_document_sync() {
 
         // A context choice persisted from an earlier session stays
         // authoritative only if it still holds.
-        srv.contexts.validate_saved_context(*session);
+        srv.contexts.validate_saved_context(session->path_id);
 
         srv.dispatch(FileEvent::buffer_opened(path_id));
         srv.settle_open_serving(session);
@@ -310,15 +310,16 @@ void LSPClient::register_document_sync() {
 
         srv.sessions.apply_change(*session, params.content_changes, params.text_document.version);
 
-        // The edit just made any in-flight compile stale. Abandon it now
+        // The edit just made any in-flight compile stale. Supersede it now
         // instead of waiting for the next AST-backed request to observe
-        // the supersede: with no follow-up request the stale parse (or its
-        // dependency prep) would run to completion and hold up its waiters.
-        srv.compiler.abandon_superseded(*session);
+        // it: the round's advisory token releases its dependency waits,
+        // and the CancelCompile interrupt keeps a stale parse from
+        // holding up its waiters.
+        srv.ast.supersede(path_id);
 
         // Editing is the canonical escalation trigger: from here on the
         // session invests in PCH/AST.
-        srv.compiler.escalate(*session);
+        srv.ast.escalate(*session);
 
         srv.dispatch(FileEvent::buffer_edited(path_id));
 
@@ -607,7 +608,7 @@ void LSPClient::register_extensions() {
         [this](RequestContext& ctx, const ext::QueryContextParams& params) -> RawResult {
             this->server.pool.foreground_pulse();
             auto [path, path_id, session] = resolve_uri(params.uri);
-            co_return to_raw(this->server.contexts.query_contexts(path, path_id, params));
+            co_return to_raw(this->server.context_service.query_contexts(path, path_id, params));
         });
 
     peer.on_request(
@@ -615,7 +616,8 @@ void LSPClient::register_extensions() {
         [this](RequestContext& ctx, const ext::CurrentContextParams& params) -> RawResult {
             this->server.pool.foreground_pulse();
             auto [path, path_id, session] = resolve_uri(params.uri);
-            co_return to_raw(this->server.contexts.current_context(path, session.get(), params));
+            co_return to_raw(
+                this->server.context_service.current_context(path, session.get(), params));
         });
 
     peer.on_request(
@@ -627,17 +629,17 @@ void LSPClient::register_extensions() {
             // The session reset lives inside switch_context (single owner,
             // synchronous, no cross-file cascade — exempt from the event
             // pipeline; see the Invalidator charter).
-            auto result = this->server.contexts.switch_context(path,
-                                                               path_id,
-                                                               session.get(),
-                                                               context_path,
-                                                               context_path_id,
-                                                               params);
+            auto result = this->server.context_service.switch_context(path,
+                                                                      path_id,
+                                                                      session.get(),
+                                                                      context_path,
+                                                                      context_path_id,
+                                                                      params);
             // A context choice asks for the context-pure AST view; the
             // merged index cannot give it (union rows). A rejected switch
             // (stale epoch, bad host) changed no context and owes none.
             if(result.success) {
-                this->server.compiler.escalate(*session);
+                this->server.ast.escalate(*session);
             }
             co_return to_raw(result);
         });
@@ -712,11 +714,11 @@ void LSPClient::register_extensions() {
             stats.pch_cache_entries = static_cast<std::uint32_t>(srv.workspace.pch_cache.size());
 
             stats.index_inmemory_shards =
-                static_cast<std::uint32_t>(srv.indexer.pending_shard_writes());
+                static_cast<std::uint32_t>(srv.index_store.pending_shard_writes());
             for(auto& [path_id, shard]: srv.workspace.shards) {
                 stats.index_shard_content_bytes += shard.bytes().size();
             }
-            stats.last_save_shards = static_cast<std::uint32_t>(srv.indexer.last_save_shards());
+            stats.last_save_shards = static_cast<std::uint32_t>(srv.index_store.last_save_shards());
 
             if(srv.workspace.store) {
                 stats.pending_tmp_files =
@@ -785,14 +787,15 @@ void LSPClient::publish_config_diagnostics() {
 void LSPClient::push_output(const Session& session) {
     // Held back until the handshake completes (the LSP spec forbids
     // publishDiagnostics before the initialize response); the output stays
-    // materialized on the session and the initialized handler replays it.
+    // materialized in the projection and the initialized handler replays it.
     if(!client_ready) {
         return;
     }
-    if(!session.output.has_value()) {
+    auto projection = server.ast.projections.projection(session.path_id);
+    if(!projection || !projection->output.has_value()) {
         return;
     }
-    auto& output = *session.output;
+    auto& output = *projection->output;
 
     auto file_path = std::string(server.workspace.path_pool.resolve(session.path_id));
     auto uri = lsp::URI::from_file_path(file_path);
@@ -847,8 +850,8 @@ void LSPClient::refresh_index_served() {
 }
 
 void LSPClient::report_index_progress() {
-    const auto& p = server.indexer.progress();
-    using Stage = Indexer::Progress::Stage;
+    const auto& p = server.pump.progress();
+    using Stage = IndexPump::Progress::Stage;
     auto& st = *index_progress;
     switch(p.stage) {
         case Stage::Begin: {
