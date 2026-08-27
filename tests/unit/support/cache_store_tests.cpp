@@ -95,6 +95,42 @@ TEST_CASE(StoreAndLookup) {
     ASSERT_TRUE(llvm::StringRef(path).ends_with("k1.pch"));
 }
 
+TEST_CASE(RootIgnoreMarkers) {
+    TempDir tmp;
+    auto store = open_store(tmp);
+
+    // Opening alone marks nothing: the root may be a user-configured,
+    // shared directory.
+    ASSERT_FALSE(llvm::sys::fs::exists(tmp.path("root/.gitignore")));
+
+    CacheStore::write_ignore_markers(tmp.path("root"));
+
+    // config.toml stays visible: the root doubles as .clice/config.toml.
+    ASSERT_EQ(fs::read(tmp.path("root/.gitignore")).value_or(""), "*\n!config.toml\n");
+    auto tag = fs::read(tmp.path("root/CACHEDIR.TAG")).value_or("");
+    ASSERT_TRUE(llvm::StringRef(tag).starts_with("Signature: 8a477f597d28d172789f06886806bc55"));
+}
+
+TEST_CASE(MarkersCreateRoot) {
+    TempDir tmp;
+
+    // Sessions mark the defaulted root before anything else creates it.
+    CacheStore::write_ignore_markers(tmp.path("fresh"));
+
+    ASSERT_EQ(fs::read(tmp.path("fresh/.gitignore")).value_or(""), "*\n!config.toml\n");
+    ASSERT_TRUE(llvm::sys::fs::exists(tmp.path("fresh/CACHEDIR.TAG")));
+}
+
+TEST_CASE(IgnoreMarkersPreserved) {
+    TempDir tmp;
+    { auto store = open_store(tmp); }
+    require(fs::write(tmp.path("root/.gitignore"), "custom\n").has_value(), "rewrite failed");
+
+    CacheStore::write_ignore_markers(tmp.path("root"));
+    ASSERT_EQ(fs::read(tmp.path("root/.gitignore")).value_or(""), "custom\n");
+    ASSERT_TRUE(llvm::sys::fs::exists(tmp.path("root/CACHEDIR.TAG")));
+}
+
 TEST_CASE(DropRemovesTmp) {
     TempDir tmp;
     auto store = open_store(tmp);

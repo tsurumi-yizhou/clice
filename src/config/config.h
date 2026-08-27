@@ -54,12 +54,20 @@ struct ProjectConfig {
     KOTATSU_ANNOTATE(defaulted = true,
                      description =
                          "Directory for the unified on-disk cache (PCH, PCM and "
-                         "index artifacts). Empty derives it from XDG_CACHE_HOME "
-                         "(or `~/.cache`) with a per-workspace subdirectory named "
-                         "after the workspace plus a short hash, falling back to "
-                         "`${workspace}/.clice`; the resolved path is printed at "
-                         "startup.")
+                         "index artifacts). Empty defaults to `${workspace}/.clice`, "
+                         "which keeps itself out of version control and backups via "
+                         "generated .gitignore and CACHEDIR.TAG markers (a "
+                         "`.clice/config.toml` stays visible to Git; backup tools "
+                         "honoring CACHEDIR.TAG skip the whole directory); an "
+                         "explicitly configured directory is never marked. The "
+                         "resolved path is printed at startup.")
     <std::string> cache_dir;
+
+    /// Whether finalize() derived cache_dir rather than the user setting
+    /// it. Only such a dedicated root receives the self-ignore markers —
+    /// a configured directory may be shared with other content.
+    KOTATSU_ANNOTATE(skip = true)
+    <bool> cache_dir_defaulted = false;
 
     KOTATSU_ANNOTATE(defaulted = true,
                      description =

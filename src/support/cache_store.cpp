@@ -31,6 +31,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/raw_ostream.h"
 
 namespace clice {
 
@@ -381,6 +382,52 @@ std::expected<CacheStore, std::error_code> CacheStore::open(llvm::StringRef root
     }
 
     return CacheStore(std::move(state));
+}
+
+void CacheStore::write_ignore_markers(llvm::StringRef root) {
+    // The root ignores itself, so the workspace-local default never
+    // pollutes the repository: `*` covers git and everything honoring
+    // gitignore (ripgrep, editor search), except `config.toml` — the root
+    // doubles as the `.clice/config.toml` location, and user configuration
+    // must stay visible. CACHEDIR.TAG (the standard marker backup and
+    // scanning tools skip) sits at the root too: it must cover generated
+    // content outside the store (logs, header-context artifacts), and
+    // root-level files are safe from open()'s layout sweep, which only
+    // scans cache/. The known cost is that CACHEDIR-aware backups also
+    // skip a config.toml kept here — git, which sees it, is the intended
+    // preservation channel.
+    if(auto ec = llvm::sys::fs::create_directories(root)) {
+        LOG_WARN("CacheStore: cannot create {}: {}", root, ec.message());
+        return;
+    }
+    auto write_marker = [](llvm::StringRef path, llvm::StringRef content) {
+        // CD_CreateNew makes creation the existence check, so a marker
+        // that appears concurrently is never overwritten either.
+        int fd = -1;
+        if(auto ec = llvm::sys::fs::openFileForWrite(path, fd, llvm::sys::fs::CD_CreateNew)) {
+            if(ec != std::errc::file_exists) {
+                LOG_WARN("CacheStore: cannot write {}: {}", path, ec.message());
+            }
+            return;
+        }
+        llvm::raw_fd_ostream out(fd, /*shouldClose=*/true);
+        out << content;
+        out.close();
+        if(out.has_error()) {
+            LOG_WARN("CacheStore: cannot write {}: {}", path, out.error().message());
+            // An uncleared error aborts in the stream's destructor.
+            out.clear_error();
+            // CD_CreateNew proved this call created the file, so removing
+            // the partial marker clobbers no concurrent writer and lets a
+            // later session retry.
+            llvm::sys::fs::remove(path);
+        }
+    };
+    write_marker(path::join(root, ".gitignore"), "*\n!config.toml\n");
+    write_marker(path::join(root, "CACHEDIR.TAG"),
+                 "Signature: 8a477f597d28d172789f06886806bc55\n"
+                 "# This file marks a cache directory created by clice.\n"
+                 "# For information see https://bford.info/cachedir/\n");
 }
 
 void CacheStore::register_namespace(CacheNamespace ns) {
