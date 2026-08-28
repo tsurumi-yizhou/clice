@@ -198,6 +198,9 @@ export interface StartOptions {
 
 export interface InitializeOptions {
     initializationOptions?: Record<string, unknown> | undefined;
+    /// Client capabilities to advertise; empty by default so servers see
+    /// the most conservative client unless a test opts in.
+    capabilities?: proto.ClientCapabilities | undefined;
 }
 
 interface Transport {
@@ -216,6 +219,8 @@ export class CliceClient {
     logMessages: proto.LogMessageParams[] = [];
     progressTokens: string[] = [];
     progressEvents: { token: string; value: unknown }[] = [];
+    /// Methods of server→client requests the client answered with null.
+    serverRequests: string[] = [];
     initResult: proto.InitializeResult | null = null;
     /// Bound by initialize(); relative paths in open/openAndWait resolve
     /// against it.
@@ -299,8 +304,11 @@ export class CliceClient {
         });
         // Requests the test client does not model are answered with null
         // instead of "method not found", mirroring pygls' lenient client.
+        // The methods are recorded so tests can assert that a refresh (or
+        // any other server-initiated request) was actually sent.
         raw.onRequest((method) => {
             console.warn(`[client] unhandled server request ${method} -> null`);
+            this.serverRequests.push(method);
             return null;
         });
         raw.onNotification((method) => {
@@ -445,7 +453,7 @@ export class CliceClient {
         const wsUri = URI.file(ws.root).toString();
         const params: proto.InitializeParams = {
             processId: process.pid,
-            capabilities: {},
+            capabilities: options.capabilities ?? {},
             rootUri: wsUri,
             workspaceFolders: [{ uri: wsUri, name: "test" }],
             initializationOptions,
@@ -951,6 +959,29 @@ export class CliceClient {
         return this.sendRequest(proto.SemanticTokensRequest.type, {
             textDocument: { uri },
         });
+    }
+
+    /// Lines carrying at least one token with the `inactive` semantic
+    /// token modifier — the wire form of preprocessor-inactive regions.
+    async inactiveLines(uri: string): Promise<number[]> {
+        const result = await this.semanticTokensFull(uri);
+        const provider = this.initResult?.capabilities.semanticTokensProvider as
+            | proto.SemanticTokensOptions
+            | undefined;
+        const bit = provider?.legend.tokenModifiers.indexOf("inactive") ?? -1;
+        if (bit < 0) {
+            throw new Error("server legend misses the inactive modifier");
+        }
+        const data = result?.data ?? [];
+        const lines = new Set<number>();
+        let line = 0;
+        for (let i = 0; i + 4 < data.length; i += 5) {
+            line += data[i] ?? 0;
+            if (((data[i + 4] ?? 0) & (1 << bit)) !== 0) {
+                lines.add(line);
+            }
+        }
+        return [...lines].sort((a, b) => a - b);
     }
 
     inlayHints(uri: string, range: proto.Range) {

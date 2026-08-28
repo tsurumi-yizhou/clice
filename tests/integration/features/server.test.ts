@@ -52,6 +52,7 @@ test("semantic token modifier legend", ({ client }) => {
         client.initResult!.capabilities.semanticTokensProvider as proto.SemanticTokensOptions
     ).legend;
     expect(legend).toBeDefined();
+    expect(legend.tokenTypes).toContain("identifier");
     expect([...legend.tokenModifiers]).toEqual([
         "declaration",
         "definition",
@@ -75,6 +76,7 @@ test("semantic token modifier legend", ({ client }) => {
         "classScope",
         "fileScope",
         "globalScope",
+        "inactive",
     ]);
 });
 
