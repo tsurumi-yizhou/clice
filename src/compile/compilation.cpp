@@ -6,6 +6,7 @@
 #include "compile/diagnostic.h"
 #include "compile/implement.h"
 #include "semantic/decls.h"
+#include "support/filesystem.h"
 #include "support/logging.h"
 
 #include "kota/ipc/lsp/position.h"
@@ -81,6 +82,20 @@ std::unique_ptr<clang::CompilerInvocation>
             LOG_ERROR_RET(nullptr,
                           " Fail to create invocation, arguments list is: {}",
                           print_argv(params.arguments));
+        }
+    }
+
+    /// The entry's compilation directory governs relative paths in the
+    /// compile (inputs, -include, header search), the same way clang's
+    /// -working-directory does. An explicit -working-directory wins, but
+    /// its own relative value resolves from the compile's directory, like
+    /// the real driver run from there.
+    if(!params.directory.empty()) {
+        auto& working_dir = invocation->getFileSystemOpts().WorkingDir;
+        if(working_dir.empty()) {
+            working_dir = params.directory;
+        } else if(!path::is_absolute(working_dir)) {
+            working_dir = path::join(params.directory, working_dir);
         }
     }
 

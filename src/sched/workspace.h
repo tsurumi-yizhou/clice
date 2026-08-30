@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "command/command.h"
-#include "command/toolchain.h"
 #include "compile/dep_file.h"
 #include "config/config.h"
 #include "index/database.h"
@@ -36,7 +35,7 @@ class ContextResolver;
 
 /// On-disk cache layout version (CacheStore root `cache/v{N}`).
 /// Bump to discard all cached artifacts after incompatible format changes.
-constexpr inline std::uint32_t cache_format_version = 7;
+constexpr inline std::uint32_t cache_format_version = 8;
 
 /// Sentinel for "no path": path pool ids start at 0, so 0 is a real file.
 constexpr inline std::uint32_t no_path_id = ~0u;
@@ -110,6 +109,10 @@ struct HeaderContext {
     /// hosts); empty = the first entry.
     std::string host_command_hash;
 
+    /// Base entry hash of that entry (before rules): stays unique when
+    /// rules collapse two candidates' applied hashes onto one value.
+    std::string host_base_hash;
+
     /// Include chain from host to the target's direct includer (excludes the
     /// target itself). The synthesized preamble embeds these files' content,
     /// so clang never opens them — staleness must be tracked here.
@@ -137,7 +140,12 @@ struct SavedContext {
     /// Pinned include occurrence; no value = automatic.
     std::optional<std::uint32_t> occurrence;
 
-    std::string command_hash;  ///< Pinned CDB entry; empty = none.
+    std::string command_hash;  ///< Pinned CDB entry (rules applied); empty = none.
+
+    /// Base entry hash of the pinned entry, resolved at pin time. The
+    /// applied hash is the protocol identity; the base disambiguates
+    /// candidates whose applied hashes collapse under the current rules.
+    std::string base_hash;
 };
 
 /// Cached PCH state.  Stored in Workspace.pch_cache keyed by the content
@@ -209,9 +217,10 @@ struct Workspace {
     /// overlay.
     Config config;
     CompilationDatabase cdb;
-    Toolchain toolchain;
 
-    PathPool path_pool;
+    /// The single path-id space: the CDB owns it, everything else shares
+    /// it — CDB entry file ids and workspace path ids are the same ids.
+    PathPool& path_pool = cdb.paths();
 
     /// Unified on-disk blob store for PCH/PCM/index artifacts.  Opened by
     /// load_workspace() when cache_dir is configured; absent means caching

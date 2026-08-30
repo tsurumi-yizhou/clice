@@ -11,7 +11,6 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/xxhash.h"
 #include "clang/Driver/Types.h"
 #include "clang/Options/OptionUtils.h"
 
@@ -334,16 +333,6 @@ std::string canonicalize(llvm::ArrayRef<std::string> args, ArgsProfile profile) 
     return buf;
 }
 
-std::string canonical_command_hash(llvm::ArrayRef<std::string> args, llvm::StringRef directory) {
-    auto canonical = canonicalize(args, ArgsProfile::Frontend);
-    // Identical argv can still mean different compiles when relative paths
-    // (-include config.h) resolve against different working directories.
-    canonical += '\0';
-    canonical += directory;
-    auto hash = llvm::xxh3_64bits(llvm::StringRef(canonical));
-    return std::format("{:016x}", hash);
-}
-
 std::string print_argv(llvm::ArrayRef<const char*> args) {
     std::string buf;
     llvm::raw_string_ostream os(buf);
@@ -377,8 +366,9 @@ unsigned default_visibility(llvm::StringRef driver) {
     if(is_cl(name) || is_cl(name.rtrim("0123456789.-"))) {
         return ~0u;
     }
-    /// Exclude CLOption to prevent /U, /D, /I from matching Unix paths.
-    return ~static_cast<unsigned>(CLOption);
+    /// Exclude the slash-prefixed CL and DXC options (/D and /I carry both
+    /// bits) to prevent /U, /D, /I from matching Unix paths.
+    return ~static_cast<unsigned>(CLOption | DXCOption);
 }
 
 bool is_c_family_file(llvm::StringRef filename) {

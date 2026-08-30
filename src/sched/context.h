@@ -15,23 +15,6 @@
 
 namespace clice {
 
-/// Where the compile command for a file came from. Anything other than
-/// CDBExact means the command was guessed to some degree, which is why
-/// diagnostics produced with it may deserve a guidance note (see
-/// format_diagnostics).
-enum class CommandSource : std::uint8_t {
-    /// Direct compilation database entry for the file.
-    CDBExact,
-    /// Header compiled in the context of a host source found through the
-    /// include graph (automatic or via clice/switchContext).
-    IncludeGraph,
-    /// Reserved for command transfer heuristics (e.g. nearest CDB entry);
-    /// no producer yet.
-    Inferred,
-    /// Synthesized default command — no CDB entry and no usable host source.
-    Fallback,
-};
-
 /// Who a command resolution serves. User context choices steer
 /// editor-facing compiles of open files, never background indexing.
 enum class ContextUse : std::uint8_t {
@@ -53,6 +36,7 @@ struct CacheContextEntry {
     std::uint32_t host;  // index into the cache path table; ~0u = none
     std::uint32_t occurrence;
     std::string command_hash;
+    std::string base_hash;
 };
 
 struct CacheArtifactEntry {
@@ -204,13 +188,17 @@ public:
     /// before toolchain resolution so the driver interprets them. Unlike
     /// config rule appends they are never NVCC-translated; prepends land
     /// right after the binary name, appends win over rule appends.
+    /// @param out_ref  If non-null, receives the resolved command selection
+    /// (the ref behind `arguments`) for structured consumers — search
+    /// config, language queries.
     CommandSource resolve_command(llvm::StringRef path,
                                   std::string& directory,
                                   std::vector<std::string>& arguments,
                                   ContextUse use = ContextUse::Background,
                                   std::uint32_t* host_path_id = nullptr,
                                   llvm::ArrayRef<std::string> extra_prepend = {},
-                                  llvm::ArrayRef<std::string> extra_append = {});
+                                  llvm::ArrayRef<std::string> extra_append = {},
+                                  CommandRef* out_ref = nullptr);
 
     /// Append the header context's suffix as one trailing #include line: the
     /// suffix content (everything after the include position along the chain)
@@ -228,7 +216,8 @@ public:
                                   std::string& directory,
                                   std::vector<std::string>& arguments,
                                   ContextUse use,
-                                  std::uint32_t* host_path_id);
+                                  std::uint32_t* host_path_id,
+                                  CommandRef* out_ref = nullptr);
 
     /// Validate a context choice persisted from an earlier run against the
     /// current CDB and include graph, dropping it when stale. Called on
@@ -245,10 +234,13 @@ public:
         return it != saved_contexts.end() ? &it->second : nullptr;
     }
 
-    /// Whether the CDB still holds an entry for `entry_path` whose canonical
-    /// command hash equals `hash` — the validity test for a pinned context
-    /// choice, shared by didOpen validation and the server's orphan pass.
-    bool entry_has_hash(llvm::StringRef entry_path, llvm::StringRef hash) const;
+    /// Whether a pinned command choice still has a live basis among
+    /// `entry_path`'s CDB entries: its applied hash matches a candidate
+    /// under current rules, or its recorded base entry hash still names
+    /// one (a rule edit moves every applied hash; the base survives it).
+    /// The validity test shared by didOpen validation and the server's
+    /// orphan pass.
+    bool pin_alive(llvm::StringRef entry_path, const SavedContext& saved) const;
 
 private:
     std::optional<HeaderContext> resolve_header_context(std::uint32_t header_path_id,

@@ -76,7 +76,10 @@ AgentClient::AgentClient(MasterServer& server, kota::ipc::JsonPeer& peer) :
             srv.pool.foreground_pulse();
             std::string directory;
             std::vector<std::string> arguments;
-            srv.contexts.resolve_command(params.path, directory, arguments);
+            // Editor semantics: an agent asks what the user's file compiles
+            // as — pins and header context included, never the background
+            // tier ladder (which offers a header nothing but fallback).
+            srv.contexts.resolve_command(params.path, directory, arguments, ContextUse::Editor);
 
             co_return CompileCommandResult{
                 .file = params.path,
@@ -94,12 +97,12 @@ AgentClient::AgentClient(MasterServer& server, kota::ipc::JsonPeer& peer) :
         ProjectFilesResult result;
         llvm::DenseSet<std::uint32_t> seen;
 
-        for(auto& entry: ws.cdb.get_entries()) {
-            auto file_path = ws.cdb.resolve_path(entry.file);
+        for(auto& entry: ws.cdb.entries()) {
+            auto file_path = ws.path_pool.resolve(entry.file);
             if(file_path.empty())
                 continue;
 
-            auto path_id = ws.path_pool.intern(file_path);
+            auto path_id = entry.file;
             if(!seen.insert(path_id).second)
                 continue;
 

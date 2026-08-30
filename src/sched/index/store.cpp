@@ -41,6 +41,12 @@ std::string blob_key(llvm::StringRef path) {
 struct CDBSnapshotEntry {
     std::string file;
     std::vector<std::string> hashes;
+
+    /// Entry hash of the file's default selection (the candidate-order
+    /// winner). The hash multiset alone cannot see an offline flip of the
+    /// winner — candidates unchanged, selection changed.
+    std::string selected;
+
     std::string rules;
     std::string host;
 };
@@ -77,11 +83,12 @@ CDBSnapshot build_cdb_snapshot(Workspace& workspace,
                                llvm::ArrayRef<std::uint32_t> standalone_debt) {
     CDBSnapshot snapshot;
     for(auto& [path_id, hashes]: workspace.cdb.command_hash_snapshot()) {
-        auto file = workspace.cdb.resolve_path(path_id).str();
+        auto file = workspace.path_pool.resolve(path_id).str();
         auto rules = rules_hash(workspace.config, file);
         snapshot.entries.push_back({
             .file = std::move(file),
             .hashes = {hashes.begin(), hashes.end()},
+            .selected = workspace.cdb.selected_hash(path_id).value_or(std::string()),
             .rules = std::move(rules),
         });
     }
@@ -1055,8 +1062,11 @@ void IndexStore::reconcile_cdb_snapshot(Report& report) {
         auto server_id = workspace.path_pool.intern(entry.file);
         cdb_ids.insert(server_id);
         auto it = before.find(entry.file);
+        // `selected` guards the offline winner flip: the candidate multiset
+        // can survive a reload that still changes which entry is the
+        // default selection.
         if(it != before.end() && it->second->hashes == entry.hashes &&
-           it->second->rules == entry.rules) {
+           it->second->selected == entry.selected && it->second->rules == entry.rules) {
             continue;
         }
         changed_ids.push_back(server_id);

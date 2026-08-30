@@ -25,24 +25,71 @@ TEST_CASE(ChoiceNeedsSession) {
     }));
 
     auto file = workspace.path_pool.intern(path);
-    auto results = workspace.cdb.lookup(path, {});
-    ASSERT_EQ(results.size(), 2u);
-    resolver.saved_contexts[file] = SavedContext{
-        no_path_id,
-        std::nullopt,
-        canonical_command_hash(results[1].to_string_argv(), results[1].resolved.directory)};
+    auto candidates = workspace.cdb.candidate_entries(path);
+    ASSERT_EQ(candidates.size(), 2u);
+    // Pin the non-default candidate (candidate order is content-decided,
+    // so the defines are read back rather than assumed).
+    auto define_of = [&](ConfigID config) -> llvm::StringRef {
+        auto argv = print_argv(workspace.cdb.render_full(config));
+        return llvm::StringRef(argv).contains("SECOND") ? "SECOND" : "FIRST";
+    };
+    auto pinned = candidates.back().config;
+    resolver.saved_contexts[file] =
+        SavedContext{no_path_id, std::nullopt, workspace.cdb.entry_hash_hex(pinned)};
 
     // An open session honors the pinned CDB entry...
     auto session = store.open(file);
     std::string directory;
     std::vector<std::string> arguments;
     resolver.resolve_command(path, directory, arguments, ContextUse::Editor);
-    ASSERT_TRUE(llvm::is_contained(arguments, "SECOND"));
+    ASSERT_TRUE(llvm::is_contained(arguments, define_of(pinned)));
 
     // ...but background indexing (no session) must never see user choices.
     arguments.clear();
     resolver.resolve_command(path, directory, arguments, ContextUse::Background);
-    ASSERT_TRUE(llvm::is_contained(arguments, "FIRST"));
+    ASSERT_TRUE(llvm::is_contained(arguments, define_of(candidates.front().config)));
+}
+
+TEST_CASE(PinBaseSurvivesRules) {
+    TempDir tmp;
+    Workspace workspace;
+    SessionStore store;
+    ContextResolver resolver(workspace);
+    tmp.touch("main.cpp");
+    auto path = tmp.path("main.cpp");
+    write_cdb(tmp,
+              workspace.cdb,
+              build_cdb_json({
+                  {tmp.root, path, {"-DFIRST"} },
+                  {tmp.root, path, {"-DSECOND"}}
+    }));
+
+    auto file = workspace.path_pool.intern(path);
+    auto candidates = workspace.cdb.candidate_entries(path);
+    ASSERT_EQ(candidates.size(), 2u);
+    auto define_of = [&](ConfigID config) -> llvm::StringRef {
+        auto argv = print_argv(workspace.cdb.render_full(config));
+        return llvm::StringRef(argv).contains("SECOND") ? "SECOND" : "FIRST";
+    };
+    auto pinned = candidates.back().config;
+
+    // A pin whose applied hash went stale (a rule edit since it was saved)
+    // but whose base identity is recorded still selects its candidate...
+    resolver.saved_contexts[file] = SavedContext{no_path_id,
+                                                 std::nullopt,
+                                                 "0123456789abcdef",
+                                                 workspace.cdb.entry_hash_hex(pinned)};
+    auto session = store.open(file);
+    std::string directory;
+    std::vector<std::string> arguments;
+    resolver.resolve_command(path, directory, arguments, ContextUse::Editor);
+    ASSERT_TRUE(llvm::is_contained(arguments, define_of(pinned)));
+
+    // ...while the same stale hash without a base falls back to the default.
+    resolver.saved_contexts[file] = SavedContext{no_path_id, std::nullopt, "0123456789abcdef", ""};
+    arguments.clear();
+    resolver.resolve_command(path, directory, arguments, ContextUse::Editor);
+    ASSERT_TRUE(llvm::is_contained(arguments, define_of(candidates.front().config)));
 }
 
 TEST_CASE(ValidateKeepsValidChoice) {
