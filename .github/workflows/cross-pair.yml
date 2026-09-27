@@ -49,24 +49,17 @@ jobs:
           environments: ${{ inputs.pixi_env }}
 
       # Restore only; saved below, after the build, on pushes to main.
-      # clang takes the MSVC version it targets from the toolset installed
-      # on the runner, never from the command line, so neither the ccache
-      # key nor its compiler check sees it: a runner image with a newer
-      # toolset must not reuse objects built against the old one, a
-      # precompiled header above all (clang rejects one from another MSVC
-      # version). Scoped per image on Windows.
-      - name: Compiler cache scope
-        id: ccache-scope
-        shell: bash
-        run: echo "scope=${{ runner.os == 'Windows' && '$ImageVersion' || 'any' }}" >> "$GITHUB_OUTPUT"
-
+      # Keyed on pixi.lock: on Windows the compiler ccache hashes is xclang's
+      # launcher (clang++.exe starts llvm.exe), the same bytes in every
+      # release, so a new toolchain must not reuse the old one's objects
+      # and precompiled headers.
       - name: Restore compiler cache
         uses: actions/cache/restore@v6
         with:
           path: .cache/ccache
-          key: ${{ runner.os }}-${{ steps.ccache-scope.outputs.scope }}-RelWithDebInfo-${{ inputs.target_triple }}-ccache-${{ github.sha }}
+          key: ${{ runner.os }}-${{ hashFiles('pixi.lock') }}-RelWithDebInfo-${{ inputs.target_triple }}-ccache-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-${{ steps.ccache-scope.outputs.scope }}-RelWithDebInfo-${{ inputs.target_triple }}-ccache-
+            ${{ runner.os }}-${{ hashFiles('pixi.lock') }}-RelWithDebInfo-${{ inputs.target_triple }}-ccache-
 
       - name: Zero cache stats
         run: pixi run -e "${{ inputs.pixi_env }}" -- ccache --zero-stats
@@ -83,7 +76,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .cache/ccache
-          key: ${{ runner.os }}-${{ steps.ccache-scope.outputs.scope }}-RelWithDebInfo-${{ inputs.target_triple }}-ccache-${{ github.sha }}
+          key: ${{ runner.os }}-${{ hashFiles('pixi.lock') }}-RelWithDebInfo-${{ inputs.target_triple }}-ccache-${{ github.sha }}
 
       # Package here, where the object files live (dsymutil needs them);
       # promotion to a release is still gated on the whole run being green.
@@ -94,11 +87,10 @@ jobs:
             --target clice-pack clice-pack-symbol
 
       - name: Check artifact dependencies
-        if: ${{ !contains(inputs.target_triple, 'windows') }}
         shell: bash
         run: |
           pixi run -e "${{ inputs.pixi_env }}" -- \
-            python scripts/check_artifact_deps.py build/RelWithDebInfo/pack/clice/bin/clice
+            python scripts/check_artifact_deps.py build/RelWithDebInfo/pack/clice/bin/clice${{ contains(inputs.target_triple, 'mingw') && '.exe' || '' }}
 
       - name: Upload package artifacts
         uses: actions/upload-artifact@v7
@@ -114,7 +106,6 @@ jobs:
           retention-days: 30
 
       - name: Upload full debug info
-        if: ${{ !contains(inputs.target_triple, 'windows') }}
         uses: actions/upload-artifact@v7
         with:
           name: debug-info-${{ inputs.target_name }}

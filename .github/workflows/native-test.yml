@@ -23,8 +23,8 @@ jobs:
           # release artifacts once their test suites pass.
           - os: windows-2025
             build_type: RelWithDebInfo
-            asset_name: clice.x86_64-pc-windows-msvc.zip
-            target_name: x86_64-pc-windows-msvc
+            asset_name: clice.x86_64-w64-mingw32.zip
+            target_name: x86_64-w64-mingw32
           - os: ubuntu-24.04
             build_type: Debug
           - os: ubuntu-24.04
@@ -52,24 +52,17 @@ jobs:
       # Pull requests only restore: every push saving its own copy churns
       # the repository's 50 GB cache pool faster than the next run can reuse
       # it. Saved from main below, once per merge.
-      # clang takes the MSVC version it targets from the toolset installed
-      # on the runner, never from the command line, so neither the ccache
-      # key nor its compiler check sees it: a runner image with a newer
-      # toolset must not reuse objects built against the old one, a
-      # precompiled header above all (clang rejects one from another MSVC
-      # version). Scoped per image on Windows.
-      - name: Compiler cache scope
-        id: ccache-scope
-        shell: bash
-        run: echo "scope=${{ runner.os == 'Windows' && '$ImageVersion' || 'any' }}" >> "$GITHUB_OUTPUT"
-
+      # Keyed on pixi.lock: on Windows the compiler ccache hashes is xclang's
+      # launcher (clang++.exe starts llvm.exe), the same bytes in every
+      # release, so a new toolchain must not reuse the old one's objects
+      # and precompiled headers.
       - name: Restore compiler cache
         uses: actions/cache/restore@v6
         with:
           path: .cache/ccache
-          key: ${{ runner.os }}-${{ steps.ccache-scope.outputs.scope }}-${{ matrix.build_type }}-native-ccache-${{ github.sha }}
+          key: ${{ runner.os }}-${{ hashFiles('pixi.lock') }}-${{ matrix.build_type }}-native-ccache-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-${{ steps.ccache-scope.outputs.scope }}-${{ matrix.build_type }}-native-ccache-
+            ${{ runner.os }}-${{ hashFiles('pixi.lock') }}-${{ matrix.build_type }}-native-ccache-
 
       - name: Zero cache stats
         run: pixi run -- ccache --zero-stats
@@ -82,7 +75,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: .cache/ccache
-          key: ${{ runner.os }}-${{ steps.ccache-scope.outputs.scope }}-${{ matrix.build_type }}-native-ccache-${{ github.sha }}
+          key: ${{ runner.os }}-${{ hashFiles('pixi.lock') }}-${{ matrix.build_type }}-native-ccache-${{ github.sha }}
 
       # Process start-up is the fixed cost every test-suite process pays
       # (inspect runs, servers, workers); the two build types differ in
@@ -141,9 +134,9 @@ jobs:
         run: pixi run -- cmake --build build/${{ matrix.build_type }} --target clice-pack clice-pack-symbol
 
       - name: Check artifact dependencies
-        if: ${{ matrix.asset_name && !contains(matrix.os, 'windows') }}
+        if: ${{ matrix.asset_name }}
         shell: bash
-        run: pixi run -- python scripts/check_artifact_deps.py build/${{ matrix.build_type }}/pack/clice/bin/clice
+        run: pixi run -- python scripts/check_artifact_deps.py build/${{ matrix.build_type }}/pack/clice/bin/clice${{ runner.os == 'Windows' && '.exe' || '' }}
 
       - name: Upload package artifacts
         if: ${{ matrix.asset_name }}
@@ -160,7 +153,7 @@ jobs:
           retention-days: 30
 
       - name: Upload full debug info
-        if: ${{ matrix.asset_name && !contains(matrix.os, 'windows') }}
+        if: ${{ matrix.asset_name }}
         uses: actions/upload-artifact@v7
         with:
           name: debug-info-${{ matrix.target_name }}
