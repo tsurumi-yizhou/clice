@@ -154,11 +154,11 @@ int run_indexing_via_server(const index::ServerEndpoint& endpoint, llvm::StringR
     return 0;
 }
 
-int run_indexing(CanonicalPath root,
+int run_indexing(Spelling root,
                  std::string configuration,
                  std::uint32_t workers,
                  const char* self_path) {
-    auto config = Config::load_from_workspace(root);
+    auto config = Config::load_from_workspace(CanonicalPath(root));
     if(!check_requested_configuration(config, configuration)) {
         return 1;
     }
@@ -281,7 +281,7 @@ struct Histogram {
 };
 
 struct ShardStat {
-    llvm::StringRef path;
+    std::string path;
     std::uint64_t bytes = 0;
     std::size_t variants = 0;
     std::uint64_t occurrences = 0;
@@ -501,7 +501,7 @@ void print_stats(const Project& project,
                      stat.variants,
                      stat.occurrences,
                      stat.relations,
-                     std::string_view(stat.path));
+                     stat.path);
     }
 }
 
@@ -513,7 +513,7 @@ void print_variants(const IndexStats& stats) {
     std::println();
     std::println("variants\tpath");
     for(auto& stat: by_variants) {
-        std::println("{}\t{}", stat.variants, std::string_view(stat.path));
+        std::println("{}\t{}", stat.variants, stat.path);
     }
 }
 
@@ -628,7 +628,7 @@ int run_show_symbol(Project& project, llvm::StringRef wanted) {
             std::println("  scope={}  file={}  reference files={}",
                          kota::meta::enum_name(symbol->scope, "External"),
                          symbol->file == index::no_file
-                             ? llvm::StringRef("-")
+                             ? "-"
                              : project.file_table.display(Fid{symbol->file}),
                          project.project_index.reference_count(hash));
         } else {
@@ -648,7 +648,7 @@ int run_show_symbol(Project& project, llvm::StringRef wanted) {
         for(auto& [path_id, shard]: project.project_index.shards) {
             auto count = [&](RelationKind kind, std::size_t Counts::* field) {
                 shard.lookup(hash, kind, [&](const index::Relation&) {
-                    per_file[project.file_table.display(path_id).str()].*field += 1;
+                    per_file[project.file_table.display(path_id)].*field += 1;
                     return true;
                 });
             };
@@ -673,11 +673,12 @@ int run_show_file(Project& project, llvm::StringRef argument) {
     auto shard_it =
         file ? project.project_index.shards.find(*file) : project.project_index.shards.end();
     if(shard_it == project.project_index.shards.end()) {
-        std::println("No rows for {} in the index.", path);
+        std::println("No rows for {} in the index.",
+                     project.file_table.display(CanonicalPath(path)));
         return 1;
     }
     auto& shard = shard_it->second;
-    std::println("file {}", path);
+    std::println("file {}", project.file_table.display(*file));
     std::println("  blob={}  content size={}  content hash={}  text={}",
                  format_size(shard.bytes().size()),
                  shard.content_size(),
@@ -685,7 +686,7 @@ int run_show_file(Project& project, llvm::StringRef argument) {
                  shard.content().empty() ? "not stored (ASCII)" : "stored");
 
     // Which unit contributed which variant, from the manifests.
-    std::map<std::uint64_t, std::vector<llvm::StringRef>> contributors;
+    std::map<std::uint64_t, std::vector<std::string>> contributors;
     if(auto it = project.project_index.contributions.find(*file);
        it != project.project_index.contributions.end()) {
         for(auto& [tu, hash]: it->second) {
@@ -701,7 +702,7 @@ int run_show_file(Project& project, llvm::StringRef argument) {
                      format_hash(hash),
                      units.size(),
                      plural_s(units.size()));
-        for(auto unit: units) {
+        for(auto& unit: units) {
             std::println("      {}", unit);
         }
     }
@@ -745,14 +746,15 @@ int run_show_tu(Project& project, llvm::StringRef argument) {
     auto& project_index = project.project_index;
     auto manifest_it = tu ? project_index.manifests.find(*tu) : project_index.manifests.end();
     if(manifest_it == project_index.manifests.end()) {
-        std::println("No manifest for {} in the index.", path);
+        std::println("No manifest for {} in the index.", files.display(CanonicalPath(path)));
         return 1;
     }
     auto& manifest = manifest_it->second;
     auto version_path = [&](VersionID fv) {
         return files.display(files.version(fv).fid);
     };
-    std::println("translation unit {}", path);
+    auto unit = files.display(*tu);
+    std::println("translation unit {}", unit);
     std::println("  built at {}  generation={}  content hash={}",
                  format_time(manifest.built_at),
                  manifest.global_gen,
@@ -778,7 +780,7 @@ int run_show_tu(Project& project, llvm::StringRef argument) {
         printed += 1;
         auto& entry = manifest.nodes[node];
         auto includer = entry.parent == index::no_node
-                            ? llvm::StringRef(path)
+                            ? unit
                             : version_path(VersionID{manifest.nodes[entry.parent].file});
         std::println("    {:{}}{}  {} at {}:{}",
                      "",
@@ -854,7 +856,7 @@ void add_index(kota::deco::cli::SubCommander& root, int& exit_code, const char* 
                }
                return;
            }
-           exit_code = run_indexing(std::move(ws),
+           exit_code = run_indexing(std::move(spelling),
                                     std::move(configuration),
                                     opts.workers.value_or(0),
                                     self_path);
