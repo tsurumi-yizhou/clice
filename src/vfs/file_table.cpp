@@ -17,8 +17,8 @@ std::optional<ObservedFile> read_file_observed(const char* path) {
     }
     auto close = llvm::make_scope_exit([&] { llvm::sys::fs::closeFile(*fd); });
 
-    llvm::sys::fs::file_status before;
-    bool have_before = !llvm::sys::fs::status(*fd, before);
+    fs::FileMetadata before;
+    bool have_before = !fs::file_metadata(*fd, before);
 
     // Force read() instead of mmap (IsVolatile): the bytes must be a
     // snapshot taken between the two fstats — a mapped buffer would keep
@@ -39,18 +39,18 @@ std::optional<ObservedFile> read_file_observed(const char* path) {
         result.content = llvm::MemoryBuffer::getMemBufferCopy(text, path);
     }
 
-    llvm::sys::fs::file_status after;
-    bool have_after = !llvm::sys::fs::status(*fd, after);
+    fs::FileMetadata after;
+    bool have_after = !fs::file_metadata(*fd, after);
     result.obs.hash = llvm::xxh3_64bits(result.content->getBuffer());
     if(!have_after) {
         return result;
     }
-    result.obs.size = after.getSize();
-    result.obs.mtime_ns = fs::mtime_ns(after);
-    result.obs.uid_device = after.getUniqueID().getDevice();
-    result.obs.uid_file = after.getUniqueID().getFile();
-    result.obs.paired = have_before && before.getSize() == after.getSize() &&
-                        fs::mtime_ns(before) == result.obs.mtime_ns;
+    result.obs.size = after.size;
+    result.obs.mtime_ns = after.mtime_ns;
+    result.obs.uid_device = after.uid_device;
+    result.obs.uid_file = after.uid_file;
+    result.obs.paired =
+        have_before && before.size == after.size && before.mtime_ns == result.obs.mtime_ns;
 
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch())

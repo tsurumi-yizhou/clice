@@ -480,8 +480,8 @@ kota::task<> scan_impl(CompilationDatabase& cdb,
                 [dir_path = std::move(dir_path)]() -> DirEntry {
                     DirEntry result;
                     result.dir_path = dir_path;
-                    llvm::sys::fs::file_status pre_status;
-                    bool pre_ok = !llvm::sys::fs::status(result.dir_path, pre_status);
+                    fs::FileMetadata pre_status;
+                    bool pre_ok = !fs::file_metadata(result.dir_path, pre_status);
                     std::error_code ec;
                     llvm::sys::fs::directory_iterator di(result.dir_path, ec);
                     for(; !ec && di != llvm::sys::fs::directory_iterator(); di.increment(ec)) {
@@ -489,14 +489,14 @@ kota::task<> scan_impl(CompilationDatabase& cdb,
                     }
                     // Same pre/post-stat + guard + complete-readdir
                     // discipline as resolve_dir.
-                    llvm::sys::fs::file_status post_status;
-                    if(pre_ok && !ec && !llvm::sys::fs::status(result.dir_path, post_status) &&
-                       fs::mtime_ns(pre_status) == fs::mtime_ns(post_status)) {
+                    fs::FileMetadata post_status;
+                    if(pre_ok && !ec && !fs::file_metadata(result.dir_path, post_status) &&
+                       pre_status.mtime_ns == post_status.mtime_ns) {
                         auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                           std::chrono::system_clock::now().time_since_epoch())
                                           .count();
-                        if(fs::mtime_ns(post_status) <= fs::stat_baseline_before_ns(now_ms)) {
-                            result.reliable_mtime = fs::mtime_ns(post_status);
+                        if(post_status.mtime_ns <= fs::stat_baseline_before_ns(now_ms)) {
+                            result.reliable_mtime = post_status.mtime_ns;
                         }
                     }
                     return result;
@@ -533,15 +533,21 @@ kota::task<> scan_impl(CompilationDatabase& cdb,
     // stat. Recorded at discovery so the prefetch never races the check.
     std::vector<FileScanResult> pending_warm;
     auto try_warm = [&](Fid path_id, std::uint32_t config_id) {
-        auto path = file_table.resolve(path_id);
-        llvm::sys::fs::file_status status;
-        if(llvm::sys::fs::status(path, status)) {
+        // A cold file has nothing to validate. In particular, do not stat
+        // every discovered header on the event loop before queuing its read.
+        auto known_hash = file_table.seen_hash(path_id);
+        if(!known_hash || !file_table.scan_results.contains({path_id, *known_hash})) {
             return false;
         }
-        auto size = status.getSize();
-        auto mtime_ns = fs::mtime_ns(status);
-        auto uid = status.getUniqueID();
-        auto hash = file_table.cached_hash(path_id, size, mtime_ns, uid.getDevice(), uid.getFile());
+        auto path = file_table.resolve(path_id);
+        fs::FileMetadata status;
+        if(fs::file_metadata(path, status)) {
+            return false;
+        }
+        auto size = status.size;
+        auto mtime_ns = status.mtime_ns;
+        auto hash =
+            file_table.cached_hash(path_id, size, mtime_ns, status.uid_device, status.uid_file);
         if(!hash) {
             return false;
         }
@@ -557,8 +563,8 @@ kota::task<> scan_impl(CompilationDatabase& cdb,
             .obs = {.size = size,
                     .mtime_ns = mtime_ns,
                     .hash = *hash,
-                    .uid_device = uid.getDevice(),
-                    .uid_file = uid.getFile(),
+                    .uid_device = status.uid_device,
+                    .uid_file = status.uid_file,
                     .paired = true,
                     .reliable = true}
         });

@@ -28,9 +28,9 @@ const llvm::StringSet<>* resolve_dir(llvm::StringRef dir,
             // it); later uses inside the operation trust the validation.
             bool fresh = cache.validated.contains(dir);
             if(!fresh && listing->second.mtime_ns != 0) {
-                llvm::sys::fs::file_status status;
-                fresh = !llvm::sys::fs::status(dir, status) &&
-                        fs::mtime_ns(status) == listing->second.mtime_ns;
+                fs::FileMetadata status;
+                fresh =
+                    !fs::file_metadata(dir, status) && status.mtime_ns == listing->second.mtime_ns;
             }
             if(fresh) {
                 cache.validated.insert(dir);
@@ -51,8 +51,8 @@ const llvm::StringSet<>* resolve_dir(llvm::StringRef dir,
     // directory: equal stats prove the listing describes this mtime, and
     // an mtime inside the guard window must not be trusted across
     // operations (a same-tick entry creation would be invisible).
-    llvm::sys::fs::file_status pre_status;
-    bool pre_ok = !llvm::sys::fs::status(dir, pre_status);
+    fs::FileMetadata pre_status;
+    bool pre_ok = !fs::file_metadata(dir, pre_status);
     llvm::StringSet<> entries;
     std::error_code ec;
     llvm::sys::fs::directory_iterator di(dir, ec);
@@ -69,17 +69,17 @@ const llvm::StringSet<>* resolve_dir(llvm::StringRef dir,
 
     if(cache.shared) {
         std::int64_t reliable_mtime = 0;
-        llvm::sys::fs::file_status post_status;
+        fs::FileMetadata post_status;
         // A failed or partial readdir (ec set) must not earn a trusted
         // mtime: the incomplete listing would be reused until the
         // directory itself changes.
-        if(pre_ok && !ec && !llvm::sys::fs::status(dir, post_status) &&
-           fs::mtime_ns(pre_status) == fs::mtime_ns(post_status)) {
+        if(pre_ok && !ec && !fs::file_metadata(dir, post_status) &&
+           pre_status.mtime_ns == post_status.mtime_ns) {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                               std::chrono::system_clock::now().time_since_epoch())
                               .count();
-            if(fs::mtime_ns(post_status) <= fs::stat_baseline_before_ns(now_ms)) {
-                reliable_mtime = fs::mtime_ns(post_status);
+            if(post_status.mtime_ns <= fs::stat_baseline_before_ns(now_ms)) {
+                reliable_mtime = post_status.mtime_ns;
             }
         }
         auto& listing = cache.shared->dir_listings[dir];

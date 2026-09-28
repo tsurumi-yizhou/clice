@@ -426,6 +426,33 @@ constexpr inline bool stable_file_ids = false;
 constexpr inline bool stable_file_ids = true;
 #endif
 
+/// Metadata needed to validate cached bytes or a directory listing. Unlike
+/// LLVM's full status, this does not compute a canonical-path identity on
+/// Windows, where the cache deliberately does not use filesystem IDs.
+struct FileMetadata {
+    std::uint64_t size = 0;
+    std::int64_t mtime_ns = 0;
+    std::uint64_t uid_device = 0;
+    std::uint64_t uid_file = 0;
+
+    FileMetadata() = default;
+
+    FileMetadata(const llvm::sys::fs::file_status& status) :
+        size(status.getSize()), mtime_ns(fs::mtime_ns(status)) {
+        if constexpr(stable_file_ids) {
+            uid_device = status.getUniqueID().getDevice();
+            uid_file = status.getUniqueID().getFile();
+        }
+    }
+};
+
+/// Follow links, like fs::status. Reparse points and unusual Windows paths
+/// fall back to LLVM. Use full status when file type or identity is needed.
+std::error_code file_metadata(const llvm::Twine& path, FileMetadata& result);
+
+/// Query the already-open file, keeping read observations bound to its handle.
+std::error_code file_metadata(llvm::sys::fs::file_t file, FileMetadata& result);
+
 /// The newest mtime (ns) a file may carry and still be provably untouched
 /// since the reference moment `at_ms` (a build start, or "now" for
 /// content read on the spot).

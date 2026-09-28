@@ -3,7 +3,6 @@
 #define NOMINMAX
 #include <windows.h>
 
-#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/ConvertUTF.h"
 #else
 #include <unistd.h>
@@ -15,6 +14,7 @@
 #include "syntax/include_resolver.h"
 #include "vfs/file_table.h"
 
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/xxhash.h"
 
@@ -36,6 +36,98 @@ llvm::sys::fs::file_status stat_of(llvm::StringRef path) {
 }
 
 TEST_SUITE(FileTable) {
+
+TEST_CASE(MetadataMatchesFullStatus) {
+    TempDir tmp;
+    tmp.touch("unicode-\xE4\xB8\xAD.h", "some bytes\n");
+    for(auto path: {tmp.path("unicode-\xE4\xB8\xAD.h"), tmp.path("")}) {
+        // Include sub-second and pre-Unix-epoch times in the comparison.
+        for(auto stamp: {1'600'000'000'123'456'700LL, -1'000'000'000LL}) {
+            ASSERT_TRUE(set_file_mtime(path, stamp));
+            auto full = stat_of(path);
+            fs::FileMetadata light;
+            ASSERT_FALSE(bool(fs::file_metadata(path, light)));
+            EXPECT_EQ(light.size, full.getSize());
+            EXPECT_EQ(light.mtime_ns, fs::mtime_ns(full));
+            if constexpr(fs::stable_file_ids) {
+                EXPECT_EQ(light.uid_device, full.getUniqueID().getDevice());
+                EXPECT_EQ(light.uid_file, full.getUniqueID().getFile());
+            }
+        }
+    }
+    fs::FileMetadata missing;
+    EXPECT_EQ(fs::file_metadata(tmp.path("missing.h"), missing),
+              std::make_error_code(std::errc::no_such_file_or_directory));
+}
+
+TEST_CASE(MetadataLongPath) {
+    TempDir tmp;
+    std::string tail;
+    for(int i = 0; i < 20; ++i) {
+        tail += "long-directory/";
+    }
+    tail += "header.h";
+    tmp.touch(tail, "long path bytes");
+    auto path = tmp.path(tail);
+    auto full = stat_of(path);
+    fs::FileMetadata light;
+    ASSERT_FALSE(bool(fs::file_metadata(path, light)));
+    EXPECT_EQ(light.size, 15u);
+    EXPECT_EQ(light.mtime_ns, fs::mtime_ns(full));
+}
+
+TEST_CASE(MetadataHandleSurvivesReplacement) {
+    TempDir tmp;
+    tmp.touch("file.h", "old");
+    auto path = tmp.path("file.h");
+    auto fd = llvm::sys::fs::openNativeFileForRead(path);
+    ASSERT_TRUE(bool(fd));
+    auto close = llvm::make_scope_exit([&] { llvm::sys::fs::closeFile(*fd); });
+    fs::FileMetadata before;
+    ASSERT_FALSE(bool(fs::file_metadata(*fd, before)));
+    ASSERT_FALSE(bool(llvm::sys::fs::rename(path, tmp.path("old.h"))));
+    tmp.touch("file.h", "replacement");
+    fs::FileMetadata after, replacement;
+    ASSERT_FALSE(bool(fs::file_metadata(*fd, after)));
+    ASSERT_FALSE(bool(fs::file_metadata(path, replacement)));
+    EXPECT_EQ(after.size, 3u);
+    EXPECT_EQ(after.mtime_ns, before.mtime_ns);
+    EXPECT_EQ(replacement.size, 11u);
+    if constexpr(fs::stable_file_ids) {
+        EXPECT_EQ(after.uid_device, before.uid_device);
+        EXPECT_EQ(after.uid_file, before.uid_file);
+        EXPECT_NE(replacement.uid_file, before.uid_file);
+    }
+}
+
+TEST_CASE(MetadataFollowsSymlink) {
+    TempDir tmp;
+    tmp.touch("target.h", "target bytes");
+    auto target = tmp.path("target.h");
+    auto link = tmp.path("link.h");
+#ifdef _WIN32
+    std::wstring wide_target, wide_link;
+    ASSERT_TRUE(llvm::ConvertUTF8toWide(target, wide_target));
+    ASSERT_TRUE(llvm::ConvertUTF8toWide(link, wide_link));
+    if(!::CreateSymbolicLinkW(wide_link.c_str(),
+                              wide_target.c_str(),
+                              SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+        ASSERT_EQ(::GetLastError(), DWORD(ERROR_PRIVILEGE_NOT_HELD));
+        kota::zest::skip();
+        return;
+    }
+#else
+    ASSERT_EQ(::symlink(target.c_str(), link.c_str()), 0);
+#endif
+    fs::FileMetadata light;
+    ASSERT_FALSE(bool(fs::file_metadata(link, light)));
+    auto full = stat_of(target);
+    EXPECT_EQ(light.size, full.getSize());
+    EXPECT_EQ(light.mtime_ns, fs::mtime_ns(full));
+    ASSERT_FALSE(bool(llvm::sys::fs::remove(target)));
+    EXPECT_EQ(fs::file_metadata(link, light),
+              std::make_error_code(std::errc::no_such_file_or_directory));
+}
 
 TEST_CASE(HardlinkFirstBindReads) {
     // Two spellings hardlinked to one inode: the second spelling's first

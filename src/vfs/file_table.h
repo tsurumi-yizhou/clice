@@ -445,8 +445,8 @@ struct FileTable {
     /// Stat the file and produce a same-source observation of its
     /// current content. nullopt = missing or unreadable.
     std::optional<DiskObservation> current(Fid fid) {
-        llvm::sys::fs::file_status status;
-        if(llvm::sys::fs::status(resolve(fid), status)) {
+        fs::FileMetadata status;
+        if(fs::file_metadata(resolve(fid), status)) {
             saw_missing(fid);
             return std::nullopt;
         }
@@ -459,16 +459,15 @@ struct FileTable {
     /// a real read (which repairs the pair for every later consumer; its
     /// observation may describe a newer stat than the caller's, which is
     /// then simply newer truth). nullopt = unreadable right now.
-    std::optional<DiskObservation> observe_for(Fid fid, const llvm::sys::fs::file_status& status) {
-        auto size = status.getSize();
-        auto mtime_ns = fs::mtime_ns(status);
-        auto uid = status.getUniqueID();
-        if(auto hash = cached_hash(fid, size, mtime_ns, uid.getDevice(), uid.getFile())) {
+    std::optional<DiskObservation> observe_for(Fid fid, const fs::FileMetadata& status) {
+        auto size = status.size;
+        auto mtime_ns = status.mtime_ns;
+        if(auto hash = cached_hash(fid, size, mtime_ns, status.uid_device, status.uid_file)) {
             return DiskObservation{.size = size,
                                    .mtime_ns = mtime_ns,
                                    .hash = *hash,
-                                   .uid_device = uid.getDevice(),
-                                   .uid_file = uid.getFile(),
+                                   .uid_device = status.uid_device,
+                                   .uid_file = status.uid_file,
                                    .paired = true,
                                    .reliable = true};
         }
@@ -641,8 +640,8 @@ private:
 
     Verdict check_version_uncached(VersionID vid) {
         auto& version = this->version(vid);
-        llvm::sys::fs::file_status status;
-        if(llvm::sys::fs::status(resolve(version.fid), status)) {
+        fs::FileMetadata status;
+        if(fs::file_metadata(resolve(version.fid), status)) {
             saw_missing(version.fid);
             return Verdict::Missing;
         }

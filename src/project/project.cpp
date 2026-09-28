@@ -345,8 +345,8 @@ DepsSnapshot capture_deps_snapshot(FileTable& files,
             continue;
         }
 
-        llvm::sys::fs::file_status status;
-        if(llvm::sys::fs::status(file.path, status)) {
+        fs::FileMetadata status;
+        if(fs::file_metadata(file.path, status)) {
             // A file the build read that is gone already: record the
             // absence, reappearing counts as a change. Still-missing
             // deliberately counts as unchanged — flagging it would rebuild
@@ -359,8 +359,8 @@ DepsSnapshot capture_deps_snapshot(FileTable& files,
             continue;
         }
 
-        auto size = status.getSize();
-        auto mtime_ns = fs::mtime_ns(status);
+        auto size = status.size;
+        auto mtime_ns = status.mtime_ns;
         if(hash == 0) {
             if(mtime_ns > baseline_before_ns) {
                 // The worker could not hash the consumed bytes and the file
