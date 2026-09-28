@@ -69,17 +69,44 @@ kota::task<llvm::SmallVector<FileEvent>> FileTracker::tick_workspace() {
     llvm::sort(files);
     files.erase(llvm::unique(files), files.end());
     for(std::size_t begin = 0; begin < files.size(); begin += batch_size) {
-        if(begin != 0) {
-            // Yield one loop iteration between batches so a long sweep
-            // never starves LSP traffic.
-            co_await kota::sleep(std::chrono::milliseconds(0));
+        struct Query {
+            Fid fid;
+            std::string path;
+            std::uint64_t revision;
+            fs::FileMetadata status;
+            std::error_code error;
+        };
+
+        llvm::SmallVector<Query> batch;
+        auto batch_end = std::min(begin + batch_size, files.size());
+        batch.reserve(batch_end - begin);
+        for(std::size_t i = begin; i < batch_end; i += 1) {
+            auto fid = files[i];
+            batch.push_back({fid,
+                             project.file_table.resolve(fid).str(),
+                             project.file_table.observation_revision(fid),
+                             {},
+                             {}});
         }
 
-        auto batch_end = std::min(begin + batch_size, files.size());
-        for(std::size_t i = begin; i < batch_end; i += 1) {
-            auto path_id = files[i];
-            fs::FileMetadata status;
-            if(fs::file_metadata(project.file_table.resolve(path_id), status)) {
+        // Only the owned batch crosses threads. queue waits for running work
+        // before completing cancellation, keeping the captured storage alive.
+        auto result = co_await kota::queue([&batch] {
+            for(auto& query: batch) {
+                query.error = fs::file_metadata(query.path, query.status);
+            }
+        });
+        if(!result) {
+            // No observations from an incomplete batch. The next sweep retries.
+            continue;
+        }
+
+        for(auto& query: batch) {
+            auto path_id = query.fid;
+            if(project.file_table.observation_revision(path_id) != query.revision) {
+                continue;
+            }
+            if(query.error) {
                 project.file_table.saw_missing(path_id);
                 continue;
             }
@@ -87,7 +114,7 @@ kota::task<llvm::SmallVector<FileEvent>> FileTracker::tick_workspace() {
             // file that stats fine but cannot be read right now (e.g. an
             // antivirus scanner briefly holding a fresh file on Windows)
             // leaves what was seen untouched; the next tick looks again.
-            project.file_table.observe_for(path_id, status);
+            project.file_table.observe_for(path_id, query.status);
         }
     }
 

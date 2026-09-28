@@ -584,6 +584,98 @@ kota::task<llvm::SmallVector<FileEvent>> sweep(FileTracker& tracker, FileTable& 
     co_return events;
 }
 
+TEST_CASE(WorkspaceTickPreservesNewerObservation) {
+    TempDir tmp;
+    tmp.touch("new.h", "int created;");
+    kota::event_loop loop;
+    FileTable files;
+    Project project{files};
+    SessionStore store;
+    auto fid = files.intern(Spelling::absolute(tmp.path("new.h")));
+    ASSERT_TRUE(files.read(fid).has_value());
+    fs::remove_all(tmp.path("new.h"));
+    project.dep_graph.set_includes(fid, 0, {});
+    FileTracker tracker(project, store, CanonicalPath(Spelling::absolute(tmp.root)));
+    std::uint64_t revision = 0;
+
+    auto newer = [&]() -> kota::task<> {
+        // Scheduled after the sweep submits its batch but before the loop
+        // can deliver worker completion. Restore the same bytes: comparing
+        // hashes alone would miss this intervening observation.
+        tmp.touch("new.h", "int created;");
+        EXPECT_TRUE(files.read(fid).has_value());
+        revision = files.observation_revision(fid);
+        // A concurrent sweep must not start a second batch.
+        EXPECT_TRUE((co_await tracker.tick_workspace()).empty());
+    };
+    auto pending = tracker.tick_workspace();
+    auto update = newer();
+    loop.schedule(pending);
+    loop.schedule(update);
+    loop.run();
+
+    EXPECT_FALSE(files.seen_missing(fid));
+    EXPECT_EQ(files.observation_revision(fid), revision);
+    EXPECT_TRUE(files.take_changes().empty());
+}
+
+TEST_CASE(WorkspaceTickCancellationAllowsRetry) {
+    TempDir tmp;
+    kota::event_loop loop;
+    FileTable files;
+    Project project{files};
+    SessionStore store;
+    auto fid = files.intern(Spelling::absolute(tmp.path("missing.h")));
+    files.saw_missing(fid);
+    FileTracker tracker(project, store, CanonicalPath(Spelling::absolute(tmp.root)));
+    kota::cancellation_source source;
+    auto pending = kota::with_token(tracker.tick_workspace(), source.token());
+    auto cancel = [&]() -> kota::task<> {
+        source.cancel();
+        co_return;
+    };
+    auto cancellation = cancel();
+    loop.schedule(pending);
+    loop.schedule(cancellation);
+    loop.run();
+
+    // Cancellation drains the worker before destroying its batch and resets
+    // the sweeping guard, so the same tracker can immediately be used again.
+    EXPECT_EQ(files.observation_revision(fid), 1u);
+    auto retry = tracker.tick_workspace();
+    loop.schedule(retry);
+    loop.run();
+    EXPECT_EQ(files.observation_revision(fid), 2u);
+}
+
+TEST_CASE(WorkspaceTickAcrossBatches) {
+    TempDir tmp;
+    kota::event_loop loop;
+    FileTable files;
+    Project project{files};
+    SessionStore store;
+    llvm::SmallVector<Fid> created;
+    for(unsigned i = 0; i < 1001; ++i) {
+        auto name = std::format("{}.h", i);
+        auto fid = files.intern(Spelling::absolute(tmp.path(name)));
+        files.saw_missing(fid);
+        if(i == 0 || i == 500 || i == 1000) {
+            tmp.touch(name, "int created;");
+            created.push_back(fid);
+        }
+    }
+    FileTracker tracker(project, store, CanonicalPath(Spelling::absolute(tmp.root)));
+    auto body = [&]() -> kota::task<> {
+        co_await tracker.tick_workspace();
+        EXPECT_EQ(files.take_changes(), created);
+        co_await tracker.tick_workspace();
+        EXPECT_TRUE(files.take_changes().empty());
+    };
+    auto task = body();
+    loop.schedule(task);
+    loop.run();
+}
+
 TEST_CASE(WorkspaceTickStateMachine) {
     TempDir tmp;
     tmp.touch("header.h", R"(int x = 1;)");

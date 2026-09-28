@@ -56,11 +56,9 @@ public:
     /// read, so touch-only changes stay silent. Returns the build's gain of
     /// default-command sources as a CDBChanged event.
     ///
-    /// Stats run synchronously in batches, yielding to the event loop
-    /// between batches; each round's duration is perf-logged.
-    /// TODO: offload stats to the thread pool (and consider a directory
-    /// listing cache for Windows, where per-file stat is expensive) if the
-    /// logged sweep timing shows the need.
+    /// Metadata queries run in bounded thread-pool batches. Results are
+    /// applied on the event loop only if no newer observation superseded
+    /// them while suspended; each round's duration is perf-logged.
     kota::task<llvm::SmallVector<FileEvent>> tick_workspace();
 
 private:

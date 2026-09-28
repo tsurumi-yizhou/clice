@@ -184,6 +184,7 @@ struct FileTable {
             std::ranges::copy(llvm::StringRef(identity), buf);
             buf[n] = '\0';
             spellings.push_back(llvm::StringRef(buf, n));
+            observation_revisions.push_back(0);
         }
         return it->second;
     }
@@ -386,6 +387,12 @@ struct FileTable {
     std::optional<std::uint64_t> seen_hash(Fid fid) const {
         auto it = seen.find(fid);
         return it != seen.end() ? it->second : std::nullopt;
+    }
+
+    /// Changes on every accepted disk observation, even if the bytes match.
+    /// Background queries must not overwrite a newer observation after suspension.
+    std::uint64_t observation_revision(Fid fid) const {
+        return observation_revisions[fid.raw];
     }
 
     /// A look found the file missing.
@@ -624,7 +631,10 @@ struct FileTable {
     }
 
 private:
+    llvm::SmallVector<std::uint64_t> observation_revisions;
+
     void saw(Fid fid, std::optional<std::uint64_t> hash) {
+        ++observation_revisions[fid.raw];
         auto [it, first] = seen.try_emplace(fid, hash);
         if(first || it->second == hash) {
             return;
