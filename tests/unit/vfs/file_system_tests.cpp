@@ -2,6 +2,7 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <format>
 #include <string>
 
@@ -119,21 +120,28 @@ TEST_CASE(KeptMappingShared) {
     tmp.touch("b.pch", std::string(64 * 1024, 'x'));
     vfs::keep_mapped(tmp.path("a.pch"));
 
-    auto map = [&](llvm::StringRef name) {
+    auto map = [&](llvm::StringRef path) {
         vfs::View view;
-        auto path = tmp.path(name);
         auto file = view.openFileForReadBinary(path);
         EXPECT_TRUE(bool(file));
         auto buffer = (*file)->getBuffer(path, -1, false, false);
         EXPECT_TRUE(bool(buffer));
         return std::move(*buffer);
     };
-    ASSERT_TRUE(map("a.pch")->getBufferStart() == map("a.pch")->getBufferStart());
-    ASSERT_FALSE(map("b.pch")->getBufferStart() == map("b.pch")->getBufferStart());
+    auto a = tmp.path("a.pch");
+    auto b = tmp.path("b.pch");
+    ASSERT_TRUE(map(a)->getBufferStart() == map(a)->getBufferStart());
+#ifdef _WIN32
+    // The master and clang spell one PCH with different separators.
+    auto slashed = a;
+    std::ranges::replace(slashed, '\\', '/');
+    ASSERT_TRUE(map(slashed)->getBufferStart() == map(a)->getBufferStart());
+#endif
+    ASSERT_FALSE(map(b)->getBufferStart() == map(b)->getBufferStart());
 #ifndef _WIN32
     // Windows refuses to rewrite a mapped file; elsewhere a rewrite is seen.
     tmp.touch("a.pch", std::string(32 * 1024, 'y'));
-    ASSERT_EQ(map("a.pch")->getBuffer(), std::string(32 * 1024, 'y'));
+    ASSERT_EQ(map(a)->getBuffer(), std::string(32 * 1024, 'y'));
 #endif
 }
 
