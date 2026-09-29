@@ -134,6 +134,17 @@ struct Selection {
 std::shared_ptr<index::TUIndex> load_pch_envelope(llvm::StringRef path);
 
 struct PCHState {
+    /// The pair's name in the store: the key and a nonce of the build that
+    /// produced it. A rebuild publishes under a new name, never over the
+    /// old pair, which workers may still have mapped — Windows refuses to
+    /// replace a mapped file.
+    std::string blob;
+
+    /// The pair the latest build replaced, kept for one more build: a
+    /// consumer that took its path just before the replacement may not
+    /// have opened it yet.
+    std::string superseded;
+
     std::string path;
     std::uint32_t bound = 0;
     DepsSnapshot deps;
