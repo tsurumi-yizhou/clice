@@ -399,6 +399,85 @@ TEST_CASE(StaleContributionSuppressed) {
     ASSERT_TRUE(query.sites(symbol, RelationKind::Reference).empty());
 }
 
+TEST_CASE(ClassNameOverConstructor) {
+    add_main("main.cpp", R"(
+        namespace outer {
+        struct Widget {
+            Widget();
+            Widget(int);
+        };
+        }
+    )");
+    ASSERT_TRUE(compile());
+    merge_into_workspace();
+
+    for(auto name: {"Widget", "outer::Widget"}) {
+        auto results = locate(name);
+        ASSERT_EQ(results.size(), 1U);
+        ASSERT_EQ(results.front().symbol.kind, SymbolKind::Struct);
+    }
+    ASSERT_EQ(locate("outer::Widget::Widget").size(), 2U);
+}
+
+TEST_CASE(UndefinedBesideStaleUse) {
+    add_file("header.h", R"(
+        int external();
+    )");
+    add_main("main.cpp", R"(
+        #include "header.h"
+        int use() { return external(); }
+    )");
+    ASSERT_TRUE(compile());
+    merge_into_workspace();
+
+    // A file using the symbol moved on; nothing defines the symbol, so the
+    // declaration still places it.
+    project.file_table.observe(main_id, DiskObservation{.hash = 1});
+    auto results = search("external");
+    ASSERT_EQ(results.size(), 1U);
+    ASSERT_TRUE(results.front().site.path.ends_with("header.h"));
+}
+
+TEST_CASE(DeletedDefinitionFallsBack) {
+    llvm::StringRef header = R"(
+        int removed();
+    )";
+    add_file("header.h", header);
+    add_main("main.cpp", R"(
+        #include "header.h"
+        int removed() { return 0; }
+    )");
+    ASSERT_TRUE(compile());
+    merge_into_workspace();
+
+    clear();
+    add_file("header.h", header);
+    add_main("use.cpp", R"(
+        #include "header.h"
+        int use() { return removed(); }
+    )");
+    ASSERT_TRUE(compile());
+    merge_into_workspace();
+    auto use_id = main_id;
+
+    // The table keeps the definition the first unit reported; the rows
+    // no longer hold it, so the declaration places the symbol — a file
+    // that only used it moving on changes nothing.
+    clear();
+    add_file("header.h", header);
+    add_main("main.cpp", R"(
+        #include "header.h"
+        int kept() { return removed(); }
+    )");
+    ASSERT_TRUE(compile());
+    merge_into_workspace();
+    project.file_table.observe(use_id, DiskObservation{.hash = 1});
+
+    auto results = search("removed");
+    ASSERT_EQ(results.size(), 1U);
+    ASSERT_TRUE(results.front().site.path.ends_with("header.h"));
+}
+
 };  // TEST_SUITE(IndexQuery)
 
 }  // namespace

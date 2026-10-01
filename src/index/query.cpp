@@ -34,11 +34,10 @@ LocalSourceRange to_local(const Occurrence& occurrence) {
 std::string extract_line(llvm::StringRef content, std::uint32_t offset) {
     if(content.empty() || offset >= content.size())
         return {};
+    // StringRef::rfind looks strictly before its position.
     std::size_t line_start = 0;
-    if(offset > 0) {
-        auto pos = content.rfind('\n', offset - 1);
-        if(pos != llvm::StringRef::npos)
-            line_start = pos + 1;
+    if(auto pos = content.rfind('\n', offset); pos != llvm::StringRef::npos) {
+        line_start = pos + 1;
     }
     auto line_end = content.find('\n', offset);
     if(line_end == llvm::StringRef::npos)
@@ -102,9 +101,11 @@ bool FreshnessGate::stale(Fid file, std::uint64_t content_hash) const {
     if(options.check_disk && checked.insert(file).second) {
         files.current(file);
     }
-    auto seen = files.seen_hash(file);
-    if(!seen || *seen == content_hash) {
-        return false;
+    if(!files.seen_missing(file)) {
+        auto seen = files.seen_hash(file);
+        if(!seen || *seen == content_hash) {
+            return false;
+        }
     }
     withheld_files.insert(file);
     return true;
@@ -443,22 +444,37 @@ std::optional<Site> IndexQuery::canonical_site(SymbolHash hash) const {
     if(auto site = first_site(hash, RelationKind::Definition)) {
         return site;
     }
-    // A declaration stands in only for a symbol nothing defines: a
-    // definition withheld as stale stays unavailable, as documented. An
-    // open session's identity may know only the declaration; the project
-    // row remembers the definition.
-    auto info = symbol_info(hash);
-    if(!info) {
-        return std::nullopt;
-    }
-    bool defined = has_flag(info->flags, SymbolFlags::HasDefinition);
-    if(auto row = index.identity_of(hash)) {
-        defined = defined || has_flag(row->flags, SymbolFlags::HasDefinition);
-    }
-    if(defined) {
-        return std::nullopt;
+    // A declaration stands in only for a symbol nothing defines. A
+    // reported definition may sit in a file whose rows are not serving —
+    // withheld as stale, or an open buffer that moved on from them — and
+    // then stays unavailable (`clice query` reports such a symbol as not
+    // found). A deleted file holds nothing anymore, and a definition
+    // deleted since its report leaves no such row behind.
+    if(reported_defined(hash)) {
+        bool unavailable = false;
+        index.each_reference_file(hash, [&](Fid file) {
+            auto* shard = index.shard(file);
+            if(unavailable || !shard || serving(file) || files.seen_missing(file)) {
+                return;
+            }
+            shard->lookup(hash, RelationKind::Definition, [&](const Relation&) {
+                unavailable = true;
+                return false;
+            });
+        });
+        if(unavailable) {
+            return std::nullopt;
+        }
     }
     return first_site(hash, RelationKind::Declaration);
+}
+
+bool IndexQuery::reported_defined(SymbolHash hash) const {
+    if(auto info = symbol_info(hash); info && has_flag(info->flags, SymbolFlags::HasDefinition)) {
+        return true;
+    }
+    auto row = index.identity_of(hash);
+    return row && has_flag(row->flags, SymbolFlags::HasDefinition);
 }
 
 std::vector<IndexQuery::Edge> IndexQuery::edges(SymbolHash hash, RelationKind kind) const {
@@ -580,16 +596,15 @@ std::vector<Site> IndexQuery::declaration(const Cursor& cursor) const {
 
 std::vector<Site> IndexQuery::references(const Cursor& cursor, bool include_declaration) const {
     ScopedTimer timer;
-    auto result = sites(cursor.symbol, RelationKind::Reference);
+    llvm::SmallVector<RelationKind, 4> kinds{RelationKind::Reference, RelationKind::WeakReference};
     if(include_declaration) {
-        for(auto kind: {RelationKind::Declaration, RelationKind::Definition}) {
-            auto extra = sites(cursor.symbol, kind);
-            result.insert(result.end(),
-                          std::make_move_iterator(extra.begin()),
-                          std::make_move_iterator(extra.end()));
-        }
-        dedup_sites(result);
+        kinds.append({RelationKind::Declaration, RelationKind::Definition});
     }
+    std::vector<Site> result;
+    for(auto kind: kinds) {
+        llvm::append_range(result, sites(cursor.symbol, kind));
+    }
+    dedup_sites(result);
     LOG_PERF("index_query",
              "kind=references path={} results={} elapsed_ms={:.2f}",
              cursor.site.path,
@@ -611,9 +626,27 @@ std::vector<Site> IndexQuery::implementation(SymbolHash hash) const {
     if(!info) {
         return {};
     }
-    bool type_like = info->kind == SymbolKind::Class || info->kind == SymbolKind::Struct ||
-                     info->kind == SymbolKind::Union;
-    return target_sites(hash, type_like ? RelationKind::Derived : RelationKind::Implementation);
+    if(info->kind == SymbolKind::Class || info->kind == SymbolKind::Struct ||
+       info->kind == SymbolKind::Union) {
+        return target_sites(hash, RelationKind::Derived);
+    }
+    // An override that only declares — a pure virtual of an abstract
+    // intermediate class — is listed, and its own overriders after it.
+    std::vector<Site> result;
+    llvm::DenseSet<SymbolHash> seen{hash};
+    llvm::SmallVector<SymbolHash> pending{hash};
+    while(!pending.empty()) {
+        for(auto& located: located_targets(pending.pop_back_val(), RelationKind::Implementation)) {
+            if(!seen.insert(located.symbol.hash).second) {
+                continue;
+            }
+            result.push_back(located.site);
+            if(!reported_defined(located.symbol.hash)) {
+                pending.push_back(located.symbol.hash);
+            }
+        }
+    }
+    return result;
 }
 
 std::optional<llvm::StringRef>
@@ -680,6 +713,31 @@ std::string IndexQuery::context_line(const Site& site) const {
     return text ? extract_line(*text, site.range.begin) : std::string{};
 }
 
+std::optional<IndexQuery::Located> IndexQuery::resolve_at(const Cursor& cursor) const {
+    if(auto located = resolve(cursor.symbol)) {
+        return located;
+    }
+    // A symbol of the file's own (a static function, a local) has no row
+    // in the global table to fan out from: its sites are in the cursor's
+    // serving source itself.
+    auto info = symbol_info(cursor.symbol);
+    auto source = serving(cursor.site.file);
+    if(!info || !source) {
+        return std::nullopt;
+    }
+    std::optional<Site> site;
+    for(auto kind: {RelationKind::Definition, RelationKind::Declaration}) {
+        source->rows->lookup(cursor.symbol, kind, [&](const Relation& relation) {
+            site = source->site(relation.range);
+            return !site;
+        });
+        if(site) {
+            return Located{.symbol = std::move(*info), .site = *site};
+        }
+    }
+    return std::nullopt;
+}
+
 std::optional<IndexQuery::Located> IndexQuery::resolve(SymbolHash hash) const {
     auto info = symbol_info(hash);
     if(!info) {
@@ -723,20 +781,15 @@ IndexQuery::RankedHits IndexQuery::ranked_search(const SymbolQuery& query,
                         const SymbolIdentity& identity,
                         llvm::StringRef path,
                         std::uint32_t reference_files) {
-        if(!is_searchable_kind(identity.kind) || identity.name.empty() || seen.contains(hash)) {
+        // A function's locals (parameters, local variables and classes)
+        // and a template's parameters are no one's search target; an open
+        // session's table holds them, the project table never does.
+        if(!is_searchable_kind(identity.kind) || identity.name.empty() ||
+           identity.scope == SymbolScope::FileLocal ||
+           has_flag(identity.flags, SymbolFlags::Unnamed) || seen.contains(hash)) {
             return;
         }
         if(!query.kinds.empty() && !llvm::is_contained(query.kinds, identity.kind)) {
-            return;
-        }
-        // A function's locals (parameters, local variables and classes)
-        // are no one's search target.
-        auto containers = container_chain(hash);
-        if(llvm::any_of(containers, [](const SymbolRef& container) {
-               return container.kind == SymbolKind::Function ||
-                      container.kind == SymbolKind::Method ||
-                      container.kind == SymbolKind::Operator;
-           })) {
             return;
         }
         if(!query.paths.empty() && llvm::none_of(query.paths, [&](const std::string& wanted) {
@@ -745,6 +798,7 @@ IndexQuery::RankedHits IndexQuery::ranked_search(const SymbolQuery& query,
             return;
         }
         if(query.absolute || !query.scope.empty() || query.mode == SymbolQuery::Mode::Members) {
+            auto containers = container_chain(hash);
             llvm::SmallVector<ScopeEntry, 4> chain;
             for(auto& container: containers) {
                 chain.push_back({.name = container.name, .args = container.args});
@@ -884,27 +938,8 @@ std::vector<IndexQuery::Located> IndexQuery::locate(const SymbolQuery& query) co
             if(!cursor) {
                 return {};
             }
-            if(auto located = resolve(cursor->symbol)) {
+            if(auto located = resolve_at(*cursor)) {
                 return {std::move(*located)};
-            }
-            // A symbol of the file's own (a static function, a local) has
-            // no row in the global table to fan out from: its sites are
-            // in the serving source itself.
-            auto info = symbol_info(cursor->symbol);
-            if(!info) {
-                return {};
-            }
-            std::optional<Site> site;
-            for(auto kind: {RelationKind::Definition, RelationKind::Declaration}) {
-                source->rows->lookup(cursor->symbol, kind, [&](const Relation& relation) {
-                    site = source->site(relation.range);
-                    return !site;
-                });
-                if(site) {
-                    return {
-                        Located{.symbol = std::move(*info), .site = *site}
-                    };
-                }
             }
             return {};
         }
@@ -931,10 +966,21 @@ std::vector<IndexQuery::Located> IndexQuery::locate(const SymbolQuery& query) co
 
     auto ranked = ranked_search(query, 50).hits;
     // Spelling the name exactly settles it; otherwise every match stands.
-    bool any_exact = llvm::any_of(ranked, [](const Ranked& hit) { return hit.rank.tier <= 1; });
+    // A class and its constructors spell one name: asked by it, the class
+    // answers.
+    llvm::DenseSet<SymbolHash> exact;
+    for(auto& hit: ranked) {
+        if(hit.rank.tier <= 1) {
+            exact.insert(hit.symbol.hash);
+        }
+    }
     std::vector<Located> results;
     for(auto& hit: ranked) {
-        if(any_exact && hit.rank.tier > 1) {
+        if(!exact.empty() && hit.rank.tier > 1) {
+            continue;
+        }
+        if(name_form(hit.symbol.flags) == NameForm::Constructor &&
+           exact.contains(hit.symbol.parent)) {
             continue;
         }
         if(auto site = canonical_site(hit.symbol.hash)) {

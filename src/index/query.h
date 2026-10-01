@@ -111,8 +111,8 @@ struct FreshnessOptions {
 /// describe the file's content on disk — they would point at text that no
 /// longer exists. The one question every disk-side row source is judged by
 /// (persisted shards, PCH overlay entries), against what the file table
-/// last saw on disk. A file seen missing keeps its last-known rows: they
-/// are the only remaining truth about it.
+/// last saw on disk. A file seen missing serves nothing: its rows describe
+/// text that is gone with it.
 class FreshnessGate {
 public:
     explicit FreshnessGate(FileTable& files, FreshnessOptions options = {}) :
@@ -269,9 +269,11 @@ public:
     /// definition, minus the site the cursor stands on.
     std::vector<Site> declaration(const Cursor& cursor) const;
 
-    /// The references of the symbol under the cursor, optionally folding in
-    /// its declarations and definitions, deduplicated across the kinds —
-    /// rows of different kinds can share one anchor.
+    /// The references of the symbol under the cursor, weak ones included (a
+    /// template's call through an overload set or a dependent name, which
+    /// names its candidates only heuristically), optionally folding in its
+    /// declarations and definitions, deduplicated across the kinds — rows of
+    /// different kinds can share one anchor.
     std::vector<Site> references(const Cursor& cursor, bool include_declaration) const;
 
     /// One canonical site per distinct relation target — the two-hop query
@@ -279,7 +281,8 @@ public:
     std::vector<Site> target_sites(SymbolHash hash, RelationKind kind) const;
 
     /// Sites implementing the symbol: derived types for a class-like
-    /// symbol, override targets otherwise.
+    /// symbol, overrides otherwise — through every override that only
+    /// declares to the ones below it.
     std::vector<Site> implementation(SymbolHash hash) const;
 
     /// A symbol's definition as text: the extent's site, the text it
@@ -308,6 +311,10 @@ public:
     };
 
     std::optional<Located> resolve(SymbolHash hash) const;
+
+    /// The symbol under a cursor with its canonical site — or, for a
+    /// symbol of the cursor file's own, its definition or declaration there.
+    std::optional<Located> resolve_at(const Cursor& cursor) const;
 
     /// One neighbour of a symbol in a graph: the symbol at its canonical
     /// site and the sites of the relation rows that connect them.
@@ -412,6 +419,10 @@ private:
 
     /// One canonical site per distinct relation target.
     std::vector<Located> located_targets(SymbolHash hash, RelationKind kind) const;
+
+    /// Whether some unit reported a definition of the symbol: an open
+    /// session's table knows only its own unit, the project table all.
+    bool reported_defined(SymbolHash hash) const;
 
     /// The one federation walk every relation query is a fold over. The
     /// visitor returns false to stop.

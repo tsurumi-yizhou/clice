@@ -94,6 +94,22 @@ struct PreambleExtras {
 };
 
 SymbolScope classify_scope(const clang::NamedDecl* decl) {
+    // A template parameter is named only inside its template, whatever
+    // linkage Clang derives for it from the enclosing context.
+    if(llvm::isa<clang::TemplateTypeParmDecl,
+                 clang::NonTypeTemplateParmDecl,
+                 clang::TemplateTemplateParmDecl>(decl)) {
+        return SymbolScope::FileLocal;
+    }
+    // An alias has no linkage of its own, yet names one entity wherever its
+    // scope reaches: at namespace and class scope it is global (TU-local in
+    // an anonymous namespace), inside a function local.
+    if(llvm::isa<clang::TypedefNameDecl, clang::NamespaceAliasDecl>(decl)) {
+        if(decl->getParentFunctionOrMethod()) {
+            return SymbolScope::FileLocal;
+        }
+        return decl->isInAnonymousNamespace() ? SymbolScope::TULocal : SymbolScope::External;
+    }
     auto linkage = decl->getFormalLinkage();
     if(linkage == clang::Linkage::None)
         return SymbolScope::FileLocal;
@@ -225,11 +241,13 @@ public:
         if(auto* ns = llvm::dyn_cast<clang::NamespaceDecl>(decl); ns && ns->isInline()) {
             flags |= SymbolFlags::InlineNamespace;
         }
-        auto location = decl->getLocation();
-        if(location.isMacroID()) {
+        // `FWD(Expr)` forward-declares a class defined by hand.
+        if(llvm::all_of(decl->redecls(), [](const clang::Decl* redecl) {
+               return redecl->getLocation().isMacroID();
+           })) {
             flags |= SymbolFlags::SpelledInMacro;
         }
-        if(unit.context().getSourceManager().isInSystemHeader(location)) {
+        if(unit.context().getSourceManager().isInSystemHeader(decl->getLocation())) {
             flags |= SymbolFlags::SystemHeader;
         }
         if(is_completable(decl)) {
@@ -346,9 +364,9 @@ public:
 
         Relation relation{
             .kind = kind,
-            .target_symbol = unit.entity(decls::normalize(target)),
+            .target_symbol = ensure_symbol(decls::normalize(target)),
         };
-        index->relations[unit.entity(decls::normalize(decl))].emplace_back(relation);
+        index->relations[ensure_symbol(decls::normalize(decl))].emplace_back(relation);
     }
 
     /// A call edge, landing at the call expression's location.
@@ -365,9 +383,9 @@ public:
         Relation relation{
             .kind = kind,
             .range = relation_range,
-            .target_symbol = unit.entity(decls::normalize(target)),
+            .target_symbol = ensure_symbol(decls::normalize(target)),
         };
-        index->relations[unit.entity(decls::normalize(decl))].emplace_back(relation);
+        index->relations[ensure_symbol(decls::normalize(decl))].emplace_back(relation);
     }
 
     /// Module names are indexed like macro names: an occurrence plus a
@@ -480,19 +498,66 @@ public:
         return result;
     }
 
+    /// Hierarchy ranges are positions in the caller's document: a call
+    /// written in a file the caller's body includes (`#include "body.inc"`
+    /// inside a function) lands at that include.
+    clang::SourceRange in_caller_file(const clang::NamedDecl* caller, clang::SourceRange range) {
+        auto& SM = unit.context().getSourceManager();
+        auto caller_file = SM.getFileID(SM.getExpansionLoc(caller->getLocation()));
+        auto location = SM.getExpansionLoc(range.getBegin());
+        if(SM.getFileID(location) == caller_file) {
+            return range;
+        }
+        while(SM.getFileID(location) != caller_file) {
+            location = SM.getIncludeLoc(SM.getFileID(location));
+            if(location.isInvalid()) {
+                return range;
+            }
+        }
+        return location;
+    }
+
     /// Decl-pair relation facts: type definitions, inheritance, overrides,
     /// constructor/destructor ownership and call edges. Only the index
     /// consumes these, so they live here rather than in the semantic layer.
     void project_relations(const Semantics& semantics, std::uint32_t index) {
         const SemanticNode& node = semantics.node(index).node;
 
-        if(auto* CE = node.get<clang::CallExpr>()) {
+        auto call = [&](const clang::NamedDecl* callee, clang::SourceRange range) {
             const clang::NamedDecl* caller = enclosing_function(semantics, index);
-            const clang::NamedDecl* callee =
-                llvm::dyn_cast_if_present<clang::NamedDecl>(CE->getCalleeDecl());
             if(caller && callee) {
-                add_call_relation(caller, RelationKind::Callee, callee, CE->getSourceRange());
-                add_call_relation(callee, RelationKind::Caller, caller, CE->getSourceRange());
+                range = in_caller_file(caller, range);
+                add_call_relation(caller, RelationKind::Callee, callee, range);
+                add_call_relation(callee, RelationKind::Caller, caller, range);
+            }
+        };
+
+        if(auto* CE = node.get<clang::CallExpr>()) {
+            // Some calls span no written extent: the ones Sema synthesizes
+            // for `__builtin_invoke` start nowhere or end before they
+            // begin, a bare MS `__noop` ends nowhere. They land at their
+            // expression location — the builtin's name — or nowhere when
+            // even that is unwritten.
+            auto range = CE->getSourceRange();
+            auto& SM = unit.context().getSourceManager();
+            if(range.isInvalid() ||
+               SM.isBeforeInTranslationUnit(range.getEnd(), range.getBegin())) {
+                range = CE->getExprLoc();
+                if(range.isInvalid()) {
+                    return;
+                }
+            }
+            if(auto* callee = llvm::dyn_cast_if_present<clang::NamedDecl>(CE->getCalleeDecl())) {
+                call(callee, range);
+                return;
+            }
+            // A dependent call reaches every candidate the resolver finds
+            // for it, as its weak references do.
+            for(auto* candidate: unit.resolver().lookup(CE)) {
+                if(auto* shadow = llvm::dyn_cast<clang::UsingShadowDecl>(candidate)) {
+                    candidate = shadow->getTargetDecl();
+                }
+                call(candidate, range);
             }
             return;
         }
@@ -504,11 +569,35 @@ public:
             if(!CCE->getParenOrBraceRange().isValid()) {
                 return;
             }
-            const clang::NamedDecl* caller = enclosing_function(semantics, index);
-            const clang::NamedDecl* callee = CCE->getConstructor();
-            if(caller && callee) {
-                add_call_relation(caller, RelationKind::Callee, callee, CCE->getSourceRange());
-                add_call_relation(callee, RelationKind::Caller, caller, CCE->getSourceRange());
+            // An inherited constructor is an implicit declaration standing
+            // in for the base constructor `using Base::Base` names.
+            const clang::CXXConstructorDecl* ctor = CCE->getConstructor();
+            if(auto inherited = ctor->getInheritedConstructor()) {
+                ctor = inherited.getConstructor();
+            }
+            call(ctor, CCE->getSourceRange());
+            return;
+        }
+
+        // `a != b` rewritten to `!(a == b)`: the traversal records only the
+        // written operands, never the call the rewrite made.
+        if(auto* RBO = node.get<clang::CXXRewrittenBinaryOperator>()) {
+            if(auto* inner = llvm::dyn_cast_if_present<clang::CXXOperatorCallExpr>(
+                   RBO->getDecomposedForm().InnerBinOp)) {
+                call(inner->getDirectCallee(), RBO->getSourceRange());
+            }
+            return;
+        }
+
+        if(auto* NE = node.get<clang::CXXNewExpr>()) {
+            call(NE->getOperatorNew(), NE->getSourceRange());
+            return;
+        }
+
+        if(auto* DE = node.get<clang::CXXDeleteExpr>()) {
+            call(DE->getOperatorDelete(), DE->getSourceRange());
+            if(auto type = DE->getDestroyedType(); !type.isNull()) {
+                call(types::destructor_of(type), DE->getSourceRange());
             }
             return;
         }
@@ -539,7 +628,7 @@ public:
             }
 
             auto* VD = llvm::cast<clang::ValueDecl>(D);
-            if(auto target = types::decl_of(VD->getType())) {
+            if(auto target = types::decl_of(types::unwrap(VD->getType()))) {
                 add_pair_relation(VD, RelationKind::TypeDefinition, target, VD->getLocation());
             }
             return;
@@ -554,7 +643,7 @@ public:
         }
 
         if(auto* TND = llvm::dyn_cast<clang::TypedefNameDecl>(D)) {
-            if(auto target = types::decl_of(TND->getUnderlyingType())) {
+            if(auto target = types::decl_of(types::unwrap(TND->getUnderlyingType()))) {
                 add_pair_relation(TND, RelationKind::TypeDefinition, target, TND->getLocation());
             }
             return;

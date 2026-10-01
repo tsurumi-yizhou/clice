@@ -2,12 +2,18 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <format>
+#include <thread>
 #include <type_traits>
 
 #ifdef __linux__
 #include <sys/vfs.h>
+#endif
+
+#ifndef _WIN32
+#include <sys/resource.h>
 #endif
 
 #include "lmdb.h"
@@ -38,16 +44,25 @@ constexpr llvm::StringLiteral lmdb_file_name = "index.mdb";
 constexpr std::size_t lmdb_small_mapsize = 256ull << 20;
 
 /// Virtual reservation; pages materialize on use. On POSIX the file's
-/// size tracks the data high-water mark, so the reservation is generous.
-/// On Windows the mapping extends the file to the whole mapsize — a
-/// 64 GiB file (sparse or not) alarms users and feeds backup and sync
-/// tools at its logical size — so the map starts small and grows on
-/// demand instead.
+/// size tracks the data high-water mark, so the reservation is generous —
+/// unless the address space is capped (`ulimit -v` on HPC and sandboxed
+/// hosts), where it would not fit. On Windows the mapping extends the file
+/// to the whole mapsize — a 64 GiB file (sparse or not) alarms users and
+/// feeds backup and sync tools at its logical size. Either way the map
+/// then starts small and grows on demand instead.
+std::size_t default_mapsize() {
 #ifdef _WIN32
-constexpr std::size_t lmdb_default_mapsize = lmdb_small_mapsize;
+    return lmdb_small_mapsize;
 #else
-constexpr std::size_t lmdb_default_mapsize = 64ull << 30;
+    constexpr std::size_t generous = 64ull << 30;
+    struct rlimit limit;
+    if(getrlimit(RLIMIT_AS, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY &&
+       limit.rlim_cur < 2 * generous) {
+        return lmdb_small_mapsize;
+    }
+    return generous;
 #endif
+}
 
 char kind_prefix(IndexBlobKind kind) {
     switch(kind) {
@@ -409,7 +424,7 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef library,
                                             bool read_only) {
     auto path = path::join(library, lmdb_file_name);
 
-    auto mapsize = initial_mapsize != 0 ? initial_mapsize : lmdb_default_mapsize;
+    auto mapsize = initial_mapsize != 0 ? initial_mapsize : default_mapsize();
 
     // One recovery retry: confirmed corruption (or a meta mismatch) is
     // repaired by deleting the database — it is a rebuildable cache, and
@@ -417,7 +432,9 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef library,
     // Transient errors (permissions, fd/memory pressure) must NOT delete
     // anything: persistence is disabled for this session instead, the
     // same discipline the loader applies to an unreadable global blob.
-    for(int attempt = 0; attempt < 2; attempt += 1) {
+    bool repaired = false;
+    int reopens = 0;
+    while(true) {
         // Giving up must not leave behind a file this attempt created
         // (make_sparse and mdb_env_open both create on demand): a later
         // session would misread the abandoned uninitialized placeholder as
@@ -445,12 +462,13 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef library,
         // loop should retry; false = give up with persistence disabled.
         auto fail = [&](int rc, llvm::StringRef stage) {
             mdb_env_close(env);
-            if(!read_only && is_corruption(rc) && attempt == 0) {
+            if(!read_only && is_corruption(rc) && !repaired) {
                 LOG_WARN("Index database at {} is corrupt ({} failed: {}); rebuilding",
                          path,
                          stage,
                          mdb_strerror(rc));
                 remove_database_files(path);
+                repaired = true;
                 return true;
             }
             LOG_WARN(
@@ -483,6 +501,16 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef library,
             // its size (no transaction is active yet) and retry once.
             mdb_env_set_mapsize(env, 0);
             rc = mdb_txn_begin(env, nullptr, MDB_RDONLY, &txn);
+        }
+        // The last process to close finds itself alone and destroys the
+        // lock file's mutexes, racing an opener blocked on its shared lock
+        // meanwhile: that opener's first transaction fails with EINVAL. A
+        // reopen finds the lock file unowned and initializes it afresh.
+        if(rc == EINVAL && reopens < 3) {
+            mdb_env_close(env);
+            reopens += 1;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10 * reopens));
+            continue;
         }
         if(rc != 0) {
             if(fail(rc, "snapshot")) {
@@ -520,7 +548,6 @@ std::unique_ptr<LmdbDatabase> open_lmdb_env(llvm::StringRef library,
         }
         return std::make_unique<LmdbDatabase>(env, dbi, txn, std::move(path), read_only);
     }
-    return nullptr;
 }
 
 enum class FsLocality : std::uint8_t {

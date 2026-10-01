@@ -11,8 +11,11 @@ base_ctor:
     - { file: "${WS}/inherited_using.cpp", range: "2:7-2:11" }
   references:
     - { file: "${WS}/inherited_using.cpp", range: "3:4-3:8" }
+    - { file: "${WS}/inherited_using.cpp", range: "13:16-13:20" }
   callHierarchy:
     - { name: "Base", kind: Method, file: "${WS}/inherited_using.cpp", range: "3:4-3:8" }
+  incomingCalls:
+    - { name: "read_derived", kind: Function, file: "${WS}/inherited_using.cpp", range: "17:4-17:16", fromRanges: ["18:12-18:22"] }
 
 base_member:
   definition:
@@ -21,6 +24,7 @@ base_member:
     - { file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
   references:
     - { file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
+    - { file: "${WS}/inherited_using.cpp", range: "14:16-14:20" }
     - { file: "${WS}/inherited_using.cpp", range: "19:19-19:23" }
   callHierarchy:
     - { name: "read", kind: Method, file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
@@ -36,8 +40,11 @@ ctor_using:
     - { file: "${WS}/inherited_using.cpp", range: "2:7-2:11" }
   references:
     - { file: "${WS}/inherited_using.cpp", range: "3:4-3:8" }
+    - { file: "${WS}/inherited_using.cpp", range: "13:16-13:20" }
   callHierarchy:
     - { name: "Base", kind: Method, file: "${WS}/inherited_using.cpp", range: "3:4-3:8" }
+  incomingCalls:
+    - { name: "read_derived", kind: Function, file: "${WS}/inherited_using.cpp", range: "17:4-17:16", fromRanges: ["18:12-18:22"] }
 
 derived_use:
   definition:
@@ -59,6 +66,7 @@ member_use:
     - { file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
   references:
     - { file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
+    - { file: "${WS}/inherited_using.cpp", range: "14:16-14:20" }
     - { file: "${WS}/inherited_using.cpp", range: "19:19-19:23" }
   callHierarchy:
     - { name: "read", kind: Method, file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
@@ -72,6 +80,7 @@ member_using:
     - { file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
   references:
     - { file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
+    - { file: "${WS}/inherited_using.cpp", range: "14:16-14:20" }
     - { file: "${WS}/inherited_using.cpp", range: "19:19-19:23" }
   callHierarchy:
     - { name: "read", kind: Method, file: "${WS}/inherited_using.cpp", range: "5:8-5:12" }
