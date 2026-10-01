@@ -95,11 +95,11 @@ LexicalInfo lexical_scan(llvm::StringRef content, const clang::LangOptions* lang
         while(!token.is_eod() && !token.is_eof()) {
             token = advance();
         }
+        LocalSourceRange range{hash.range.begin, token.range.begin};
         if(kind) {
-            info.block_directives.push_back({
-                .kind = *kind,
-                .range = {hash.range.begin, token.range.begin},
-            });
+            info.block_directives.push_back({.kind = *kind, .range = range});
+        } else if(keyword == "include" || keyword == "include_next" || keyword == "import") {
+            info.include_directives.push_back(range);
         }
     };
 
@@ -116,6 +116,12 @@ LexicalInfo lexical_scan(llvm::StringRef content, const clang::LangOptions* lang
 
         if(token.is_directive_hash()) {
             scan_directive(token);
+            continue;
+        }
+
+        if(clang::tok::isStringLiteral(token.kind) &&
+           token.text(content).split('"').first.ends_with("R")) {
+            info.raw_strings.push_back(token.range);
             continue;
         }
 

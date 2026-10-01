@@ -303,6 +303,11 @@ struct FoldingRange {
     LocalSourceRange range;
     std::optional<protocol::FoldingRangeKind> kind;
     std::string collapsed_text;
+
+    /// What a client folding whole lines folds, when it differs from what
+    /// `range` implies: the line holding `begin` stays visible and the
+    /// lines after it hide through the line holding `end`.
+    std::optional<LocalSourceRange> lines;
 };
 
 /// A resolved document link: the argument range of an include-like

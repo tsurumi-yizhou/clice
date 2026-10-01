@@ -388,6 +388,17 @@ public:
         return lexical.block_directives;
     }
 
+    /// The main file's include directives in source order, the preamble's
+    /// and skipped blocks' included.
+    llvm::ArrayRef<LocalSourceRange> include_directives() const {
+        return lexical.include_directives;
+    }
+
+    /// The main file's raw string literal tokens in source order.
+    llvm::ArrayRef<LocalSourceRange> raw_strings() const {
+        return lexical.raw_strings;
+    }
+
 private:
     friend class SemanticsBuilder;
 
