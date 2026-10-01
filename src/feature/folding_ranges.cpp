@@ -29,9 +29,15 @@ namespace {
 ///
 /// Fold kinds are plain strings on the wire (LSP standardizes only `comment`,
 /// `imports` and `region`; servers may add custom values).
+///
+/// A delimited fold spans its delimiters, which `collapsed_text` repeats; a
+/// section fold (an access-specifier section, a conditional branch, a
+/// region, a module fragment) runs from the end of its header line to the
+/// next header, which stays visible.
 class FoldingRangeCollector {
 public:
-    explicit FoldingRangeCollector(CompilationUnitRef unit) : unit(unit) {}
+    explicit FoldingRangeCollector(CompilationUnitRef unit) :
+        unit(unit), content(unit.main_content()) {}
 
     auto collect() -> std::vector<FoldingRange> {
         auto nodes = unit.semantics().node_entries();
@@ -40,7 +46,7 @@ public:
             const Semantics::Node& entry = nodes[index];
             if(!entry.node.is_ast()) {
                 // The preprocessor segment follows the AST segment; directive
-                // folds are collected from the unit's directive table below.
+                // folds are collected from the lexical scan below.
                 break;
             }
 
@@ -58,11 +64,8 @@ public:
             index += 1;
         }
 
-        auto directives_it = unit.directives().find(unit.main_file());
-        if(directives_it != unit.directives().end()) {
-            collect_condition_directives(directives_it->second.conditions);
-            collect_pragma_region(directives_it->second.pragmas);
-        }
+        collect_block_directives(unit.semantics().block_directives());
+        collect_module_fragments(unit.semantics().module_declarations());
 
         // Order by kind and text after position so equal entries are adjacent
         // and the output stays deterministic under the unstable sort.
@@ -92,16 +95,20 @@ public:
 private:
     void collect_decl(const clang::Decl* decl) {
         if(const auto* ns = llvm::dyn_cast<clang::NamespaceDecl>(decl)) {
-            // NamespaceDecl does not store its left brace location; scan for
-            // it so the fold keeps the name visible.
-            auto tokens = unit.expanded_tokens(ns->getSourceRange())
-                              .drop_until([](const clang::syntax::Token& token) {
-                                  return token.kind() == clang::tok::l_brace;
-                              });
-            if(!tokens.empty()) {
-                add_range(clang::SourceRange(tokens.front().location(), ns->getRBraceLoc()),
-                          "namespace",
-                          "{...}");
+            add_block(ns, ns->getRBraceLoc(), "namespace");
+            return;
+        }
+
+        if(const auto* linkage = llvm::dyn_cast<clang::LinkageSpecDecl>(decl)) {
+            if(linkage->hasBraces()) {
+                add_block(linkage, linkage->getRBraceLoc(), "linkageSpec");
+            }
+            return;
+        }
+
+        if(const auto* exported = llvm::dyn_cast<clang::ExportDecl>(decl)) {
+            if(exported->hasBraces()) {
+                add_block(exported, exported->getRBraceLoc(), "export");
             }
             return;
         }
@@ -125,13 +132,10 @@ private:
         }
 
         if(const auto* function = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
-            if(!function->doesThisDeclarationHaveABody()) {
-                collect_parameter_list(function->getSourceRange());
-                return;
+            collect_parameter_list(function);
+            if(function->doesThisDeclarationHaveABody()) {
+                add_range(function->getBody()->getSourceRange(), "functionBody", "{...}");
             }
-
-            collect_parameter_list(function->getBeginLoc(), function->getBody()->getBeginLoc());
-            add_range(function->getBody()->getSourceRange(), "functionBody", "{...}");
         }
     }
 
@@ -139,8 +143,7 @@ private:
         if(const auto* lambda = llvm::dyn_cast<clang::LambdaExpr>(stmt)) {
             add_range(lambda->getIntroducerRange(), "lambdaCapture", "[...]");
             if(lambda->hasExplicitParameters()) {
-                collect_parameter_list(lambda->getIntroducerRange().getEnd(),
-                                       lambda->getCompoundStmtBody()->getBeginLoc());
+                collect_parameter_list(lambda->getCallOperator());
             }
             return;
         }
@@ -223,104 +226,97 @@ private:
     }
 
     void collect_access_specifiers(const clang::CXXRecordDecl* record) {
-        clang::AccessSpecDecl* previous = nullptr;
+        const clang::AccessSpecDecl* previous = nullptr;
+        auto close = [&](clang::SourceLocation next) {
+            if(!previous) {
+                return;
+            }
+            auto [header_fid, header] =
+                unit.decompose_location(unit.file_location(previous->getColonLoc()));
+            auto [next_fid, end] = unit.decompose_location(unit.file_location(next));
+            if(header_fid == unit.main_file() && next_fid == unit.main_file()) {
+                add_section(header_end(header), end, "accessSpecifier");
+            }
+        };
         for(auto* member: record->decls()) {
-            auto* access = llvm::dyn_cast<clang::AccessSpecDecl>(member);
-            if(!access) {
-                continue;
+            if(auto* access = llvm::dyn_cast<clang::AccessSpecDecl>(member)) {
+                close(access->getAccessSpecifierLoc());
+                previous = access;
             }
-
-            if(previous) {
-                add_range(
-                    clang::SourceRange(previous->getColonLoc(), access->getAccessSpecifierLoc()),
-                    "accessSpecifier",
-                    "");
-            }
-            previous = access;
         }
+        close(record->getBraceRange().getEnd());
+    }
 
-        if(previous) {
-            add_range(clang::SourceRange(previous->getColonLoc(), record->getBraceRange().getEnd()),
-                      "accessSpecifier",
-                      "");
+    void collect_parameter_list(const clang::FunctionDecl* function) {
+        if(auto type = function->getFunctionTypeLoc()) {
+            add_range(type.getParensRange(), "functionParams", "(...)");
         }
     }
 
-    void collect_parameter_list(clang::SourceLocation left, clang::SourceLocation right) {
-        collect_parameter_list(clang::SourceRange(left, right));
-    }
-
-    void collect_parameter_list(clang::SourceRange bounds) {
-        auto tokens = unit.expanded_tokens(bounds);
-        auto left_paren = tokens.drop_until(
-            [](const clang::syntax::Token& token) { return token.kind() == clang::tok::l_paren; });
-        if(left_paren.empty()) {
-            return;
-        }
-
-        auto right_paren = std::find_if(
-            left_paren.rbegin(),
-            left_paren.rend(),
-            [](const clang::syntax::Token& token) { return token.kind() == clang::tok::r_paren; });
-        if(right_paren == left_paren.rend()) {
-            return;
-        }
-
-        add_range(clang::SourceRange(left_paren.front().location(), right_paren->location()),
-                  "functionParams",
-                  "(...)");
-    }
-
-    void collect_condition_directives(const std::vector<Condition>& conditions) {
-        llvm::SmallVector<const Condition*> stack;
-
-        for(const auto& condition: conditions) {
-            switch(condition.kind) {
-                case Condition::BranchKind::If:
-                case Condition::BranchKind::Ifdef:
-                case Condition::BranchKind::Ifndef:
-                case Condition::BranchKind::Elif:
-                case Condition::BranchKind::Elifdef:
-                case Condition::BranchKind::Elifndef: stack.push_back(&condition); break;
-
-                case Condition::BranchKind::Else: {
-                    if(!stack.empty()) {
-                        auto* previous = stack.pop_back_val();
-                        add_range(
-                            clang::SourceRange(previous->condition_range.getEnd(), condition.loc),
-                            "conditionDirective",
-                            "");
+    void collect_block_directives(llvm::ArrayRef<LexicalInfo::BlockDirective> directives) {
+        using enum LexicalInfo::BlockDirective::Kind;
+        llvm::SmallVector<const LexicalInfo::BlockDirective*> branches;
+        llvm::SmallVector<const LexicalInfo::BlockDirective*> regions;
+        for(const auto& directive: directives) {
+            switch(directive.kind) {
+                case If: branches.push_back(&directive); break;
+                case Else:
+                case EndIf: {
+                    if(branches.empty()) {
+                        break;
                     }
-                    stack.push_back(&condition);
+                    add_section(branches.back()->range.end,
+                                directive.range.begin,
+                                "conditionDirective");
+                    if(directive.kind == Else) {
+                        branches.back() = &directive;
+                    } else {
+                        branches.pop_back();
+                    }
                     break;
                 }
-
-                case Condition::BranchKind::EndIf:
-                    if(!stack.empty()) {
-                        (void)stack.pop_back_val();
+                case Region: regions.push_back(&directive); break;
+                case EndRegion: {
+                    if(!regions.empty()) {
+                        add_section(regions.pop_back_val()->range.end,
+                                    directive.range.begin,
+                                    protocol::FoldingRangeKind::region);
                     }
                     break;
+                }
             }
         }
     }
 
-    void collect_pragma_region(const std::vector<Pragma>& pragmas) {
-        llvm::SmallVector<const Pragma*> stack;
-
-        for(const auto& pragma: pragmas) {
-            if(pragma.kind == Pragma::Kind::Region) {
-                stack.push_back(&pragma);
+    /// The global module fragment runs to the module declaration, the
+    /// private one to the end of the file.
+    void collect_module_fragments(llvm::ArrayRef<LexicalInfo::ModuleDeclaration> modules) {
+        for(auto [index, module]: llvm::enumerate(modules)) {
+            if(module.kind == LexicalInfo::ModuleDeclaration::Kind::Declaration) {
                 continue;
             }
-
-            if(pragma.kind != Pragma::Kind::EndRegion || stack.empty()) {
-                continue;
+            auto end = static_cast<std::uint32_t>(content.size());
+            if(index + 1 < modules.size()) {
+                const auto& next = modules[index + 1];
+                end = next.export_keyword.valid() ? next.export_keyword.begin : next.keyword.begin;
             }
+            add_section(header_end(module.keyword.begin), end, "moduleFragment");
+        }
+    }
 
-            auto* previous = stack.pop_back_val();
-            add_range(clang::SourceRange(previous->loc, pragma.loc),
-                      protocol::FoldingRangeKind::region,
-                      "");
+    /// A brace block whose declaration records only its closing brace: the
+    /// opening one is the declaration's first `{`.
+    void add_block(const clang::Decl* decl,
+                   clang::SourceLocation right_brace,
+                   protocol::FoldingRangeKind kind) {
+        auto tokens = unit.expanded_tokens(decl->getSourceRange())
+                          .drop_until([](const clang::syntax::Token& token) {
+                              return token.kind() == clang::tok::l_brace;
+                          });
+        if(!tokens.empty()) {
+            add_range(clang::SourceRange(tokens.front().location(), right_brace),
+                      std::move(kind),
+                      "{...}");
         }
     }
 
@@ -331,9 +327,10 @@ private:
             return;
         }
 
-        auto [begin, end] = range;
-        begin = unit.expansion_location(begin);
-        end = unit.expansion_location(end);
+        // What macro arguments spell folds where it is written; what a
+        // macro body produces folds at the invocation.
+        auto begin = unit.file_location(range.getBegin());
+        auto end = unit.file_location(range.getEnd());
         if(begin == end) {
             return;
         }
@@ -344,8 +341,7 @@ private:
         }
 
         // Single-line ranges are not worth folding.
-        auto content = unit.file_content(fid);
-        if(!content.substr(local.begin, local.end - local.begin).contains('\n')) {
+        if(!content.substr(local.begin, local.length()).contains('\n')) {
             return;
         }
 
@@ -356,7 +352,25 @@ private:
         });
     }
 
+    /// `begin` ends a header line; a section hiding no whole line is noise.
+    void add_section(std::uint32_t begin, std::uint32_t end, protocol::FoldingRangeKind kind) {
+        if(end <= begin || content.substr(begin, end - begin).count('\n') < 2) {
+            return;
+        }
+        ranges.push_back({
+            .range = {begin, end},
+            .kind = std::move(kind)
+        });
+    }
+
+    /// Where the text of the line holding `offset` ends.
+    std::uint32_t header_end(std::uint32_t offset) {
+        return static_cast<std::uint32_t>(
+            std::min(content.find_first_of("\r\n", offset), content.size()));
+    }
+
     CompilationUnitRef unit;
+    llvm::StringRef content;
     std::vector<FoldingRange> ranges;
 };
 
@@ -366,18 +380,11 @@ auto folding_ranges(CompilationUnitRef unit) -> std::vector<FoldingRange> {
     return FoldingRangeCollector(unit).collect();
 }
 
-auto folding_ranges(CompilationUnitRef unit, PositionEncoding encoding)
-    -> std::vector<protocol::FoldingRange> {
-    return folding_ranges_to_protocol(folding_ranges(unit),
-                                      unit.main_content(),
-                                      unit.line_starts(),
-                                      encoding);
-}
-
 auto folding_ranges_to_protocol(llvm::ArrayRef<FoldingRange> ranges,
                                 llvm::StringRef content,
                                 llvm::ArrayRef<std::uint32_t> line_starts,
-                                PositionEncoding encoding) -> std::vector<protocol::FoldingRange> {
+                                PositionEncoding encoding,
+                                bool line_folding_only) -> std::vector<protocol::FoldingRange> {
     LineMap map(content,
                 std::span<const std::uint32_t>(line_starts.data(), line_starts.size()),
                 encoding);
@@ -391,12 +398,23 @@ auto folding_ranges_to_protocol(llvm::ArrayRef<FoldingRange> ranges,
         if(!start || !end)
             continue;
 
-        protocol::FoldingRange range{
-            .start_line = start->line,
-            .start_character = start->character,
-            .end_line = end->line,
-            .end_character = end->character,
-        };
+        protocol::FoldingRange range;
+        if(line_folding_only) {
+            // The client hides whole lines below the start line. The line a
+            // fold ends on holds its closing delimiter or the next header —
+            // `} else {`, `#else`, `private:` — and must stay visible.
+            if(end->line <= start->line + 1) {
+                continue;
+            }
+            range = {.start_line = start->line, .end_line = end->line - 1};
+        } else {
+            range = {
+                .start_line = start->line,
+                .start_character = start->character,
+                .end_line = end->line,
+                .end_character = end->character,
+            };
+        }
 
         if(item.kind.has_value()) {
             range.kind = *item.kind;

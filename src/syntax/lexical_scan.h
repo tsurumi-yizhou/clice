@@ -13,8 +13,11 @@ namespace clice {
 
 /// Everything one lexical pass over a file records that neither the AST
 /// nor the preprocessor callbacks report: comments (the token buffer drops
-/// them) and the three module declaration forms (clang reports imports
-/// through PPCallbacks, but nothing covers the declarations themselves).
+/// them), the three module declaration forms (clang reports imports
+/// through PPCallbacks, but nothing covers the declarations themselves)
+/// and the block structure of the conditional and region directives (the
+/// callbacks skip the branches nested in a skipped block, a `#else` behind
+/// a taken `#elif`, and everything a preamble PCH consumed).
 struct LexicalInfo {
     struct Comment {
         enum class Kind : std::uint8_t {
@@ -58,6 +61,31 @@ struct LexicalInfo {
         /// keyword for the private fragment.
         llvm::SmallVector<LocalSourceRange, 2> partition_parts;
     };
+
+    /// A directive opening, continuing or closing a block of lines,
+    /// whether or not the preprocessor entered it.
+    struct BlockDirective {
+        enum class Kind : std::uint8_t {
+            /// `#if`, `#ifdef` or `#ifndef`.
+            If,
+            /// `#elif`, `#elifdef`, `#elifndef` or `#else`.
+            Else,
+            /// `#endif`.
+            EndIf,
+            /// `#pragma region`.
+            Region,
+            /// `#pragma endregion`.
+            EndRegion,
+        };
+
+        Kind kind;
+
+        /// From the `#` to the end of the directive's logical line.
+        LocalSourceRange range;
+    };
+
+    /// In source order.
+    std::vector<BlockDirective> block_directives;
 
     // Both vectors heap-allocate so that payload pointers into them (the
     // Semantics node table stores such pointers) survive moving the info.
