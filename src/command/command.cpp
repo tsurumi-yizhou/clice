@@ -224,6 +224,65 @@ void render_arg(const Arg& arg, llvm::function_ref<void(std::string_view)> cb) {
     option::table().render(parsed, forward);
 }
 
+void render_driver_arg(const Arg& arg,
+                       CompilerFamily family,
+                       llvm::function_ref<void(std::string_view)> cb) {
+    if(family != CompilerFamily::MSVC && family != CompilerFamily::ClangCL) {
+        render_arg(arg, cb);
+        return;
+    }
+
+    auto reads_back = [&](std::vector<std::string>& fragments) {
+        auto parse_options = kota::option::ParseOptions{.visibility = option::CLOption};
+        std::size_t count = 0;
+        bool same = true;
+        for(auto& parsed: option::table().parse(fragments, parse_options)) {
+            count += 1;
+            same = same && parsed && parsed->id == arg.opt_id &&
+                   llvm::equal(parsed->values,
+                               arg.values,
+                               [](std::string_view lhs, const char* rhs) { return lhs == rhs; });
+        }
+        return same && count == 1;
+    };
+    auto emit = [&](llvm::ArrayRef<std::string> fragments) {
+        for(auto& fragment: fragments) {
+            cb(fragment);
+        }
+    };
+
+    std::vector<std::string> fragments;
+    render_arg(arg, [&](std::string_view fragment) { fragments.emplace_back(fragment); });
+    if(reads_back(fragments)) {
+        emit(fragments);
+        return;
+    }
+
+    // A cl spelling of the option keeps its place among the arguments,
+    // where order decides (`/W3 -Wno-unused-variable`).
+    for(auto& option: option::table().option_infos) {
+        if(option.alias_id != arg.opt_id || !(option.visibility & option::CLOption)) {
+            continue;
+        }
+        std::vector<std::string> spelled{std::string(option.prefixed_name)};
+        if(option.kind != kota::option::Kind::Flag) {
+            if(arg.values.size() != 1) {
+                continue;
+            }
+            spelled[0] += arg.values[0];
+        }
+        if(reads_back(spelled)) {
+            emit(spelled);
+            return;
+        }
+    }
+
+    // The driver appends `/clang:` arguments after all others.
+    for(auto& fragment: fragments) {
+        cb("/clang:" + fragment);
+    }
+}
+
 unsigned family_visibility(CompilerFamily family) {
     /// Exclude the slash-prefixed CL and DXC options otherwise (/D and /I
     /// carry both bits), to prevent /U, /D, /I from matching Unix absolute
@@ -1339,7 +1398,7 @@ std::vector<const char*> CompilationDatabase::render_driver(const CommandRef& re
             case ArgClass::Semantic:
             case ArgClass::UserContent:
             case ArgClass::Diagnostics:
-                render_arg(arg, emit);
+                render_driver_arg(arg, cfg.family, emit);
                 if(arg.cls == ArgClass::UserContent) {
                     last_user_content = argv.size();
                 }

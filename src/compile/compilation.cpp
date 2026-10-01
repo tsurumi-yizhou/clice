@@ -136,6 +136,14 @@ std::unique_ptr<clang::CompilerInvocation>
         lang_opts.DelayedTemplateParsing = false;
     }
 
+    // A header compiled under a source's command (`-x c++` buys a parse
+    // instead of a precompiled-header job) is still a header: no "#pragma
+    // once in main file", no unused warnings for its static functions.
+    if(auto file = front_opts.Inputs[0].getFile();
+       is_header_path(file) || is_context_header_path(file)) {
+        lang_opts.IsHeaderFile = true;
+    }
+
     return invocation;
 }
 
