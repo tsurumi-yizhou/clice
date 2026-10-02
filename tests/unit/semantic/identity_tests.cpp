@@ -922,6 +922,101 @@ using §(alias)Result = int;
     }
 }
 
+TEST_CASE(CTagsPerFile) {
+    llvm::StringRef header = R"c(
+struct §(shared)shared { int x; };
+struct §(opaque)opaque;
+)c";
+    add_file("forward.h", "struct opaque;\n");
+    add_file("common.h", header);
+    add_main("a.c", R"c(
+#include "forward.h"
+#include "common.h"
+struct §(state)state { int x; };
+)c");
+    ASSERT_TRUE(compile("-std=c17"));
+
+    Tester other;
+    other.add_file("common.h", header);
+    other.add_main("b.c", R"c(
+#include "common.h"
+struct §(state)state { int x; };
+)c");
+    ASSERT_TRUE(other.compile("-std=c17"));
+
+    EXPECT_NE(entity_at(*this, "a.c", "state"), entity_at(other, "b.c", "state"));
+    EXPECT_EQ(entity_at(*this, "common.h", "shared"), entity_at(other, "common.h", "shared"));
+    EXPECT_EQ(entity_at(*this, "common.h", "opaque"), entity_at(other, "common.h", "opaque"));
+}
+
+TEST_CASE(CTagsInContext) {
+    add_file("part.h", "struct ctx;\nstruct §(part)part { int x; };\n");
+    add_main("host.c", R"c(
+struct §(ctx)ctx { int x; };
+#include "part.h"
+)c");
+    ASSERT_TRUE(compile("-std=c17"));
+
+    /// The header compiled as its host sees it: the host's text before the
+    /// include arrives as a fragment the compile -includes, named after
+    /// the host by its opening #line marker — not by a #line the host's
+    /// own text carries.
+    std::string marker = "#line 1 \"";
+    for(char c: unit->file_path(unit->main_file())) {
+        if(c == '\\') {
+            marker += '\\';
+        }
+        marker += c;
+    }
+    marker += "\"\n";
+
+    Tester context;
+    context.add_main("part.h", "struct §(ctx)ctx;\nstruct §(part)part { int x; };\n");
+    context.prepare("-std=c17");
+    auto prefix = TestVFS::path(".clice-prefix.h");
+    context.params.add_synthesized({
+        {prefix, marker + "struct ctx { int x; };\n#line 9 \"elsewhere.c\"\n"}
+    });
+    context.owned_args.insert(context.owned_args.end() - 1, {"-include", prefix});
+    context.params.arguments.clear();
+    for(auto& arg: context.owned_args) {
+        context.params.arguments.push_back(arg.c_str());
+    }
+    ASSERT_TRUE(context.try_compile());
+
+    EXPECT_EQ(entity_at(context, "part.h", "ctx"), entity_at(*this, "host.c", "ctx"));
+    EXPECT_EQ(entity_at(context, "part.h", "part"), entity_at(*this, "part.h", "part"));
+}
+
+TEST_CASE(CLinkageIgnoresTypes) {
+    add_main("a.c", R"c(
+typedef int wchar_t;
+int §(f)f();
+void §(g)g(wchar_t c);
+)c");
+    ASSERT_TRUE(compile("-std=c17"));
+
+    Tester other;
+    other.add_main("b.cpp", R"cpp(
+extern "C" int §(f)f(void);
+extern "C" void §(g)g(wchar_t c);
+)cpp");
+    ASSERT_TRUE(other.compile());
+
+    EXPECT_EQ(entity_at(*this, "a.c", "f"), entity_at(other, "b.cpp", "f"));
+    EXPECT_EQ(entity_at(*this, "a.c", "g"), entity_at(other, "b.cpp", "g"));
+}
+
+TEST_CASE(OverloadableCFunctions) {
+    add_main("a.c", R"c(
+__attribute__((overloadable)) void §(i)f(int);
+__attribute__((overloadable)) void §(d)f(double);
+)c");
+    ASSERT_TRUE(compile("-std=c17"));
+
+    EXPECT_NE(entity_at(*this, "a.c", "i"), entity_at(*this, "a.c", "d"));
+}
+
 TEST_CASE(HeaderAcrossUnits) {
     llvm::StringRef first = R"cpp(
 #pragma once
