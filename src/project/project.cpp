@@ -76,15 +76,12 @@ static std::optional<Spelling> database_in(const Spelling& dir) {
     return candidate;
 }
 
-llvm::SmallVector<Spelling> discover_compile_commands(CanonicalRef workspace_root) {
-    llvm::SmallVector<Spelling> found;
+llvm::SmallVector<Spelling> database_places(CanonicalRef workspace_root) {
+    llvm::SmallVector<Spelling> places;
     if(workspace_root.empty()) {
-        return found;
+        return places;
     }
-    Spelling root(workspace_root);
-    if(auto database = database_in(root)) {
-        found.push_back(std::move(*database));
-    }
+    places.emplace_back("compile_commands.json", Spelling(workspace_root));
 
     // Name order, so build/ and out/ side by side load in the same order on
     // every start rather than whichever the directory listing yields first.
@@ -92,17 +89,23 @@ llvm::SmallVector<Spelling> discover_compile_commands(CanonicalRef workspace_roo
     std::error_code ec;
     for(llvm::sys::fs::directory_iterator it(workspace_root, ec), end; it != end && !ec;
         it.increment(ec)) {
-        // A symlinked build directory is a build directory too.
-        if(llvm::sys::fs::is_directory(it->path())) {
+        // A symlinked build directory is a build directory too, even
+        // before its target exists.
+        if(it->type() == llvm::sys::fs::file_type::symlink_file ||
+           llvm::sys::fs::is_directory(it->path())) {
             subdirectories.push_back(Spelling::absolute(it->path()));
         }
     }
     std::ranges::sort(subdirectories, {}, &Spelling::str);
     for(auto& subdirectory: subdirectories) {
-        if(auto database = database_in(subdirectory)) {
-            found.push_back(std::move(*database));
-        }
+        places.emplace_back("compile_commands.json", subdirectory);
     }
+    return places;
+}
+
+llvm::SmallVector<Spelling> discover_compile_commands(CanonicalRef workspace_root) {
+    auto found = database_places(workspace_root);
+    llvm::erase_if(found, [](const Spelling& place) { return !llvm::sys::fs::exists(place); });
     return found;
 }
 
@@ -163,15 +166,19 @@ CanonicalPath project_root_above(CanonicalRef start) {
     return root;
 }
 
-llvm::SmallVector<Spelling> compile_commands_above(CanonicalRef start,
-                                                   CanonicalRef workspace_root) {
-    llvm::SmallVector<Spelling> found;
+llvm::SmallVector<Spelling> database_places_above(CanonicalRef start, CanonicalRef workspace_root) {
+    llvm::SmallVector<Spelling> places;
     path::walk_ancestors(start, workspace_root, [&](llvm::StringRef dir) {
-        if(auto database = database_in(Spelling::absolute(dir))) {
-            found.push_back(std::move(*database));
-        }
+        places.emplace_back("compile_commands.json", Spelling::absolute(dir));
         return true;
     });
+    return places;
+}
+
+llvm::SmallVector<Spelling> compile_commands_above(CanonicalRef start,
+                                                   CanonicalRef workspace_root) {
+    auto found = database_places_above(start, workspace_root);
+    llvm::erase_if(found, [](const Spelling& place) { return !llvm::sys::fs::exists(place); });
     return found;
 }
 
@@ -240,29 +247,22 @@ DepsSnapshot capture_deps_snapshot(FileTable& files,
 }
 
 bool deps_changed(FileTable& files, const DepsSnapshot& snap) {
-    for(auto& dep: snap) {
+    auto changed = [&](const DepState& dep) {
+        // Gone at build time: reappearing is the change; still-missing
+        // stays unchanged (see the capture).
         if(dep.missing) {
-            // Gone at build time: reappearing is the change; still-missing
-            // stays unchanged (see the capture).
-            if(files.present(dep.path_id)) {
-                return true;
-            }
-            continue;
+            return files.present(dep.path_id);
         }
-
         // No version names the consumed bytes: rebuild once to converge.
         if(!dep.version.valid()) {
             return true;
         }
-
         // Missing means gone now — a change, since the build saw the file.
         // Unreadable cannot prove the disk unchanged and counts as changed
         // — conservative, retried by the rebuild's capture.
-        if(files.check_version(dep.version) != vfs::DiskState::Verdict::Fresh) {
-            return true;
-        }
-    }
-    return false;
+        return files.check_version(dep.version) != vfs::DiskState::Verdict::Fresh;
+    };
+    return std::ranges::count_if(snap, changed) != 0;
 }
 
 std::shared_ptr<index::TUIndex> load_pch_envelope(llvm::StringRef path) {

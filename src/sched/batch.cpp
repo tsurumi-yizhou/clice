@@ -138,6 +138,7 @@ struct BatchLifetime {
         aux.spawn(watch_signal(SIGINT, stop, stop_requested));
         aux.spawn(watch_signal(SIGTERM, stop, stop_requested));
         aux.spawn(checkpoint_task(stack));
+        aux.spawn(stack.files.disk.end_turns(stack.loop));
     }
 
     kota::cancellation_token token() {

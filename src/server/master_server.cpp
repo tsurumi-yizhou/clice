@@ -51,6 +51,7 @@ MasterServer::MasterServer(kota::event_loop& loop,
             server.drain_disk_changes();
         }(*this));
     };
+    polling.spawn(files.disk.end_turns(loop));
     // The notify hook is process-wide because the logging layer cannot
     // depend on the server; the composition root owns it for the server's
     // lifetime and turns reports into state (notify_log) plus a wake-up
@@ -70,6 +71,9 @@ MasterServer::~MasterServer() {
     // The projects go first, while the members their release reads live.
     lifecycle = ServerLifecycle::Exited;
     projects.clear();
+    // A server never shut down (a unit test) still ends the file table's
+    // turns.
+    polling.cancel();
     logging::set_notify_hook(nullptr);
 }
 
@@ -637,6 +641,9 @@ kota::task<> MasterServer::poll_task() {
     while(true) {
         co_await kota::sleep(interval);
         files.disk.tick(budget);
+        for(auto& project: projects) {
+            project->tick_databases();
+        }
     }
 }
 

@@ -70,6 +70,7 @@ ProjectServer::ProjectServer(MasterServer& server, CanonicalPath root) :
     // document changed on disk: the document gets the treatment the
     // changed file's cascade gives its dependents.
     ast.on_stale = [this](Fid path_id) {
+        this->server.drain_disk_changes();
         if(auto session = sessions.find(path_id)) {
             ast.invalidate(path_id);
             session->trial_done = false;
@@ -206,7 +207,6 @@ void ProjectServer::start() {
         discover_around(path_id);
     }
     if(poll_seconds.count() > 0) {
-        bg_tasks.spawn(cdb_poll_task());
         bg_tasks.spawn(sources_poll_task());
         server.start_polling();
     }
@@ -376,6 +376,16 @@ void ProjectServer::index_rows_changed(llvm::ArrayRef<Fid> path_ids) {
     }
 }
 
+void ProjectServer::tick_databases() {
+    if(!tracker || project.config.tracker.workspace_poll_seconds.value == 0) {
+        return;
+    }
+    auto events = tracker->tick_cdb();
+    if(!events.empty()) {
+        dispatch(events);
+    }
+}
+
 void ProjectServer::dispatch(llvm::ArrayRef<FileEvent> events) {
     auto dirty = invalidator.apply(events);
 
@@ -538,22 +548,11 @@ void ProjectServer::start_control_listener() {
     bg_tasks.spawn(serve_control(*this, std::move(*acceptor)));
 }
 
-kota::task<> ProjectServer::cdb_poll_task() {
-    constexpr auto interval = std::chrono::seconds(3);
-    while(true) {
-        co_await kota::sleep(interval);
-        auto events = tracker->tick_cdb();
-        if(!events.empty()) {
-            dispatch(events);
-        }
-    }
-}
-
 kota::task<> ProjectServer::sources_poll_task() {
     auto interval = std::chrono::seconds(project.config.tracker.workspace_poll_seconds.value);
     while(true) {
         co_await kota::sleep(interval);
-        auto events = tracker->tick_sources();
+        auto events = co_await tracker->tick_sources();
         if(!events.empty()) {
             dispatch(events);
         }

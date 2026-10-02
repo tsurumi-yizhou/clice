@@ -42,7 +42,7 @@ constexpr inline std::uint32_t cache_format_version = 13;
 ///
 /// `version` names the FileVersion the build actually consumed (interned
 /// from the worker-reported content hash); its check is paid once per
-/// wave for every artifact and TU referencing it (FileTable::
+/// turn for every artifact and TU referencing it (FileTable::
 /// check_version). An invalid version means the build saw no nameable
 /// bytes: `missing` distinguishes "the file was absent" — a place a failed
 /// lookup looked, or a file gone by the capture — (appearing is the
@@ -320,10 +320,13 @@ struct Project {
                        Fid exclude_path_id = {}) const;
 };
 
+/// Where a `compile_commands.json` is looked for when no rule declares
+/// one: the workspace root, then its direct subdirectories in name order.
+llvm::SmallVector<Spelling> database_places(CanonicalRef workspace_root);
+
 /// The `compile_commands.json` files to load when no rule declares one:
-/// the workspace root's, then those of its direct subdirectories in name
-/// order. Empty when none exists yet — the CDBWatcher keeps looking on
-/// its CDB poll.
+/// those of database_places that exist. Empty when none exists yet — the
+/// CDBWatcher keeps watching the places.
 llvm::SmallVector<Spelling> discover_compile_commands(CanonicalRef workspace_root);
 
 /// Every `compile_commands.json` under `workspace_root` (`.git` and the
@@ -343,9 +346,13 @@ bool defines_project(CanonicalRef dir);
 /// Empty when no ancestor has either.
 CanonicalPath project_root_above(CanonicalRef start);
 
-/// The `compile_commands.json` files in `start` and its ancestors up to
-/// `workspace_root`, nearest first: the databases a file deeper in the
-/// tree than startup discovery looks may compile from.
+/// Where a `compile_commands.json` is looked for in `start` and its
+/// ancestors up to `workspace_root`, nearest first.
+llvm::SmallVector<Spelling> database_places_above(CanonicalRef start, CanonicalRef workspace_root);
+
+/// The `compile_commands.json` files of database_places_above that exist:
+/// the databases a file deeper in the tree than startup discovery looks
+/// may compile from.
 llvm::SmallVector<Spelling> compile_commands_above(CanonicalRef start, CanonicalRef workspace_root);
 
 /// Capture a staleness snapshot from a build's reported inputs, interning
@@ -361,7 +368,8 @@ DepsSnapshot capture_deps_snapshot(FileTable& files,
 
 /// Whether any consumed version stopped matching the disk; see
 /// FileTable::check_version and DepState for the
-/// per-reference missing policy. Callers open the memo wave.
+/// per-reference missing policy. Every dependency is looked at, so the
+/// changes one check finds cascade together.
 bool deps_changed(FileTable& files, const DepsSnapshot& snap);
 
 }  // namespace clice
