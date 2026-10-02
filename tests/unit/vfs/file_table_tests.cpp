@@ -11,7 +11,6 @@
 
 #include "test/temp_dir.h"
 #include "test/test.h"
-#include "support/filesystem.h"
 #include "vfs/file_table.h"
 #include "vfs/path.h"
 
@@ -75,7 +74,7 @@ TEST_CASE(RenameSaveReads) {
     ASSERT_TRUE(first.has_value());
 
     tmp.touch("f.h.tmp", "int v2();\n");
-    ASSERT_TRUE(bool(fs::rename(tmp.path("f.h.tmp"), f)));
+    ASSERT_TRUE(!vfs::rename(tmp.path("f.h.tmp"), f));
     EXPECT_TRUE(set_file_mtime(f, first->stamp.mtime_ns));
 
     auto stamp = stamp_of(f);
@@ -106,7 +105,7 @@ TEST_CASE(FastPathChecksIdentity) {
     ASSERT_TRUE(pool.cached_hash(fid, read->stamp).has_value());
 
     tmp.touch("f.h.tmp", "int v2();\n");
-    ASSERT_TRUE(bool(fs::rename(tmp.path("f.h.tmp"), f)));
+    ASSERT_TRUE(!vfs::rename(tmp.path("f.h.tmp"), f));
     EXPECT_TRUE(set_file_mtime(f, read->stamp.mtime_ns));
 
     ASSERT_TRUE(pool.check_version(vid) == vfs::DiskState::Verdict::Stale);
@@ -437,6 +436,22 @@ TEST_CASE(WindowsCaseVariantsMerge) {
     FileTable pool;
     auto fid = pool.intern(Spelling::absolute(tmp.path("real/file.H")));
     EXPECT_EQ(pool.intern(Spelling::absolute(tmp.path("Real/File.h"))), fid);
+    EXPECT_TRUE(llvm::StringRef(pool.resolve(fid)).ends_with("/Real/File.h"));
+}
+
+TEST_CASE(LongPathCaseMerges) {
+    // Past MAX_PATH the OS opens a path only with the `\\?\` prefix;
+    // without it the identity falls back to the spelling's own case.
+    TempDir tmp;
+    std::string deep;
+    for(int i = 0; i < 6; i += 1) {
+        deep += std::string(50, static_cast<char>('a' + i)) + "/";
+    }
+    tmp.touch(deep + "Real/File.h", "");
+    ASSERT_TRUE(tmp.path(deep + "Real/File.h").size() > MAX_PATH);
+    FileTable pool;
+    auto fid = pool.intern(Spelling::absolute(tmp.path(deep + "real/file.H")));
+    EXPECT_EQ(pool.intern(Spelling::absolute(tmp.path(deep + "Real/File.h"))), fid);
     EXPECT_TRUE(llvm::StringRef(pool.resolve(fid)).ends_with("/Real/File.h"));
 }
 #else
