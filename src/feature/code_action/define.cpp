@@ -11,6 +11,8 @@
 #include "semantic/display.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
@@ -159,27 +161,6 @@ bool is_specifier(const clang::syntax::Token& token) {
 bool declaration_only(const clang::syntax::Token& token) {
     return token.kind() == clang::tok::kw_virtual || token.kind() == clang::tok::kw_static ||
            token.kind() == clang::tok::kw_explicit;
-}
-
-/// Where the type the decl-specifiers spell is written beneath a return
-/// type's declarator (`const R` of `const R* (*f())(int)`).
-clang::TypeLoc specifier_loc(clang::TypeLoc loc) {
-    while(true) {
-        auto unqualified = loc.getUnqualifiedLoc();
-        if(auto pointer = unqualified.getAs<clang::PointerTypeLoc>()) {
-            loc = pointer.getPointeeLoc();
-        } else if(auto reference = unqualified.getAs<clang::ReferenceTypeLoc>()) {
-            loc = reference.getPointeeLoc();
-        } else if(auto paren = unqualified.getAs<clang::ParenTypeLoc>()) {
-            loc = paren.getInnerLoc();
-        } else if(auto function = unqualified.getAs<clang::FunctionTypeLoc>()) {
-            loc = function.getReturnLoc();
-        } else if(auto array = unqualified.getAs<clang::ArrayTypeLoc>()) {
-            loc = array.getElementLoc();
-        } else {
-            return loc;
-        }
-    }
 }
 
 /// How a declaration turns into the head of its out-of-line definition.
@@ -445,13 +426,126 @@ private:
             if(type->isDependentType()) {
                 return std::nullopt;
             }
-            return type_name(unit.context(), type, from, {}, decl->getDeclContext());
+            return spelling_under_heads(type);
         }
         if(llvm::isa<clang::CXXRecordDecl>(scope)) {
             spelled = "typename " + spelled;
         }
         auto qualifiers = type.getLocalQualifiers();
         return qualifiers.empty() ? spelled : qualifiers.getAsString() + " " + spelled;
+    }
+
+    /// The spelling at `from` of a non-dependent type written before the
+    /// name, beneath the definition's template heads.
+    std::optional<std::string> spelling_under_heads(clang::QualType type) {
+        auto spelled = type_name(unit.context(), type, from, {}, decl->getDeclContext());
+        if(!spelled || parameter_names(*spelled).empty()) {
+            return spelled;
+        }
+        // Spelled from the global scope, every name a parameter would
+        // capture is a global one, anchored there.
+        spelled = type_name(unit.context(), type, unit.tu(), {}, decl->getDeclContext());
+        if(spelled) {
+            for(auto offset: llvm::reverse(parameter_names(*spelled))) {
+                spelled->insert(offset, "::");
+            }
+        }
+        return spelled;
+    }
+
+    /// Where `spelling` leaves a template parameter's name unqualified, of
+    /// the function or a class around it: the definition's template heads
+    /// declare those again in front of `from`, where type_name looked the
+    /// names up.
+    llvm::SmallVector<std::size_t> parameter_names(llvm::StringRef spelling) {
+        llvm::StringSet<> parameters;
+        for(const clang::DeclContext* context = decl;
+            llvm::isa<clang::FunctionDecl, clang::CXXRecordDecl>(context);
+            context = context->getParent()) {
+            if(auto* params = llvm::cast<clang::Decl>(context)->getDescribedTemplateParams()) {
+                for(const auto* param: *params) {
+                    parameters.insert(param->getName());
+                }
+            }
+        }
+        // A byte outside ASCII belongs to an identifier.
+        auto identifier = [](char c) {
+            return llvm::isAlnum(c) || c == '_' || !llvm::isASCII(c);
+        };
+        llvm::SmallVector<std::size_t> offsets;
+        for(std::size_t at = 0; at < spelling.size();) {
+            // A literal's text names nothing.
+            if(spelling[at] == '"' || spelling[at] == '\'') {
+                auto quote = spelling[at];
+                at += 1;
+                while(at < spelling.size() && spelling[at] != quote) {
+                    at += spelling[at] == '\\' ? 2 : 1;
+                }
+                at += 1;
+                continue;
+            }
+            auto word = spelling.substr(at).take_while(identifier);
+            if(word.empty()) {
+                at += 1;
+                continue;
+            }
+            // A component after `::`, `.` or `->` continues a name or an
+            // expression.
+            auto before = spelling.take_front(at);
+            if(!before.ends_with("::") && !before.ends_with(".") && !before.ends_with("->") &&
+               parameters.contains(word)) {
+                offsets.push_back(at);
+            }
+            at += word.size();
+        }
+        return offsets;
+    }
+
+    /// Where the type the decl-specifiers spell is written beneath a
+    /// return type's declarator (`const R` of `const R* (*f())(int)`). A
+    /// member pointer is part of that declarator only when it wraps the
+    /// name (`R (C::*f())()`); its class, written before the name too, is
+    /// then respelled for `from` on the way. One before the name is the
+    /// type spelled (`int C::* f()`).
+    clang::TypeLoc specifier_loc(clang::TypeLoc loc, std::uint32_t name) {
+        while(true) {
+            auto unqualified = loc.getUnqualifiedLoc();
+            if(auto pointer = unqualified.getAs<clang::PointerTypeLoc>()) {
+                loc = pointer.getPointeeLoc();
+            } else if(auto reference = unqualified.getAs<clang::ReferenceTypeLoc>()) {
+                loc = reference.getPointeeLoc();
+            } else if(auto paren = unqualified.getAs<clang::ParenTypeLoc>()) {
+                loc = paren.getInnerLoc();
+            } else if(auto function = unqualified.getAs<clang::FunctionTypeLoc>()) {
+                loc = function.getReturnLoc();
+            } else if(auto array = unqualified.getAs<clang::ArrayTypeLoc>()) {
+                loc = array.getElementLoc();
+            } else if(auto member = unqualified.getAs<clang::MemberPointerTypeLoc>()) {
+                auto end = offset_of(member.getEndLoc());
+                if(!end || *end <= name) {
+                    return loc;
+                }
+                qualify_member_class(member);
+                loc = member.getPointeeLoc();
+            } else {
+                return loc;
+            }
+        }
+    }
+
+    void qualify_member_class(clang::MemberPointerTypeLoc member) {
+        auto begin = offset_of(member.getQualifierLoc().getBeginLoc());
+        auto star = offset_of(member.getStarLoc());
+        if(!begin || !star) {
+            return;
+        }
+        clang::QualType type(member.getTypePtr()->getQualifier().getAsType(), 0);
+        if(type->isDependentType()) {
+            return;
+        }
+        if(auto spelled = spelling_under_heads(type)) {
+            patches.push_back({*begin, *star, *spelled + "::"});
+        }
     }
 
     /// The decl-specifiers are looked up at the definition's scope, unlike
@@ -461,7 +555,7 @@ private:
     /// long`) fold into the replaced span, the declaration-only ones
     /// dropped.
     void qualify_return_type(std::uint32_t name) {
-        auto loc = specifier_loc(decl->getFunctionTypeLoc().getReturnLoc());
+        auto loc = specifier_loc(decl->getFunctionTypeLoc().getReturnLoc(), name);
         auto begin = offset_of(loc.getBeginLoc());
         auto end = offset_of(loc.getEndLoc());
         // A constructor's return type has no location; a conversion
@@ -654,21 +748,54 @@ std::optional<Placement> placement_of(CompilationUnitRef unit, const clang::Func
     return placement_after(unit, file_scope_anchor(written_declaration(decl)));
 }
 
+/// The definition an implicit specialization instantiates: its pattern's,
+/// once instantiated; before that, the last of the definitions of the
+/// primary template and its partial specializations, any of which the
+/// first use may choose (`std::function` defines only a partial one).
+const clang::TagDecl*
+    pattern_definition(const clang::ClassTemplateSpecializationDecl* specialization,
+                       const clang::SourceManager& sm) {
+    auto pattern = specialization->getSpecializedTemplateOrPartial();
+    if(auto* partial = llvm::dyn_cast<clang::ClassTemplatePartialSpecializationDecl*>(pattern)) {
+        return partial->getDefinition();
+    }
+    auto* primary = llvm::cast<clang::ClassTemplateDecl*>(pattern);
+    const clang::TagDecl* last = primary->getTemplatedDecl()->getDefinition();
+    if(specialization->hasDefinition()) {
+        return last;
+    }
+    llvm::SmallVector<clang::ClassTemplatePartialSpecializationDecl*> partials;
+    primary->getPartialSpecializations(partials);
+    for(const auto* partial: partials) {
+        const auto* defined = partial->getDefinition();
+        if(defined &&
+           (!last || sm.isBeforeInTranslationUnit(last->getEndLoc(), defined->getEndLoc()))) {
+            last = defined;
+        }
+    }
+    return last;
+}
+
 /// The last definition of the classes a definition of the function needs
 /// complete, its return and parameter types held by value; null when it
-/// needs none, nullopt when one has no definition in this TU. A template
-/// specialization is taken as complete: using it instantiates it. So is
-/// a class the compiler defines itself, such as AArch64's `va_list`.
+/// needs none, nullopt when one has no definition in this TU. A class
+/// template's implicit specialization completes with its pattern's
+/// definition, instantiated yet or not. A class the compiler defines
+/// itself, such as AArch64's `va_list`, is complete everywhere.
 std::optional<const clang::TagDecl*> last_needed_definition(CompilationUnitRef unit,
                                                             const clang::FunctionDecl* decl) {
     auto& sm = unit.context().getSourceManager();
     const clang::TagDecl* last = nullptr;
     auto need = [&](clang::QualType type) {
         auto* record = type->isDependentType() ? nullptr : type->getAsCXXRecordDecl();
-        if(!record || llvm::isa<clang::ClassTemplateSpecializationDecl>(record)) {
+        if(!record) {
             return true;
         }
-        auto* definition = record->getDefinition();
+        const clang::TagDecl* definition = record->getDefinition();
+        if(auto* specialization = llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record);
+           specialization && !specialization->isExplicitSpecialization()) {
+            definition = pattern_definition(specialization, sm);
+        }
         if(!definition) {
             return false;
         }
@@ -690,25 +817,23 @@ std::optional<const clang::TagDecl*> last_needed_definition(CompilationUnitRef u
 }
 
 /// Whether a definition spelled at `from` defines `decl`. `from` must
-/// enclose it, and a function outside a class must sit in namespaces its
-/// qualifier names: one the qualifier skips, unnamed or inline, would
-/// leave the definition declaring a new function. Inside `extern "C"`,
-/// the definition would give a C++ function C linkage.
+/// enclose it, past namespaces its qualifier names: one the qualifier
+/// skips, unnamed or inline, would leave the definition declaring a new
+/// function, or naming the class of a member ambiguously beside a class
+/// of that name outside it. Inside `extern "C"`, the definition would
+/// give a C++ function C linkage.
 bool defines_from(const clang::FunctionDecl* decl, const clang::DeclContext* from) {
     auto* scope = from->getRedeclContext();
     if(!scope->Encloses(decl->getDeclContext())) {
         return false;
     }
-    if(llvm::isa<clang::CXXMethodDecl>(decl)) {
-        return true;
-    }
-    if(from->isExternCContext() && !decl->isExternC()) {
+    if(!llvm::isa<clang::CXXMethodDecl>(decl) && from->isExternCContext() && !decl->isExternC()) {
         return false;
     }
     for(auto* context = decl->getDeclContext()->getRedeclContext(); !context->Equals(scope);
         context = context->getParent()->getRedeclContext()) {
-        auto* ns = llvm::cast<clang::NamespaceDecl>(context);
-        if(ns->isAnonymousNamespace() || ns->isInline()) {
+        auto* ns = llvm::dyn_cast<clang::NamespaceDecl>(context);
+        if(ns && (ns->isAnonymousNamespace() || ns->isInline())) {
             return false;
         }
     }

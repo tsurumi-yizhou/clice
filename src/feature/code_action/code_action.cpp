@@ -142,8 +142,8 @@ const clang::TemplateParameterList* template_parameters(const clang::CXXRecordDe
 /// unnamed one needs a name the class qualifier can refer to: `T<index>`,
 /// made unlike every identifier the classes enclosing it spell (the
 /// parameters of their templates and member templates, the names their
-/// members use) and the names given to the parameters of the templates
-/// enclosing this one.
+/// members use), every name ever defined as a macro and the names given
+/// to the parameters of the templates enclosing this one.
 std::string parameter_name(const clang::NamedDecl* param, std::size_t index) {
     if(!param->getName().empty()) {
         return param->getNameAsString();
@@ -181,7 +181,7 @@ std::string parameter_name(const clang::NamedDecl* param, std::size_t index) {
         }
     }
     auto name = std::format("T{}", index);
-    while(taken.contains(name)) {
+    while(taken.contains(name) || context.Idents.get(name).hadMacroDefinition()) {
         name += '_';
     }
     return name;
@@ -452,9 +452,28 @@ struct SpelledNames : clang::RecursiveASTVisitor<SpelledNames> {
         return true;
     }
 
+    /// A pointer or reference to a declaration, `Box<&C::x>`, names it.
+    bool TraverseTemplateArgument(const clang::TemplateArgument& argument) {
+        if(argument.getKind() == clang::TemplateArgument::Declaration &&
+           !name(argument.getAsDecl())) {
+            return false;
+        }
+        return clang::RecursiveASTVisitor<SpelledNames>::TraverseTemplateArgument(argument);
+    }
+
     bool name(const clang::NamedDecl* decl) {
         if(decl->isTemplateParameter()) {
             return true;
+        }
+        // A variable, function or enumerator of a tag's name in the tag's
+        // own scope hides it from any spelling but an elaborated one.
+        if(auto* tag = llvm::dyn_cast<clang::TagDecl>(decl); tag && tag->getIdentifier()) {
+            for(const auto* found:
+                tag->getDeclContext()->getRedeclContext()->lookup(tag->getDeclName())) {
+                if(llvm::isa<clang::ValueDecl, clang::FunctionTemplateDecl>(found)) {
+                    return nameable = false;
+                }
+            }
         }
         const clang::NamedDecl* root = decl;
         for(const clang::Decl* member = decl;;) {
@@ -717,12 +736,68 @@ std::optional<std::string> respell(clang::ASTContext& context,
     return result;
 }
 
+/// A type constraint: its concept spelled for `from`, which may lie
+/// outside the concept's namespace, and its arguments as written. The
+/// concept is named from the global scope when the first name of its
+/// spelling finds something else at `from`, or is that of a template
+/// parameter among `hidden`.
+void print_constraint(llvm::raw_ostream& os,
+                      CompilationUnitRef unit,
+                      const clang::ConceptReference* reference,
+                      const clang::DeclContext* from,
+                      const llvm::StringSet<>& hidden) {
+    auto* named = reference->getNamedConcept();
+    const clang::NamedDecl* root = named;
+    for(const auto* context = named->getDeclContext();
+        !context->isTranslationUnit() && !(from && context->Encloses(from));
+        context = context->getParent()) {
+        auto* ns = llvm::dyn_cast<clang::NamespaceDecl>(context);
+        if(ns && !ns->isAnonymousNamespace() && !ns->isInline()) {
+            root = ns;
+        }
+    }
+    auto qualifier = qualifier_at(named->getDeclContext(), from);
+    if(hidden.contains(root->getName()) ||
+       (from && lookup_unqualified(from, root->getDeclName()) != Entities{entity_of(root)})) {
+        qualifier = "::" + qualifier_at(named->getDeclContext(), nullptr);
+    }
+    os << qualifier << named->getName();
+    // A placeholder's constraint carries an empty argument list even when
+    // none is written; only a written one has its angle brackets.
+    auto* arguments = reference->getTemplateArgsAsWritten();
+    if(!arguments || arguments->getRAngleLoc().isInvalid()) {
+        return;
+    }
+    if(auto text = spelled_text(unit, {arguments->getLAngleLoc(), arguments->getRAngleLoc()})) {
+        os << *text;
+        return;
+    }
+    os << '<';
+    for(auto [index, argument]: llvm::enumerate(arguments->arguments())) {
+        if(index) {
+            os << ", ";
+        }
+        argument.getArgument().print(unit.context().getPrintingPolicy(), os, false);
+    }
+    os << '>';
+}
+
 /// One "template <...>" head of `record`, the parameters spelled without
 /// defaults, followed by the requires-clause when the list has one.
 std::string template_head(CompilationUnitRef unit,
                           const clang::TemplateParameterList* params,
                           const clang::CXXRecordDecl* record,
                           const clang::DeclContext* from) {
+    llvm::StringSet<> parameters;
+    for(const clang::DeclContext* context = record;
+        auto* enclosing = llvm::dyn_cast<clang::CXXRecordDecl>(context);
+        context = context->getParent()) {
+        if(auto* list = template_parameters(enclosing)) {
+            for(const auto* param: *list) {
+                parameters.insert(param->getName());
+            }
+        }
+    }
     std::string head;
     llvm::raw_string_ostream os(head);
     os << "template <";
@@ -732,12 +807,23 @@ std::string template_head(CompilationUnitRef unit,
         }
         auto* type = llvm::dyn_cast<clang::TemplateTypeParmDecl>(param);
         if(auto* value = llvm::dyn_cast<clang::NonTypeTemplateParmDecl>(param)) {
-            os << type_name(unit.context(), value->getType(), from, {}, record).value_or("auto");
+            auto placeholder = value->getTypeSourceInfo()->getTypeLoc().getAs<clang::AutoTypeLoc>();
+            if(placeholder && placeholder.isConstrained()) {
+                print_constraint(os, unit, placeholder.getConceptReference(), from, parameters);
+                os << (placeholder.getTypePtr()->isDecltypeAuto() ? " decltype(auto)" : " auto");
+            } else {
+                os << type_name(unit.context(), value->getType(), from, {}, record)
+                          .value_or("auto");
+            }
             if(value->isParameterPack()) {
                 os << "...";
             }
         } else if(type && type->hasTypeConstraint()) {
-            type->getTypeConstraint()->print(os, unit.context().getPrintingPolicy());
+            print_constraint(os,
+                             unit,
+                             type->getTypeConstraint()->getConceptReference(),
+                             from,
+                             parameters);
             if(type->isParameterPack()) {
                 os << "...";
             }

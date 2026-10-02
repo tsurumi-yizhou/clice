@@ -99,7 +99,13 @@ void expand_deduced_type(const Context& ctx, std::vector<CodeAction>& out) {
     // specifiers, or possibly spelled by a macro among them, is out of
     // reach.
     auto content = unit.main_content();
-    if(printed.ends_with('*')) {
+    // The deduced type prints through the sugar of another deduction and
+    // of decltype, and a nullability attribute after the `*` it qualifies.
+    auto declarator = *deduced;
+    while(llvm::isa<clang::AutoType, clang::DecltypeType, clang::AttributedType>(declarator)) {
+        declarator = declarator->getLocallyUnqualifiedSingleStepDesugaredType();
+    }
+    if(llvm::isa<clang::PointerType, clang::MemberPointerType>(declarator)) {
         auto tokens = unit.spelled_tokens(unit.main_file());
         const auto* at = llvm::partition_point(tokens, [&](const clang::syntax::Token& token) {
             return unit.file_offset(token.location()) < range->begin;
@@ -123,8 +129,13 @@ void expand_deduced_type(const Context& ctx, std::vector<CodeAction>& out) {
             if(!content.substr(end, next - end).trim().empty()) {
                 return;
             }
-            printed += ' ';
-            printed += clang::tok::getKeywordSpelling(it->kind());
+            // decltype of a const pointer has the qualifier already.
+            bool has = it->kind() == clang::tok::kw_const ? deduced->isConstQualified()
+                                                          : deduced->isVolatileQualified();
+            if(!has) {
+                printed += ' ';
+                printed += clang::tok::getKeywordSpelling(it->kind());
+            }
         }
         range->begin = unit.file_offset(first->location());
     }
