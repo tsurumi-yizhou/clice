@@ -29,6 +29,7 @@ cli:
     - index
     - query
     - refactor
+    - analyze
     - lint
     - format
 

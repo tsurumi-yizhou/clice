@@ -11,8 +11,9 @@ clice 只有一个二进制。编辑器启动 `clice serve` 并通过 LSP 与它
 | `inspect`  | 对源文件运行某一项功能，把原始结果打印成 JSON。  |                                |
 | `query`    | 向持久化索引查询符号、引用、调用图和文件。       | [query](./query.md)            |
 | `refactor` | 依据持久化索引在整个工作区重命名一个符号。       | [refactor](./refactor.md)      |
+| `analyze`  | 报告重构所需的事实，例如模块依赖和循环依赖。     | [analyze](./analyze.md)        |
 | `doc`      | 从项目中提取文档数据。尚未实现。                 |                                |
 
 `inspect` 现在已可使用但还没有页面，选项通过 `clice inspect --help` 查看。
 
-`serve`、`index`、`lint`、`format`、`inspect`、`query` 和 `refactor` 都接受 `--configuration <tag>`，为本次运行固定构建配置，其优先级高于编辑器持久化的选择；参见[切换配置](../guide/configuration.md#switching-configurations)。
+`serve`、`index`、`lint`、`format`、`inspect`、`query`、`refactor` 和 `analyze` 都接受 `--configuration <tag>`，为本次运行固定构建配置，其优先级高于编辑器持久化的选择；参见[切换配置](../guide/configuration.md#switching-configurations)。
