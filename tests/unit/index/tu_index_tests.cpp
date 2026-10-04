@@ -1288,6 +1288,53 @@ TEST_CASE(ScopeModuleLinkage) {
     ASSERT_EQ(scope("static_var"), static_cast<int>(index::SymbolScope::TULocal));
 }
 
+TEST_CASE(ExportedFlag) {
+    build_index(R"(
+            export module m;
+            export int exported_var = 0;
+            export {
+                int block_fn();
+                struct Exported { void member(); };
+            }
+            export namespace api { int nested(); }
+            export template <typename Param> concept Small = sizeof(Param) < 4;
+            namespace detail { export int open(); }
+            namespace hidden { int closed(); }
+            int module_var = 0;
+            int block_fn() { return 0; }
+        )");
+
+    auto exported = [&](llvm::StringRef name) {
+        return has(symbol_named(name).second, index::SymbolFlags::Exported);
+    };
+    ASSERT_TRUE(exported("exported_var"));
+    ASSERT_TRUE(exported("block_fn"));
+    ASSERT_TRUE(exported("Exported"));
+    ASSERT_TRUE(exported("nested"));
+    ASSERT_TRUE(exported("Small"));
+    ASSERT_TRUE(exported("detail"));
+    ASSERT_FALSE(exported("hidden"));
+    ASSERT_FALSE(exported("Param"));
+    ASSERT_FALSE(exported("member"));
+    ASSERT_FALSE(exported("module_var"));
+}
+
+TEST_CASE(AnonymousScopeFlag) {
+    build_index(R"(
+            enum { unnamed_value };
+            struct Holder { union { int union_member; }; };
+            struct { int declarator_member; } unnamed_object;
+        )");
+
+    auto anonymous = [&](llvm::StringRef member) {
+        auto parent = symbol_named(member).second.parent;
+        return has(tu_index.symbols[parent], index::SymbolFlags::AnonymousScope);
+    };
+    ASSERT_TRUE(anonymous("unnamed_value"));
+    ASSERT_TRUE(anonymous("union_member"));
+    ASSERT_FALSE(anonymous("declarator_member"));
+}
+
 TEST_CASE(ScopeNoLinkage) {
     build_index(R"(
             enum { unnamed_value };

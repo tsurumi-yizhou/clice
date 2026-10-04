@@ -186,11 +186,30 @@ export int exported_value = 1;
 int private_value = 2;
 )cpp");
 
+    auto definition = SymbolModifiers::to_mask(SymbolModifiers::Definition);
     EXPECT_TOKEN("g0", SymbolKind::Keyword);
     EXPECT_TOKEN("k0", SymbolKind::Keyword);
-    EXPECT_TOKEN("n0", SymbolKind::Module);
-    EXPECT_TOKEN("n1", SymbolKind::Module);
+    EXPECT_TOKEN("n0", SymbolKind::Module, definition);
+    EXPECT_TOKEN("n1", SymbolKind::Module, definition);
     EXPECT_TOKEN("p0", SymbolKind::Keyword);
+}
+
+TEST_CASE(UsingFromDependentBase) {
+    // A dependent name that a template base brings in with a
+    // using-declaration names the member itself.
+    run_utf8(R"cpp(
+struct Base { void f(); };
+template <class T> struct B : Base { using Base::f; };
+template <class T> struct D : B<T> {
+    void g() {
+        this->§(member)⟦f⟧();
+        B<T>::§(qualified)⟦f⟧();
+    }
+};
+)cpp");
+
+    EXPECT_TOKEN("member", SymbolKind::Method);
+    EXPECT_TOKEN("qualified", SymbolKind::Method);
 }
 
 TEST_CASE(UTF16LengthDiffersFromUTF8) {
@@ -275,6 +294,24 @@ int y = x;
 
     EXPECT_TOKEN("kw", SymbolKind::Keyword);
     EXPECT_TOKEN("mod", SymbolKind::Module);
+}
+
+TEST_CASE(DottedModuleImport) {
+    add_files("main.cpp", R"(
+#[mod.cppm]
+export module app.core;
+export int x = 42;
+
+#[main.cpp]
+import §(m0)⟦app⟧.§(m1)⟦core⟧;
+int y = x;
+)");
+    ASSERT_TRUE(compile_with_modules());
+    tokens = feature::semantic_tokens(*unit, feature::PositionEncoding::UTF8);
+    decoded = decode_utf8_tokens(unit->main_content(), tokens);
+
+    EXPECT_TOKEN("m0", SymbolKind::Module);
+    EXPECT_TOKEN("m1", SymbolKind::Module);
 }
 
 TEST_CASE(ImportChannelAudit) {
