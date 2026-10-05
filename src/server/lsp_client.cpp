@@ -30,6 +30,7 @@
 #include "kota/meta/enum.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Process.h"
+#include "llvm/Support/xxhash.h"
 
 namespace clice {
 
@@ -113,6 +114,11 @@ static void publish(kota::ipc::JSONPeer& peer, const protocol::PublishDiagnostic
     }
 }
 
+/// The answer to a diagnostics pull.
+static kota::codec::RawValue full_report(std::vector<protocol::Diagnostic> items) {
+    return to_raw(protocol::RelatedFullDocumentDiagnosticReport{.items = std::move(items)});
+}
+
 /// Fold versioned document changes into the plain `changes` map for a
 /// client without documentChanges support.
 static void unversion(protocol::WorkspaceEdit& edit) {
@@ -166,52 +172,60 @@ LSPClient::AliasDocument* LSPClient::find_alias(Fid path_id, llvm::StringRef spe
     return alias != it->second.end() ? &*alias : nullptr;
 }
 
-kota::ipc::Error LSPClient::unserved(llvm::StringRef spelling) {
+LSPClient::AliasDocument* LSPClient::find_alias(llvm::StringRef spelling) {
     auto path_id =
         spelling.empty() ? std::nullopt : server.files.find(Spelling::absolute(spelling));
-    return path_id && find_alias(*path_id, spelling) ? content_modified() : document_not_open();
+    return path_id ? find_alias(*path_id, spelling) : nullptr;
+}
+
+kota::ipc::Error LSPClient::unserved(llvm::StringRef spelling) {
+    return find_alias(spelling) ? content_modified() : document_not_open();
+}
+
+std::string LSPClient::divergence_message(const AliasDocument& alias) {
+    return std::format(
+        "This file is also open as {}, which clice analyzes; edits here are not "
+        "analyzed until the texts agree. Close one of the two.",
+        server.files.display(alias.buffer.path_id));
+}
+
+void LSPClient::refresh_diagnostics() {
+    if(diagnostic_refresh) {
+        fire_refresh(server.loop, peer, protocol::DiagnosticRefreshParams{});
+    }
 }
 
 void LSPClient::publish_alias(AliasDocument& alias, const Session* owner, ProjectServer& project) {
     if(!client_ready) {
         return;
     }
+    bool diverged = !owner || owner->text != alias.buffer.text;
+    bool flipped = std::exchange(alias.warned, diverged) != diverged;
+    if(diverged && flipped) {
+        peer.send_notification(protocol::ShowMessageParams{
+            .type = protocol::MessageType::Warning,
+            .message = divergence_message(alias),
+        });
+    }
+    if(pull_diagnostics) {
+        if(flipped) {
+            refresh_diagnostics();
+        }
+        return;
+    }
     protocol::PublishDiagnosticsParams params;
     params.uri = feature::to_uri(alias.spelling);
     params.version = alias.buffer.version;
-    if(owner && owner->text == alias.buffer.text) {
+    if(diverged) {
+        params.diagnostics.push_back(feature::file_warning(divergence_message(alias)));
+    } else if(auto projection =
+                  project.ast.projections.projection_at(owner->path_id, owner->version)) {
+        params.diagnostics = format_diagnostics(*projection->output);
+        append_crash_notes(*owner, params.diagnostics);
+    } else if(!flipped) {
         // Shared once the owner's compile caught up with the text; until
         // then only a divergence warning is taken down.
-        auto projection = project.ast.projections.projection(owner->path_id);
-        if(projection && projection->output && projection->output->version == owner->version) {
-            params.diagnostics = format_diagnostics(*projection->output);
-            append_crash_notes(*owner, params.diagnostics);
-        } else if(!alias.warned) {
-            return;
-        }
-        alias.warned = false;
-    } else {
-        auto first = server.files.display(alias.buffer.path_id);
-        auto message = std::format(
-            "This file is also open as {}, which clice analyzes; edits here are not "
-            "analyzed until the texts agree. Close one of the two.",
-            first);
-        protocol::Diagnostic diagnostic;
-        diagnostic.range = protocol::Range{
-            .start = protocol::Position{.line = 0, .character = 0},
-            .end = protocol::Position{.line = 0, .character = 0},
-        };
-        diagnostic.severity = protocol::DiagnosticSeverity::Warning;
-        diagnostic.source = "clice";
-        diagnostic.message = message;
-        params.diagnostics.push_back(std::move(diagnostic));
-        if(!alias.warned) {
-            alias.warned = true;
-            peer.send_notification(protocol::ShowMessageParams{
-                .type = protocol::MessageType::Warning,
-                .message = std::move(message),
-            });
-        }
+        return;
     }
     publish(peer, params);
 }
@@ -276,7 +290,12 @@ void LSPClient::register_lifecycle() {
                 ws_caps.folding_range.has_value() && ws_caps.folding_range->refresh_support;
             versioned_edits =
                 ws_caps.workspace_edit.has_value() && ws_caps.workspace_edit->document_changes;
+            diagnostic_refresh =
+                ws_caps.diagnostics.has_value() && ws_caps.diagnostics->refresh_support;
         }
+
+        pull_diagnostics = params.capabilities.text_document.has_value() &&
+                           params.capabilities.text_document->diagnostic.has_value();
 
         if(params.capabilities.text_document.has_value() &&
            params.capabilities.text_document->folding_range.has_value()) {
@@ -352,6 +371,16 @@ void LSPClient::register_lifecycle() {
                 std::vector<protocol::CodeActionKind>(feature::code_action_kinds.begin(),
                                                       feature::code_action_kinds.end()),
         };
+        // No inter-file dependencies: an edit reaches no other document's
+        // diagnostics, open buffers are never depended upon (see Session).
+        // A saved file's dependents are recompiled on their next request
+        // and refreshed then (see push_output).
+        if(pull_diagnostics) {
+            caps.diagnostic_provider = protocol::DiagnosticOptions{
+                .inter_file_dependencies = false,
+                .workspace_diagnostics = false,
+            };
+        }
 
         protocol::WorkspaceFoldersServerCapabilities folder_caps;
         folder_caps.supported = true;
@@ -410,9 +439,8 @@ void LSPClient::register_lifecycle() {
         for(auto& project: srv.projects) {
             project->sessions.for_each([&](Fid path_id, const Session& session) {
                 auto& projections = project->ast.projections;
-                auto projection = projections.projection(path_id);
-                if(projection && projection->output.has_value() && projections.current(path_id) &&
-                   projection->output->version == session.version) {
+                if(projections.current(path_id) &&
+                   projections.projection_at(path_id, session.version)) {
                     this->push_output(*project, session);
                 }
                 return true;
@@ -590,7 +618,7 @@ void LSPClient::register_document_sync() {
         // A second name's diagnostics end with it, whether it closes or
         // takes the file over.
         auto clear_alias = [&](llvm::StringRef spelling) {
-            if(client_ready) {
+            if(client_ready && !pull_diagnostics) {
                 peer.send_notification(
                     protocol::PublishDiagnosticsParams{.uri = feature::to_uri(spelling)});
             }
@@ -606,7 +634,8 @@ void LSPClient::register_document_sync() {
         // LSP versions are scoped to an open document: a reopen restarts
         // them, so a stale entry would misread the fresh document's first
         // compile as an unchanged-text recompile.
-        published_versions.erase(path_id);
+        output_versions.erase(path_id);
+        pulled.erase(path_id);
         // The diagnostics clear goes out under the spelling being closed.
         srv.close_session(path_id);
         srv.files.unshow(path_id);
@@ -616,6 +645,10 @@ void LSPClient::register_document_sync() {
             clear_alias(next.spelling);
             srv.files.show_as(path_id, next.spelling);
             srv.open_session(path_id, std::move(next.buffer.text), next.buffer.version);
+            // A pulling client still holds its divergence warning.
+            if(pull_diagnostics && next.warned) {
+                refresh_diagnostics();
+            }
         }
     });
 
@@ -710,6 +743,38 @@ void LSPClient::register_language_features() {
                 co_return to_raw(co_await std::move(links).or_fail());
             });
     });
+
+    // A pull is always answered with a report, never an error: on an
+    // error, clients clear what they hold or stop pulling the document.
+    peer.on_request(
+        [this](RequestContext& ctx, const protocol::DocumentDiagnosticParams& params) -> RawResult {
+            this->server.pool.foreground_pulse();
+            auto [path, path_id, session, project] = resolve_uri(params.text_document.uri);
+            std::vector<protocol::Diagnostic> items;
+            if(session) {
+                items = co_await project->features.diagnostics(session);
+            }
+            // A second name answers the warning once its text parted from the
+            // first name's, before the pull or while it waited.
+            if(auto* alias = find_alias(path);
+               alias && (!session || alias->buffer.text != session->text)) {
+                co_return full_report({feature::file_warning(divergence_message(*alias))});
+            }
+            auto report = full_report(std::move(items));
+            if(session) {
+                // Recorded against the live session: one that replaced this
+                // pull's meanwhile (the document moved to another project)
+                // compiles the same text, and its landing must correct the
+                // empty answer the closed one gave.
+                if(auto live = server.find_session(path_id)) {
+                    pulled[path_id] = {
+                        .version = live->version,
+                        .report = llvm::xxh3_64bits(report.data),
+                    };
+                }
+            }
+            co_return report;
+        });
 
     peer.on_request(
         [this](RequestContext& ctx, const protocol::CodeActionParams& params) -> RawResult {
@@ -1172,13 +1237,22 @@ void LSPClient::push_output(ProjectServer& project, const Session& session) {
     }
     auto& output = *projection->output;
 
-    protocol::PublishDiagnosticsParams params;
-    params.uri = feature::to_uri(server.files.display(session.path_id));
-    params.version = output.version;
-    params.diagnostics = format_diagnostics(output);
-    append_crash_notes(session, params.diagnostics);
-    publish(peer, params);
-    publish_aliases(session.path_id);
+    if(pull_diagnostics) {
+        if(auto it = pulled.find(session.path_id);
+           it != pulled.end() && it->second.version == session.version &&
+           it->second.report !=
+               llvm::xxh3_64bits(full_report(project.features.settled_diagnostics(session)).data)) {
+            refresh_diagnostics();
+        }
+    } else {
+        protocol::PublishDiagnosticsParams params;
+        params.uri = feature::to_uri(server.files.display(session.path_id));
+        params.version = output.version;
+        params.diagnostics = format_diagnostics(output);
+        append_crash_notes(session, params.diagnostics);
+        publish(peer, params);
+        publish_aliases(session.path_id);
+    }
 
     // Two cases make the client re-pull whole-document results it already
     // holds: index projections served while this compile was pending
@@ -1189,7 +1263,7 @@ void LSPClient::push_output(ProjectServer& project, const Session& session) {
     // need neither: the client re-pulls on didChange and that pull awaits
     // the fresh AST.
     if(output.version.has_value()) {
-        auto [it, inserted] = published_versions.try_emplace(session.path_id, *output.version);
+        auto [it, inserted] = output_versions.try_emplace(session.path_id, *output.version);
         bool same_text = !inserted && it->second == *output.version;
         it->second = *output.version;
         if(session.index_served || same_text) {

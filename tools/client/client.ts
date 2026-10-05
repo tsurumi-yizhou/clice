@@ -62,6 +62,14 @@ export { withTimeout } from "../promise.ts";
 export const MTIME_GRANULARITY = 1_100; // Filesystem mtime precision + margin
 export const SETTLE_TIME = 500; // Server stabilization after an operation
 export const IDLE_TIMEOUT = 5_000; // Idle soak time in lifecycle tests
+export const EDIT_SUPERSEDE_DELAY = 300; // An edit lands while SLOW_SOURCE still parses
+
+/// Two hundred thousand trivial declarations: slow to parse on any
+/// hardware, so an edit or a cancel lands while a request still waits on
+/// the compile, and cheap to abandon (the worker polls the stop flag per
+/// declaration).
+export const SLOW_SOURCE =
+    Array.from({ length: 200_000 }, (_, i) => `int v${i};`).join("\n") + "\n";
 
 export function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -833,6 +841,23 @@ export class CliceClient {
         const arrived = this.armDiagnostics(uri);
         await this.hoverAt(uri, 0, 0);
         await withTimeout(arrived, timeout, `diagnostics ${uri}`);
+    }
+
+    /// Pull the document's diagnostics (textDocument/diagnostic); clice
+    /// answers every pull with a full report.
+    async pullDiagnostics(
+        uri: string,
+        token?: proto.CancellationToken,
+    ): Promise<proto.Diagnostic[]> {
+        const report = await this.sendRequest(
+            proto.DocumentDiagnosticRequest.type,
+            { textDocument: { uri } },
+            token,
+        );
+        if (report.kind !== proto.DocumentDiagnosticReportKind.Full) {
+            throw new Error(`Expected a full report, got: ${JSON.stringify(report)}`);
+        }
+        return report.items;
     }
 
     /// How many diagnostics publishes the document has received.
