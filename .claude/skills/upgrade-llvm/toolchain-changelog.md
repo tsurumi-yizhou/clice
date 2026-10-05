@@ -1,10 +1,27 @@
 # Toolchain Changelog
 
 Pitfalls met while building with the toolchain and consuming the prebuilt LLVM
-packages (`cmake/llvm.cmake`, `cmake/toolchain.cmake`, CI). `llvm-changelog.md` covers
+packages (`MODULE.bazel`, `.bazelrc`, `BUILD.bazel`, `bazel/`, CI; the CMake files
+the older sections name are gone). `llvm-changelog.md` covers
 clang API changes; this file covers everything around them. Every entry: what you see,
 why, what we do, how to check it before spending CI time. Append to it with every
 toolchain change.
+
+## 2026-10: Bazel
+
+clice builds with Bazel 9 (npm's bazelisk). xclang's Bazel module, from the clice
+Bazel registry (https://bazel.clice.io), is the toolchain on every host and brings
+libclang and its ASan build as repositories (`@libclang`, `@libclang_asan`), each
+library with the link interface of xclang's CMake package; kotatsu and the
+third-party libraries come from the same registry.
+
+| Symptom                                                                                      | Cause                                                                                                                                | Fix                                                                                                                                                                                                                                    | Check                                                                                                         |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| No cross build: a build on x86_64 Linux for aarch64 Linux finds no toolchain.                | xclang's module registers one toolchain per host, compiling for that host, and its `@libclang` is the host's.                        | Every target builds on its own runner (`ubuntu-24.04-arm`, `macos-15-intel`, `windows-11-arm` too).                                                                                                                                    | `bazel build --platforms=...` of another target fails at toolchain resolution.                                |
+| Every link of clice takes minutes.                                                           | The libclang archives hold ThinLTO bitcode; lld redoes its code generation on every link.                                            | lld's ThinLTO cache, at one path per OS (`.bazelrc`: the path is in the link's action key), under `/var/tmp`, which the Linux sandbox lets actions write to (`--sandbox_writable_path`); CI keeps it in the entry of the Bazel caches. | After a link, `/var/tmp/xclang-thinlto` (`C:/xclang-thinlto`) is full; relinking after an edit takes seconds. |
+| macOS: the debugger finds no debug info; or Bazel's sandbox paths in the binary.             | Mach-O programs keep their DWARF in the object files, recorded by absolute path: the sandbox the link ran in, gone after it.         | `-Wl,-oso_prefix,.`: paths relative to the execution root, where the objects stay.                                                                                                                                                     | `dsymutil -s build/RelWithDebInfo/bin/bin/clice \| grep OSO` names `bazel-out/...`.                           |
+| Windows unit tests: 1551 instead of the Linux count; `Config` and `SelectionTree` never run. | lld's `--gc-sections` in MinGW mode drops the static initializers of COMDAT sections, zest's test registrations among them.          | xclang's `gc_sections` feature is off for Windows; `clice` alone turns it on.                                                                                                                                                          | The unit test count of the Windows leg.                                                                       |
+| Windows: the version is `0.1.0`.                                                             | `--workspace_status_command=<script>.sh` runs through `cmd.exe`, which hands a `.sh` to its file association and reads nothing back. | `bazel/workspace_status.mjs`, run by node on every host.                                                                                                                                                                               | `clice --version` on Windows names the commit.                                                                |
 
 ## 2026-09: xclang
 

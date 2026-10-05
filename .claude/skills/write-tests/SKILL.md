@@ -8,7 +8,7 @@ description: How to write clice integration tests (TypeScript/vitest) — fixtur
 The suite is TypeScript on vitest. Harness = the `@clice/tools` workspace
 package (`tools/`, session machinery in `tools/client/session.ts`); each suite binds it in its own fixture file (`tests/integration/fixtures.ts`, `tests/snap/fixtures.ts`). Tests live in
 `tests/integration/<area>/*.test.ts`; tests of the tooling itself in
-`tests/tools/`. Run: `cd tests && CLICE_EXECUTABLE=../build/RelWithDebInfo/bin/clice npx vitest run --config integration/vitest.config.ts <file>`;
+`tests/tools/`. Run: `cd tests && CLICE_EXECUTABLE=../build/RelWithDebInfo/bin/bin/clice npx vitest run --config integration/vitest.config.ts <file>`;
 gates: `npm run check` at the repo root (tsc strict + ESLint, zero tolerance).
 
 ## Choosing a fixture form
@@ -237,9 +237,11 @@ deterministic waits (`poll("cdb")`, `armDiagnostics`) over sleeping.
   A debugger attached to `unit_tests` sees only the runner — take a
   backtrace with `--no-isolation --test-filter=Suite.Case`, which runs the
   test in-process (`lldb --batch -o run -k "bt 40" -- ...`).
-- The Tester's driver is the `clang++` on PATH: the cross test legs install
-  only the `test-run` env, so they compile against the runner's system
-  libstdc++, not conda's. A wrapper script named `clang++` that execs the
+- The Tester's driver is the `clang++` on PATH: the native-test legs with
+  `activate: test-run` (arm64 Linux, x64 macOS, arm64 Windows) run with only
+  the `test-run` env active, so on arm64 Linux they compile against the
+  runner's system libstdc++, not conda's, and on arm64 Windows with the
+  runner's clang, which targets MSVC. A wrapper script named `clang++` that execs the
   pixi clang with another `--gcc-install-dir` reproduces such a leg locally.
 
 ## C++ unit tests (zest)
