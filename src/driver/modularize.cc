@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "analysis/module_graph.h"
+#include "analysis/rewriting.h"
 #include "analysis/wrapping.h"
 #include "driver/analysis_support.h"
 #include "driver/driver.h"
@@ -20,7 +21,14 @@ using kota::deco::decl::KVStyle;
 
 namespace {
 
-struct ModulizeOptions {
+/// What the build needs: the wrapped modules, and the program modules the
+/// partition rewrites.
+struct Plan {
+    analysis::Wrapping::Plan wrapping;
+    analysis::Rewriting::Plan rewriting;
+};
+
+struct ModularizeOptions {
     kota::deco::decl::HelpOption help;
 
     DecoKV(style = KVStyle::JoinedOrSeparate,
@@ -46,7 +54,8 @@ struct ModulizeOptions {
            help =
                "JSON file assigning modules by globs, first match wins; a module is wrapped, "
                R"("textual": true stays headers, "external": true is std, "provides": )"
-               R"("std.compat" names who exports its names)",
+               R"("std.compat" names who exports its names, "rewrite": true rewrites a )"
+               R"(program module into module units, its primary interface at "primary")",
            required = false)
     <std::string> partition;
 
@@ -65,17 +74,21 @@ struct ModulizeOptions {
     LogLevelOption log{.log_level = LogLevel::Warn};
 };
 
+llvm::SmallString<256> join(llvm::StringRef base, llvm::StringRef relative) {
+    llvm::SmallString<256> path(base);
+    llvm::sys::path::append(path, llvm::sys::path::Style::posix, relative);
+    return path;
+}
+
 /// Write the files whose content changed, so a regeneration rebuilds only
 /// what it touched, and remove the files the previous run wrote that this
 /// one no longer produces: a stale empty header in a mirror would hide the
-/// real one. The manifest `.modulize` lists what a run wrote; nothing else
+/// real one. The manifest `.modularize` lists what a run wrote; nothing else
 /// under `out` is touched.
 std::expected<void, std::string> write_files(llvm::StringRef out,
                                              llvm::ArrayRef<analysis::Wrapping::File> files) {
     auto at = [&](llvm::StringRef relative) {
-        llvm::SmallString<256> path(out);
-        llvm::sys::path::append(path, llvm::sys::path::Style::posix, relative);
-        return path;
+        return join(out, relative);
     };
     llvm::StringSet<> written;
     std::string manifest;
@@ -97,7 +110,7 @@ std::expected<void, std::string> write_files(llvm::StringRef out,
                 std::format("cannot write {}: {}", path.str().str(), error.message()));
         }
     }
-    if(auto previous = vfs::read(at(".modulize"))) {
+    if(auto previous = vfs::read(at(".modularize"))) {
         llvm::SmallVector<llvm::StringRef> lines;
         (*previous)->getBuffer().split(lines, '\n', -1, false);
         for(auto relative: lines) {
@@ -113,21 +126,21 @@ std::expected<void, std::string> write_files(llvm::StringRef out,
             }
         }
     }
-    if(auto error = vfs::write(at(".modulize"), manifest)) {
+    if(auto error = vfs::write(at(".modularize"), manifest)) {
         return std::unexpected(
-            std::format("cannot write {}/.modulize: {}", out.str(), error.message()));
+            std::format("cannot write {}/.modularize: {}", out.str(), error.message()));
     }
     return {};
 }
 
-int run_modulize(const ModulizeOptions& opts) {
+int run_modularize(const ModularizeOptions& opts) {
     auto fail = [](std::string error) {
         print_json(Failure{.error = std::move(error)});
         return 1;
     };
 
     if(!opts.partition || !opts.out) {
-        return fail("modulize needs --partition and --out");
+        return fail("modularize needs --partition and --out");
     }
     auto libcxx = read_std(opts.std.value_or(""));
     if(!libcxx) {
@@ -161,27 +174,67 @@ int run_modulize(const ModulizeOptions& opts) {
         return fail(wrapping.error());
     }
 
-    auto out = Spelling(*opts.out, Spelling::cwd()).str();
+    Spelling out_spelling(*opts.out, Spelling::cwd());
+    auto out = out_spelling.str();
+    std::optional<analysis::Rewriting> rewriting;
+    if(llvm::any_of(partition->primaries, [](auto& primary) { return !primary.empty(); })) {
+        // The prelude by its path from the workspace root, which the
+        // rewritten files' include path holds.
+        CanonicalPath canonical_out(out_spelling);
+        llvm::StringRef prelude_dir = canonical_out;
+        auto inside = prelude_dir.consume_front(loaded->root) && prelude_dir.consume_front("/");
+        llvm::SmallString<256> prelude(inside ? prelude_dir : llvm::StringRef(out));
+        llvm::sys::path::append(prelude, llvm::sys::path::Style::posix, wrapping->plan.prelude);
+        auto rewritten =
+            analysis::rewrite(loaded->facts, *partition, *interfaces, prelude, loaded->root);
+        if(!rewritten) {
+            return fail(rewritten.error());
+        }
+        rewriting = std::move(*rewritten);
+    }
+
     if(auto written = write_files(out, wrapping->files); !written) {
         return fail(written.error());
     }
-    print_json(wrapping->plan);
+    Plan plan{.wrapping = std::move(wrapping->plan)};
+    if(rewriting) {
+        for(auto& file: rewriting->files) {
+            auto path = join(loaded->root, file.path);
+            if(auto error = vfs::create_directories(llvm::sys::path::parent_path(path))) {
+                return fail(std::format("cannot create the directory of {}: {}",
+                                        path.str().str(),
+                                        error.message()));
+            }
+            if(auto error = vfs::write(path, file.content)) {
+                return fail(std::format("cannot write {}: {}", path.str().str(), error.message()));
+            }
+        }
+        for(auto& removed: rewriting->plan.removed) {
+            auto path = join(loaded->root, removed);
+            if(auto error = vfs::remove(path)) {
+                return fail(std::format("cannot remove {}: {}", path.str().str(), error.message()));
+            }
+        }
+        plan.rewriting = std::move(rewriting->plan);
+    }
+    print_json(plan);
     return 0;
 }
 
 }  // namespace
 
-void add_modulize(kota::deco::cli::SubCommander& root) {
-    auto command = kota::deco::cli::command<ModulizeOptions>("clice modulize [OPTIONS]");
+void add_modularize(kota::deco::cli::SubCommander& root) {
+    auto command = kota::deco::cli::command<ModularizeOptions>("clice modularize [OPTIONS]");
     command
-        .match_all([](ModulizeOptions opts) {
+        .match_all([](ModularizeOptions opts) {
             opts.log.apply();
-            logging::stderr_logger("modulize", logging::options);
-            return run_modulize(opts);
+            logging::stderr_logger("modularize", logging::options);
+            return run_modularize(opts);
         })
         .on_error([](auto err) { print_json(Failure{.error = err.message}); });
-    root.add({.name = "modulize",
-              .description = "Wrap a partition's libraries as modules over their headers"},
+    root.add({.name = "modularize",
+              .description = "Wrap a partition's libraries as modules over their headers and "
+                             "rewrite its program modules into module units"},
              std::move(command));
 }
 

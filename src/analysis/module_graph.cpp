@@ -12,6 +12,7 @@
 #include "command/command.h"
 #include "index/serialization.h"
 #include "project/project.h"
+#include "syntax/lexer.h"
 #include "vfs/file_system.h"
 #include "vfs/path.h"
 
@@ -23,6 +24,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Path.h"
+#include "clang/Basic/IdentifierTable.h"
 
 namespace clice::analysis {
 
@@ -324,6 +326,7 @@ Facts collect(Project& project, llvm::function_ref<bool(llvm::StringRef)> in_sco
             tree.skipped.push_back(node.skipped);
             if(auto from = id_of(includer), to = id_of(file); from != none && to != none) {
                 include_lines.try_emplace({from, to}, node.line);
+                facts.files[from].directives.emplace_back(node.line, to);
             }
             if(!node.skipped && unit != none) {
                 if(auto id = id_of(file); id != none) {
@@ -341,6 +344,10 @@ Facts collect(Project& project, llvm::function_ref<bool(llvm::StringRef)> in_sco
                 }
             }
         }
+    }
+    for(auto& file: facts.files) {
+        std::ranges::sort(file.directives);
+        file.directives.erase(std::ranges::unique(file.directives).begin(), file.directives.end());
     }
     for(auto& [includer, targets]: includes) {
         std::ranges::sort(targets);
@@ -1484,6 +1491,22 @@ std::expected<void, std::string> move_entities(Facts& facts, llvm::StringRef spe
     return {};
 }
 
+bool is_keyword(llvm::StringRef word) {
+    const static auto options = raw_dialect(clang::Language::CXX, clang::LangStandard::lang_cxx23);
+    static clang::IdentifierTable table(options);
+    return table.get(word).getTokenID() != clang::tok::identifier;
+}
+
+bool is_module_name(llvm::StringRef name) {
+    llvm::SmallVector<llvm::StringRef> parts;
+    name.split(parts, '.');
+    return llvm::all_of(parts, [](llvm::StringRef part) {
+        return !part.empty() && (llvm::isAlpha(part.front()) || part.front() == '_') &&
+               llvm::all_of(part, [](char c) { return llvm::isAlnum(c) || c == '_'; }) &&
+               !is_keyword(part) && part != "module" && part != "import";
+    });
+}
+
 std::expected<Partition, std::string> partition(const Facts& facts, const PartitionSpec& spec) {
     Partition result;
     llvm::StringMap<std::uint32_t> ids;
@@ -1593,6 +1616,10 @@ std::expected<Partition, std::string> partition(const Facts& facts, const Partit
     auto count = result.modules.size();
     result.kinds.assign(count, ModuleKind::Program);
     result.provides.resize(count);
+    result.primaries.resize(count);
+    // Whether an entry rewrites the module, and whether one wraps it, as an
+    // entry without a kind says.
+    std::vector<bool> rewritten(count, false), wrapped(count, false);
     for(auto& claimed: spec.modules) {
         // A merge or move can still take a claimed module's files away.
         auto module = result.module_named(claimed.name);
@@ -1603,6 +1630,7 @@ std::expected<Partition, std::string> partition(const Facts& facts, const Partit
         // the module may name its kind.
         auto& kind = result.kinds[module];
         if(claimed.kind == ModuleKind::Wrapped) {
+            wrapped[module] = true;
             if(kind == ModuleKind::Program) {
                 kind = ModuleKind::Wrapped;
             }
@@ -1614,6 +1642,77 @@ std::expected<Partition, std::string> partition(const Facts& facts, const Partit
         }
         for(auto& provided: claimed.provides) {
             result.provides[module].insert(provided.getKey());
+        }
+        if(claimed.rewrite) {
+            rewritten[module] = true;
+            if(!claimed.primary.empty()) {
+                result.primaries[module] = claimed.primary;
+            }
+        }
+    }
+
+    // A rewritten module's primary interface defaults to the deepest
+    // directory holding its headers, its files' when it has none.
+    for(std::uint32_t module = 0; module < count; module += 1) {
+        if(rewritten[module] && (wrapped[module] || result.kinds[module] != ModuleKind::Program)) {
+            return std::unexpected(
+                std::format("module {} is both rewritten and wrapped", result.modules[module]));
+        }
+        auto& primary = result.primaries[module];
+        if(!rewritten[module] || !primary.empty()) {
+            continue;
+        }
+        std::optional<llvm::StringRef> common;
+        for(bool headers: {true, false}) {
+            for(std::uint32_t file = 0; file < facts.files.size(); file += 1) {
+                auto& info = facts.files[file];
+                if(result.module_of[file] != module || (headers && info.source)) {
+                    continue;
+                }
+                auto dir = llvm::sys::path::parent_path(info.path, llvm::sys::path::Style::posix);
+                if(!common) {
+                    common = dir;
+                }
+                while(!common->empty() && !path::under(dir, *common)) {
+                    common = llvm::sys::path::parent_path(*common, llvm::sys::path::Style::posix);
+                }
+            }
+            if(common) {
+                break;
+            }
+        }
+        llvm::SmallString<256> path(common.value_or(""));
+        llvm::sys::path::append(path, llvm::sys::path::Style::posix, "module.cppm");
+        primary = path.str().str();
+    }
+
+    // A rewritten module writes its files in place and declares its name.
+    llvm::StringMap<std::uint32_t> placed;
+    for(std::uint32_t module = 0; module < count; module += 1) {
+        auto& primary = result.primaries[module];
+        if(primary.empty()) {
+            continue;
+        }
+        if(!is_module_name(result.modules[module])) {
+            return std::unexpected(
+                std::format("module {}: not a module name to rewrite", result.modules[module]));
+        }
+        if(auto [it, inserted] = placed.try_emplace(primary, module); !inserted) {
+            auto [first, second] = std::minmax(result.modules[it->second], result.modules[module]);
+            return std::unexpected(
+                std::format("modules {} and {} both put their primary interface at {}",
+                            first,
+                            second,
+                            primary));
+        }
+    }
+    for(std::uint32_t file = 0; file < facts.files.size(); file += 1) {
+        auto module = result.module_of[file];
+        if(!result.primaries[module].empty() &&
+           llvm::sys::path::is_absolute(facts.files[file].path, llvm::sys::path::Style::posix)) {
+            return std::unexpected(std::format("module {} would rewrite {}, outside the workspace",
+                                               result.modules[module],
+                                               facts.files[file].path));
         }
     }
     return result;
@@ -2828,6 +2927,65 @@ std::vector<Impact> Report::impact() const {
     return result;
 }
 
+std::vector<Unit> Report::units() const {
+    Graph graph(facts, partition);
+    auto pasted = pasted_fragments(facts);
+
+    // A header owning nothing other files name, an umbrella over other
+    // headers, is internal too: its includers reach what it includes
+    // through those headers' partitions. An internal header an interface
+    // header or another module includes is none: an interface importing an
+    // implementation partition leaves its names unreachable to importers.
+    auto internal = graph.internal;
+    for(std::uint32_t file = 0; file < facts.files.size(); file += 1) {
+        auto& info = facts.files[file];
+        if(!info.source && !info.fragment && info.specializes.empty() &&
+           graph.dependents[file].empty()) {
+            internal[file] = true;
+        }
+    }
+    for(bool changed = true; changed;) {
+        changed = false;
+        for(std::uint32_t file = 0; file < facts.files.size(); file += 1) {
+            if(internal[file] && llvm::any_of(facts.files[file].includers, [&](std::uint32_t by) {
+                   return partition.module_of[by] != partition.module_of[file] ||
+                          (!facts.files[by].source && !facts.files[by].fragment && !internal[by]);
+               })) {
+                internal[file] = false;
+                changed = true;
+            }
+        }
+    }
+
+    std::vector<Unit> result(facts.files.size());
+    for(std::uint32_t file = 0; file < facts.files.size(); file += 1) {
+        auto& info = facts.files[file];
+        auto& unit = result[file];
+        unit.kind = info.source      ? Unit::Kind::Source
+                    : info.fragment  ? Unit::Kind::Fragment
+                    : internal[file] ? Unit::Kind::Internal
+                                     : Unit::Kind::Interface;
+        for(auto named: llvm::concat<const std::uint32_t>(llvm::ArrayRef(file), pasted[file])) {
+            for(auto [uses, owners]: {
+                    std::pair{&facts.uses[named],       &unit.names },
+                    std::pair{&facts.macro_uses[named], &unit.macros}
+            }) {
+                for(auto& use: *uses) {
+                    auto owner = facts.entities[use.entity].owner;
+                    if(owner != file) {
+                        owners->push_back(owner);
+                    }
+                }
+            }
+        }
+        for(auto* owners: {&unit.names, &unit.macros}) {
+            std::ranges::sort(*owners);
+            owners->erase(std::ranges::unique(*owners).begin(), owners->end());
+        }
+    }
+    return result;
+}
+
 std::expected<std::vector<Interface>, std::string> Report::interface(llvm::StringRef name) const {
     auto count = partition.modules.size();
     auto wanted = partition.module_named(name);
@@ -3031,11 +3189,13 @@ std::expected<std::vector<Interface>, std::string> Report::interface(llvm::Strin
 
     // A macro another module's directive spells (clang's OPTION expanding
     // llvm's LLVM_MAKE_OPT_ID_WITH_ID_PREFIX) is used where that macro is
-    // expanded; one a textual header expands is used wherever that header
-    // compiles, in importers.
+    // expanded — also by the fragments its own header pastes, which no
+    // other file's uses show (StmtVisitor.h's STMT in StmtNodes.inc); one a
+    // textual header expands is used wherever that header compiles, in
+    // importers.
     for(std::uint32_t entity = 0; entity < facts.entities.size(); entity += 1) {
         auto& info = facts.entities[entity];
-        if(info.kind != SymbolKind::Macro || reverse.users[entity].empty()) {
+        if(info.kind != SymbolKind::Macro) {
             continue;
         }
         auto module = module_of(info.owner);

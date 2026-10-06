@@ -29,6 +29,11 @@ struct PartitionFile {
 
         /// The module exporting the names of its headers.
         std::optional<std::string> provides;
+
+        /// A program module rewritten into a named module, and where its
+        /// primary interface unit goes.
+        std::optional<bool> rewrite;
+        std::optional<std::string> primary;
     };
 
     std::vector<Module> modules;
@@ -81,6 +86,29 @@ std::expected<analysis::PartitionSpec, std::string>
         if(textual && external) {
             return std::unexpected(
                 std::format("module {} is both textual and external", claimed.name));
+        }
+        if(module.rewrite.value_or(false)) {
+            // A kind beside it is left for the partition to reject.
+            if(!textual && !external) {
+                claimed.kind = analysis::ModuleKind::Program;
+            }
+            claimed.rewrite = true;
+            claimed.primary = module.primary.value_or("");
+            llvm::StringRef primary = claimed.primary;
+            if(llvm::sys::path::is_absolute(primary) ||
+               llvm::sys::path::is_absolute(primary, llvm::sys::path::Style::posix) ||
+               llvm::is_contained(
+                   llvm::make_range(llvm::sys::path::begin(primary), llvm::sys::path::end(primary)),
+                   "..")) {
+                return std::unexpected(
+                    std::format("module {}: primary {} lies outside the workspace",
+                                claimed.name,
+                                primary.str()));
+            }
+        } else if(module.primary) {
+            return std::unexpected(
+                std::format("module {} has a primary interface but is not rewritten",
+                            claimed.name));
         }
         if(textual) {
             claimed.kind = analysis::ModuleKind::Textual;
